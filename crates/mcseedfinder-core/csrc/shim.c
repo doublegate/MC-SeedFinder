@@ -329,3 +329,43 @@ double mcsf_compute_depth(int mc, double c, double e, double w, int y) {
     double off = getSpline(bn.sp, np_param) + 0.015F;
     return 1.0 - (y * 4) / 128.0 - 83.0 / 160.0 + off;
 }
+
+/* --- Approximate surface heightmap (cubiomes mapApproxHeight) ---------- */
+/* Important: NOT bit-exact Java terrain. cubiomes itself names this
+ * `mapApproxHeight` because it's derived from the depth-spline output
+ * (np[NP_DEPTH] / 76.0 in 1.18+) — fast and deterministic, but post-
+ * climate-noise, not the per-block Java surface column. The shim exposes
+ * it for use ONLY as visual relief, never as exact altitude. Every
+ * downstream caller must label its output "approximate". */
+
+/* Single-point variant. Coords (x, z) are in cubiomes scale-4 units
+ * (i.e. block_x >> 2). Returns the surface height in (fractional) blocks
+ * via *out_y; biome at that surface point goes to *out_biome (NULL OK).
+ * Returns the cubiomes mapApproxHeight return code, or non-zero on error. */
+int mcsf_surface_height_at(
+    Generator *g, int x, int z,
+    float *out_y, int *out_biome
+) {
+    SurfaceNoise sn;
+    initSurfaceNoise(&sn, g->dim, g->seed);
+    float y = 0.0f;
+    int id = 0;
+    int rc = mapApproxHeight(&y, &id, g, &sn, x, z, 1, 1);
+    if (rc != 0) return rc;
+    *out_y = y;
+    if (out_biome) *out_biome = id;
+    return 0;
+}
+
+/* Batch variant: fills out_y (w*h floats) and out_ids (w*h int32s) for a
+ * rectangle starting at (x, z) in scale-4 units. Output stride matches
+ * mapApproxHeight: y[j*w+i]. */
+int mcsf_surface_height_map(
+    Generator *g,
+    int x, int z, int w, int h,
+    float *out_y, int *out_ids
+) {
+    SurfaceNoise sn;
+    initSurfaceNoise(&sn, g->dim, g->seed);
+    return mapApproxHeight(out_y, out_ids, g, &sn, x, z, w, h);
+}

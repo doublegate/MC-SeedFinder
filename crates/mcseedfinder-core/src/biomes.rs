@@ -64,6 +64,22 @@ extern "C" {
         sy: c_int,
         sz: c_int,
     ) -> usize;
+    fn mcsf_surface_height_at(
+        g: *mut CubGenerator,
+        x: c_int,
+        z: c_int,
+        out_y: *mut f32,
+        out_biome: *mut c_int,
+    ) -> c_int;
+    fn mcsf_surface_height_map(
+        g: *mut CubGenerator,
+        x: c_int,
+        z: c_int,
+        w: c_int,
+        h: c_int,
+        out_y: *mut f32,
+        out_ids: *mut c_int,
+    ) -> c_int;
 }
 
 /// 256-entry cubiomes biome RGB colormap, fetched once.
@@ -134,11 +150,20 @@ impl BiomeBackend {
         Self::new(mc, dim, y).ok_or_else(|| "failed to allocate cubiomes generator".to_string())
     }
 
-    /// Numeric cubiomes biome ID at `(x, z)` for `world_seed`, or [`NO_BIOME`].
+    /// Numeric cubiomes biome ID at `(x, z)` for `world_seed`, sampled at
+    /// the backend's configured default `y` (sea level by default). For
+    /// 3D-biome aware queries use [`Self::get_biome_at_y`].
     pub fn get_biome(&mut self, world_seed: i64, x: i32, z: i32) -> i32 {
+        self.get_biome_at_y(world_seed, x, self.y, z)
+    }
+
+    /// Numeric cubiomes biome ID at the **explicit** `(x, y, z)` block
+    /// coordinate. MC 1.18+ biomes are 3D, so the answer can differ across
+    /// `y` for the same `(x, z)`.
+    pub fn get_biome_at_y(&mut self, world_seed: i64, x: i32, y: i32, z: i32) -> i32 {
         self.ensure_seed(world_seed);
         // SAFETY: generator is initialized and seeded above.
-        unsafe { mcsf_biome_at(self.generator, SCALE_BLOCK, x, self.y, z) }
+        unsafe { mcsf_biome_at(self.generator, SCALE_BLOCK, x, y, z) }
     }
 
     /// (Re)apply a world seed if it differs from the cached one.
@@ -152,15 +177,9 @@ impl BiomeBackend {
         }
     }
 
-    /// Render a biome tile to raw RGBA pixels (4 bytes per pixel, row-major,
-    /// top-left origin). `(x, z)` is the top-left **block** coordinate; `(sx,
-    /// sz)` is the tile size in *scaled* units (so the tile covers
-    /// `sx*scale` × `sz*scale` blocks). `scale` must be a cubiomes scale
-    /// (1, 4, 16, 64, or 256); 4 is the standard biome-map scale.
-    ///
-    /// Returns `sx * sz * 4` bytes. Prefer this over `render_tile_png` when
-    /// the consumer can blit raw RGBA (e.g. a Canvas2D `putImageData`); it
-    /// skips PNG encode + base64 + browser decode (~30–45 ms / tile saved).
+    /// Render a biome tile to raw RGBA pixels at the backend's default `y`
+    /// (sea level unless overridden at construction). For Y-aware rendering
+    /// (the 3D isometric view), use [`Self::render_tile_rgba_at_y`].
     pub fn render_tile_rgba(
         &mut self,
         world_seed: i64,
@@ -169,6 +188,35 @@ impl BiomeBackend {
         z: i32,
         sx: u32,
         sz: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.render_tile_rgba_at_y(world_seed, scale, x, z, sx, sz, self.y)
+    }
+
+    /// Render a biome tile to raw RGBA pixels at an **explicit block Y**.
+    /// `(x, z)` is the top-left block coordinate; `(sx, sz)` is the tile
+    /// size in *scaled* units (so the tile covers `sx*scale` × `sz*scale`
+    /// blocks). `scale` must be a cubiomes scale (1, 4, 16, 64, or 256).
+    /// `y_block` is a Minecraft block height; for 1.18+ valid range is
+    /// `[-64, 319]` (sea level = 63). Internally converted to cubiomes'
+    /// `Range.y` (scale-relative — at scale 4 the Range y is `y_block >> 2`).
+    ///
+    /// MC 1.18+ biomes are 3D, so the same `(seed, x, z, scale)` at
+    /// different `y_block`s can return different biome IDs (and thus
+    /// different colours). Pre-1.18 worlds ignore Y.
+    ///
+    /// Returns `sx * sz * 4` bytes. Prefer this over `render_tile_png` when
+    /// the consumer can blit raw RGBA (e.g. a Canvas2D `putImageData` or a
+    /// Three.js `DataTexture`); it skips PNG encode + base64 + browser
+    /// decode (~30–45 ms / tile saved).
+    pub fn render_tile_rgba_at_y(
+        &mut self,
+        world_seed: i64,
+        scale: i32,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+        y_block: i32,
     ) -> Result<Vec<u8>, String> {
         if !matches!(scale, 1 | 4 | 16 | 64 | 256) {
             return Err(format!(
@@ -192,7 +240,8 @@ impl BiomeBackend {
         let cache_len = min_cache.max(total);
         let mut ids = vec![0i32; cache_len];
         // SAFETY: generator is initialized + seeded; the buffer is at least
-        // mcsf_min_cache_size ints; cubiomes y=0 means a 2D plane.
+        // mcsf_min_cache_size ints. cubiomes' Range.y is in scale-relative
+        // units, so a block Y of 63 at scale=4 becomes Range.y = 15.
         let rc = unsafe {
             mcsf_gen_biomes(
                 self.generator,
@@ -202,7 +251,7 @@ impl BiomeBackend {
                 z / scale,
                 sx as c_int,
                 sz as c_int,
-                0,
+                y_block / scale,
             )
         };
         if rc != 0 {
@@ -224,6 +273,72 @@ impl BiomeBackend {
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
         Ok(rgba)
+    }
+
+    /// **Approximate** surface block height at `(x, z)` for `world_seed`,
+    /// plus the biome at that surface point. Uses cubiomes'
+    /// `mapApproxHeight`, which derives Y from the depth-spline output
+    /// (`np[NP_DEPTH] / 76.0` for 1.18+). **Not bit-exact Java terrain.**
+    ///
+    /// Coords `(x, z)` are in cubiomes scale-4 units (block_x >> 2).
+    /// Returns `(height_in_blocks, biome_id)`.
+    pub fn surface_height(
+        &mut self,
+        world_seed: i64,
+        x: i32,
+        z: i32,
+    ) -> Result<(f32, i32), String> {
+        self.ensure_seed(world_seed);
+        let mut y = 0.0f32;
+        let mut id = 0i32;
+        // SAFETY: generator is initialized + seeded; the shim writes
+        // exactly one f32 and one i32 into the provided pointers.
+        let rc = unsafe { mcsf_surface_height_at(self.generator, x, z, &mut y, &mut id) };
+        if rc != 0 {
+            return Err(format!("cubiomes mapApproxHeight failed with rc={rc}"));
+        }
+        Ok((y, id))
+    }
+
+    /// **Approximate** surface heightmap tile. Coords `(x, z)` are in
+    /// cubiomes scale-4 units (block_x >> 2); `(sx, sz)` is the tile size
+    /// in the same units. Returns `(heights, biome_ids)`, each `sx*sz`
+    /// long, row-major matching `mapApproxHeight`'s `[j*sx + i]` order.
+    ///
+    /// Like [`Self::surface_height`], this is **approximate** —
+    /// labelled `"exactness": "approximate"` at the Tauri boundary.
+    pub fn surface_height_tile(
+        &mut self,
+        world_seed: i64,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+    ) -> Result<(Vec<f32>, Vec<i32>), String> {
+        if sx == 0 || sz == 0 {
+            return Err("tile size must be positive".into());
+        }
+        self.ensure_seed(world_seed);
+        let total = (sx as usize) * (sz as usize);
+        let mut heights = vec![0.0f32; total];
+        let mut ids = vec![0i32; total];
+        // SAFETY: generator is initialized + seeded; output buffers are
+        // sized exactly sx*sz which is what cubiomes' mapApproxHeight expects.
+        let rc = unsafe {
+            mcsf_surface_height_map(
+                self.generator,
+                x,
+                z,
+                sx as c_int,
+                sz as c_int,
+                heights.as_mut_ptr(),
+                ids.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!("cubiomes mapApproxHeight failed with rc={rc}"));
+        }
+        Ok((heights, ids))
     }
 
     /// Render a biome tile as PNG bytes. Wraps [`render_tile_rgba`] with a
@@ -391,6 +506,97 @@ mod tests {
         ];
         for &(seed, x, z, expected) in cases {
             assert_eq!(g.get_biome(seed, x, z), expected, "seed={seed} x={x} z={z}");
+        }
+    }
+
+    // ---- Phase 7+ : Y-aware biome queries + approximate surface heightmap.
+
+    /// Y actually flows through to cubiomes. For MC 1.18+ many biomes are
+    /// 3D — caves/deepslate biomes appear at low Y, mountain/peak biomes at
+    /// high Y. We sweep a 512×512-block region to find any (x, z) where
+    /// `biome(y=80)` differs from `biome(y=20)`. If none exists, Y was
+    /// silently dropped somewhere in the FFI/Range chain.
+    #[test]
+    fn biome_at_different_y_can_differ_for_3d_biome_seed() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        let seed: i64 = 12345;
+        let mut differ = None;
+        'outer: for x in (-256..256).step_by(8) {
+            for z in (-256..256).step_by(8) {
+                let surface = g.get_biome_at_y(seed, x, 80, z);
+                let deep = g.get_biome_at_y(seed, x, 20, z);
+                if surface != deep && surface != NO_BIOME && deep != NO_BIOME {
+                    differ = Some((x, z, surface, deep));
+                    break 'outer;
+                }
+            }
+        }
+        let (x, z, s, d) = differ.expect(
+            "no (x,z) in 512x512 sweep had biome(y=80) != biome(y=20) — \
+             Y is NOT being threaded through to cubiomes",
+        );
+        eprintln!("Y-aware: ({x},{z}) surface={s} deep={d}");
+    }
+
+    /// `render_tile_rgba_at_y` must produce different bytes at different
+    /// Ys for a 3D-biome seed. Bit-strict: the tile is identical only if
+    /// Y silently collapsed somewhere.
+    #[test]
+    fn render_tile_at_y_differs_from_default() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        let surface = g
+            .render_tile_rgba_at_y(12345, 4, -64, -64, 64, 64, 80)
+            .expect("y=80 tile");
+        let deep = g
+            .render_tile_rgba_at_y(12345, 4, -64, -64, 64, 64, 20)
+            .expect("y=20 tile");
+        assert_ne!(
+            surface, deep,
+            "tile RGBA was identical at y=80 and y=20 — per-request Y silently collapsed"
+        );
+    }
+
+    /// Single-point surface height returns a plausible block-Y in the
+    /// 1.18+ build range, plus a resolvable biome ID.
+    #[test]
+    fn surface_height_is_reasonable_for_overworld() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        let (y, biome) = g.surface_height(12345, 0, 0).expect("surface_height");
+        // 1.18+ build range; spline output is empirically in [-30, 200].
+        assert!(
+            (-64.0..=320.0).contains(&y),
+            "implausible surface y={y} (outside 1.18+ build range)"
+        );
+        assert!((0..256).contains(&biome), "implausible biome id {biome}");
+    }
+
+    /// Batch heightmap agrees with per-point lookups (modulo f32 ties).
+    /// Catches indexing/stride bugs at the FFI seam.
+    #[test]
+    fn surface_height_tile_matches_per_point() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        // 8×8 scale-4 tile → 32×32-block region.
+        let (heights, ids) = g
+            .surface_height_tile(12345, 0, 0, 8, 8)
+            .expect("surface_height_tile");
+        assert_eq!(heights.len(), 64);
+        assert_eq!(ids.len(), 64);
+        // mapApproxHeight treats coords as scale-4 (each step = 1 unit in
+        // scale-4 space, matching what we pass to surface_height too).
+        for j in 0..8i32 {
+            for i in 0..8i32 {
+                let (y_pt, b_pt) = g
+                    .surface_height(12345, i, j)
+                    .expect("per-point surface_height");
+                let idx = (j * 8 + i) as usize;
+                let y_batch = heights[idx];
+                let b_batch = ids[idx];
+                assert!(
+                    (y_batch - y_pt).abs() < 0.5,
+                    "batch y={y_batch} per-point y={y_pt} at ({i},{j})"
+                );
+                assert_eq!(b_batch, b_pt, "biome id mismatch at ({i},{j})");
+            }
         }
     }
 }

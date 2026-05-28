@@ -209,7 +209,8 @@ impl GpuBiomeRenderer {
     ///
     /// `(x, z)` is the top-left **block** coordinate; `(sx, sz)` is the
     /// tile size in scale-grid units (so the tile covers `sx*scale`
-    /// blocks). Returns `sx * sz * 4` bytes.
+    /// blocks). `y_block` is a Minecraft block height (sea level = 63;
+    /// 1.18+ range -64..319). Returns `sx * sz * 4` bytes.
     pub fn render_tile_rgba(
         &self,
         scale: i32,
@@ -217,6 +218,7 @@ impl GpuBiomeRenderer {
         z: i32,
         sx: u32,
         sz: u32,
+        y_block: i32,
     ) -> Result<Vec<u8>, String> {
         if scale != 4 {
             return Err(format!(
@@ -231,13 +233,17 @@ impl GpuBiomeRenderer {
 
         // cubiomes' genBiomeNoise3D at r.scale=4: inner scale=1, mid=0.
         // r.x = caller's x / scale. xi = r.x + i (in scale-4 grid units).
-        // sampleBiomeNoise input is the scale-4 grid coord.
+        // sampleBiomeNoise input is the scale-4 grid coord. The Y component
+        // is in cubiomes' canonical units — mcsf_compute_depth internally
+        // does `(y * 4) / 128.0` (shim.c:330), expecting scale-4 units
+        // there too. So we forward y_block / scale (= y_block / 4) here.
         let gx = x / scale;
         let gz = z / scale;
+        let gy = y_block / scale;
         let mut coords: Vec<(i32, i32, i32)> = Vec::with_capacity(total);
         for j in 0..sz {
             for i in 0..sx {
-                coords.push((gx + i as i32, 0, gz + j as i32));
+                coords.push((gx + i as i32, gy, gz + j as i32));
             }
         }
         let biomes = self
@@ -423,7 +429,7 @@ mod tests {
         let sx = 32u32;
         let sz = 32u32;
         let gpu_rgba = rend
-            .render_tile_rgba(scale, 0, 0, sx, sz)
+            .render_tile_rgba(scale, 0, 0, sx, sz, 0)
             .expect("gpu render");
         let cpu_rgba = cpu
             .render_tile_rgba(12345, scale, 0, 0, sx, sz)
@@ -445,5 +451,57 @@ mod tests {
             rate * 100.0
         );
         assert!(rate >= 0.99, "tile RGBA match rate {rate:.4} below 99%");
+    }
+
+    /// Phase 7+: parity at a non-zero block Y. Confirms the GPU pipeline's
+    /// `mcsf_compute_depth` Y plumbing matches cubiomes' `sampleBiomeNoise`
+    /// at the same Y. cubiomes' Range.y for genBiomes at scale 4 is in
+    /// scale-4 units, so y_block = 20 (block) ≡ Range.y = 5.
+    #[test]
+    fn gpu_render_tile_rgba_matches_biome_backend_at_y_20() {
+        use crate::biomes::BiomeBackend;
+        let Some(mc) = parse_mc_version("1.21") else {
+            return;
+        };
+        let Some(rend) = GpuBiomeRenderer::try_new(mc, 12345, false) else {
+            eprintln!("skipping: no GPU adapter on this host");
+            return;
+        };
+        let mut cpu = match BiomeBackend::from_strs("1.21", "overworld", 0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: BiomeBackend init failed: {e}");
+                return;
+            }
+        };
+
+        let scale = 4i32;
+        let sx = 32u32;
+        let sz = 32u32;
+        let y_block = 20i32;
+        let gpu_rgba = rend
+            .render_tile_rgba(scale, 0, 0, sx, sz, y_block)
+            .expect("gpu render at y=20");
+        let cpu_rgba = cpu
+            .render_tile_rgba_at_y(12345, scale, 0, 0, sx, sz, y_block)
+            .expect("cpu render at y=20");
+        assert_eq!(gpu_rgba.len(), cpu_rgba.len());
+
+        let mut equal_pixels = 0usize;
+        let total = (sx * sz) as usize;
+        for i in 0..total {
+            if gpu_rgba[i * 4..i * 4 + 4] == cpu_rgba[i * 4..i * 4 + 4] {
+                equal_pixels += 1;
+            }
+        }
+        let rate = equal_pixels as f64 / total as f64;
+        eprintln!(
+            "tile RGBA match rate @ y={y_block}: {equal_pixels}/{total} = {:.2}%",
+            rate * 100.0
+        );
+        assert!(
+            rate >= 0.99,
+            "GPU↔CPU tile RGBA at y={y_block} match rate {rate:.4} below 99%"
+        );
     }
 }

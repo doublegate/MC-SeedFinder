@@ -717,6 +717,12 @@ struct TileRequest {
     sx: u32,
     #[serde(default = "default_size")]
     sz: u32,
+    /// Minecraft block Y at which to sample biomes. Defaults to sea level
+    /// (63). For 1.18+ valid range is `[-64, 319]`; the frontend's
+    /// wheel-driven Y scrubber drives this. Older callers that omit `y`
+    /// keep the previous fixed-sea-level behaviour.
+    #[serde(default = "default_y")]
+    y: i32,
 }
 
 fn default_version() -> String {
@@ -730,6 +736,9 @@ fn default_scale() -> i32 {
 }
 fn default_size() -> u32 {
     256
+}
+fn default_y() -> i32 {
+    63
 }
 
 #[tauri::command]
@@ -809,13 +818,14 @@ fn render_tile_rgba_cmd(
         release_biome_backend(&state, &request.version, &request.dimension, backend);
         return Err(SUPERSEDED.into());
     }
-    let rgba = backend.render_tile_rgba(
+    let rgba = backend.render_tile_rgba_at_y(
         request.seed,
         request.scale,
         request.x,
         request.z,
         request.sx,
         request.sz,
+        request.y,
     );
     let version = request.version.clone();
     let dimension = request.dimension.clone();
@@ -835,6 +845,83 @@ fn render_tile_rgba_cmd(
             "z": request.z,
             "sx": request.sx,
             "sz": request.sz,
+            "y": request.y,
+        })
+    })
+}
+
+/// Heightmap request: same view rectangle as `TileRequest` but the
+/// response is per-pixel surface-block-Y instead of biome RGBA. Used by
+/// the 3D isometric view to extrude the ground plane.
+///
+/// **Approximate.** The heights come from cubiomes' `mapApproxHeight`,
+/// which derives Y from the depth-spline output, not from Java's full
+/// per-block surface noise. The response advertises this via the
+/// `"exactness": "approximate"` field so the UI can label it.
+#[derive(Debug, Deserialize)]
+struct HeightTileRequest {
+    seed: i64,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default = "default_dimension")]
+    dimension: String,
+    /// Top-left block coordinate of the tile (matches `TileRequest`).
+    x: i32,
+    z: i32,
+    /// Tile size in *scale-4* pixels (cubiomes' `mapApproxHeight`
+    /// canonical unit). One pixel = 4 blocks. A 256-pixel tile covers
+    /// 1024 blocks across.
+    #[serde(default = "default_size")]
+    sx: u32,
+    #[serde(default = "default_size")]
+    sz: u32,
+}
+
+#[tauri::command]
+fn surface_height_tile_cmd(
+    request: HeightTileRequest,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Share the tile_counter with `render_tile_rgba_cmd` — the front-end
+    // fires both for the same pan/Y-scroll, so a newer pan should
+    // supersede both together.
+    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
+    if superseded(&state.tile_counter, my_seq) {
+        release_biome_backend(&state, &request.version, &request.dimension, backend);
+        return Err(SUPERSEDED.into());
+    }
+    // mapApproxHeight expects scale-4 coords. The Rust API mirrors that.
+    let result = backend.surface_height_tile(
+        request.seed,
+        request.x >> 2,
+        request.z >> 2,
+        request.sx,
+        request.sz,
+    );
+    let version = request.version.clone();
+    let dimension = request.dimension.clone();
+    release_biome_backend(&state, &version, &dimension, backend);
+
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    result.map(|(heights, biome_ids)| {
+        serde_json::json!({
+            "heights": heights,
+            "biome_ids": biome_ids,
+            "exactness": "approximate",
+            "seed": request.seed,
+            "version": request.version,
+            "dimension": request.dimension,
+            "x": request.x,
+            "z": request.z,
+            "sx": request.sx,
+            "sz": request.sz,
+            "scale": 4,
         })
     })
 }
@@ -1028,6 +1115,7 @@ fn main() {
             analyze_seed,
             render_tile,
             render_tile_rgba_cmd,
+            surface_height_tile_cmd,
             list_structures_in_view,
             import_level_dat,
             export_results
