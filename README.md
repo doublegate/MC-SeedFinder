@@ -281,7 +281,18 @@ run in the current sandbox or CI environment.
 
 ## Desktop MVP
 
-The desktop shell lives in `desktop/`.
+The desktop shell lives in `desktop/`. There's also a thin proxy `package.json`
+at the repo root so the common commands work from anywhere in the tree:
+
+```bash
+# From the repo root:
+npm run install:desktop                    # one-time, installs desktop deps
+npm run dev                                # = `npm --prefix desktop run tauri dev`
+npm run build                              # = `npm --prefix desktop run build`
+npm run tauri:build                        # = `npm --prefix desktop run tauri build`
+```
+
+Or work inside the `desktop/` folder directly:
 
 ```bash
 cd desktop
@@ -293,13 +304,13 @@ RUSTC_WRAPPER= cargo check --manifest-path src-tauri/Cargo.toml
 Run the browser-based Vite preview:
 
 ```bash
-npm run dev -- --port 5173
+npm run dev -- --port 5173                 # (only inside desktop/)
 ```
 
 Run through Tauri during local desktop development:
 
 ```bash
-npm run tauri dev
+npm run tauri dev                          # from desktop/, OR `npm run dev` from root
 ```
 
 Current desktop status:

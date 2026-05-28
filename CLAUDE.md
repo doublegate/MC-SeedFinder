@@ -19,7 +19,7 @@ Never present approximate worldgen as exact. Structure/stronghold placement and 
 - Python tests: `PYTHONPATH=src python -m unittest` (or `pytest`). Tests are `unittest` classes, `test_*` methods, pytest-compatible.
 - Rust tests **require the feature flag**: `cargo test --features pyo3`. Plain `cargo test` will not exercise the bindings.
 - Rust benchmark: `RUSTC_WRAPPER= cargo run --release --example bench_structure_search -- 100000`.
-- Desktop checks: `cd desktop && npm run build && RUSTC_WRAPPER= cargo check --manifest-path src-tauri/Cargo.toml`.
+- Desktop checks: `cd desktop && npm run build && RUSTC_WRAPPER= cargo check --manifest-path src-tauri/Cargo.toml`. There is a thin proxy `package.json` at the repo root so `npm run dev` / `npm run build` work from anywhere; the actual desktop project still lives in `desktop/`.
 
 Prefix Rust commands with `RUSTC_WRAPPER=` to disable `sccache` when it is configured but cannot run in the sandbox/CI. `/verify-all` runs the full three-language gate.
 

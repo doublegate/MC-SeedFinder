@@ -1,0 +1,13 @@
+{
+  "name": "mc-seed-finder",
+  "private": true,
+  "description": "Root-level proxy scripts so common desktop commands work from the repo root. The actual Node project lives in ./desktop/.",
+  "scripts": {
+    "dev": "npm --prefix desktop run tauri dev",
+    "tauri:dev": "npm --prefix desktop run tauri dev",
+    "tauri": "npm --prefix desktop run tauri --",
+    "build": "npm --prefix desktop run build",
+    "tauri:build": "npm --prefix desktop run tauri build",
+    "install:desktop": "npm --prefix desktop install"
+  }
+}
