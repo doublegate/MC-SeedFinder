@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { ConditionBuilder, defaultRoot, nodeToWire, type TreeNode } from "./conditions";
 import "./styles.css";
 
 // ---------------------------------------------------------------------------
@@ -74,9 +75,9 @@ const PIN_STRUCTURES = [
 function App() {
   const [edition, setEdition] = useState("java");
   const [version, setVersion] = useState("1.21");
-  const [structure, setStructure] = useState("village");
-  const [distance, setDistance] = useState(1000);
   const [count, setCount] = useState(100000);
+  const [maxMatches, setMaxMatches] = useState(25);
+  const [conditionTree, setConditionTree] = useState<TreeNode>(() => defaultRoot());
   const [job, setJob] = useState<JobState>({
     jobId: "",
     status: "idle",
@@ -110,14 +111,12 @@ function App() {
       dimension: "overworld",
       start_seed: 0,
       count,
-      max_matches: 25,
+      max_matches: maxMatches,
       criteria: {
-        nearby_structures: [
-          { structure, max_distance: distance, centre_x: 0, centre_z: 0 },
-        ],
+        conditions: nodeToWire(conditionTree),
       },
     }),
-    [count, distance, edition, structure, version],
+    [count, maxMatches, edition, version, conditionTree],
   );
 
   // ---- Streamed search events ----
@@ -396,24 +395,21 @@ function App() {
             <option>1.18</option>
           </select>
         </label>
-        <label className="control">
-          Structure
-          <select value={structure} onChange={(event) => setStructure(event.target.value)}>
-            <option value="village">Village</option>
-            <option value="pillager_outpost">Pillager Outpost</option>
-            <option value="ocean_monument">Ocean Monument</option>
-            <option value="stronghold">Stronghold</option>
-            <option value="woodland_mansion">Woodland Mansion</option>
-          </select>
-        </label>
-        <label className="control">
-          Distance
-          <input value={distance} min={1} max={8000} type="number" onChange={(event) => setDistance(Number(event.target.value))} />
-        </label>
-        <label className="control">
-          Seeds
-          <input value={count} min={1} type="number" onChange={(event) => setCount(Number(event.target.value))} />
-        </label>
+        <div className="control control-row">
+          <label>
+            Seeds
+            <input value={count} min={1} type="number" onChange={(event) => setCount(Number(event.target.value))} />
+          </label>
+          <label>
+            Max matches
+            <input value={maxMatches} min={1} type="number" onChange={(event) => setMaxMatches(Number(event.target.value))} />
+          </label>
+        </div>
+        <div className="conditionsHeader">
+          <h3>Conditions</h3>
+          <small>Build a tree; any seed matching the root will be returned.</small>
+        </div>
+        <ConditionBuilder root={conditionTree} onChange={setConditionTree} />
         <div className="actions">
           <button onClick={startSearch} disabled={job.status === "running"}>Run</button>
           <button className="secondary" onClick={cancelSearch} disabled={job.status !== "running"}>Cancel</button>
@@ -527,8 +523,14 @@ function App() {
           <dl>
             <dt>Seed</dt>
             <dd>{selectedSeed ?? "none"}</dd>
-            <dt>Target</dt>
-            <dd>{structure.replace("_", " ")} within {distance} blocks</dd>
+            <dt>Conditions</dt>
+            <dd>
+              {conditionTree.type === "all_of" ||
+              conditionTree.type === "any_of" ||
+              conditionTree.type === "none_of"
+                ? `${conditionTree.type.replace("_", " ")} of ${conditionTree.of.length}`
+                : conditionTree.type.replace(/_/g, " ")}
+            </dd>
             {analysis && (
               <>
                 <dt>Origin biome</dt>

@@ -9,6 +9,21 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Visual condition builder (Phase 4b-5).** The sidebar's hardcoded
+  structure+distance form is replaced by a recursive tree editor that builds
+  the `conditions` spec without hand-editing JSON. Every node has a type
+  picker spanning all three logic gates (`all_of` / `any_of` / `none_of`) and
+  every leaf (`nearby_structure`, `cluster`, `spawn_biome`, `nearby_biomes`,
+  `biome_area`); type changes morph the node, preserving compatible fields.
+  Biome leaves get a chip-style picker backed by a curated TS biome catalog
+  + the same group quick-picks as the Python `BIOME_GROUPS`.
+- New `desktop/src/biomes.ts` mirroring the relevant subset of
+  `src/mcseedfinder/biomes.py` (~40 biomes + 7 quick-pick groups).
+- New `desktop/src/conditions.tsx` — typed `TreeNode` model, `nodeToWire`
+  serializer, `ConditionBuilder` component, recursive `NodeView`, biome
+  multi-select with chips.
+- `Max matches` is now a sidebar field (was hardcoded at 25).
+
 - **Biome criteria in native desktop search (Phase 4b-4).** The Rust
   `conditions` evaluator gains biome leaves (`spawn_biome`, `nearby_biomes`,
   `biome_area`) that mirror the Python `SpawnBiome` / `NearbyBiomes` /

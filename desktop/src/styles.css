@@ -112,6 +112,182 @@ input {
   color: #243026;
 }
 
+.control-row {
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.control-row label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.conditionsHeader {
+  margin: 18px 0 10px;
+  padding-top: 14px;
+  border-top: 1px solid #d2d9cb;
+}
+
+.conditionsHeader h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.conditionsHeader small {
+  color: #627064;
+  font-size: 11.5px;
+}
+
+.conditionBuilder {
+  max-height: 48vh;
+  overflow-y: auto;
+  padding: 4px 2px 4px 0;
+}
+
+.condNode {
+  margin-bottom: 8px;
+  padding: 8px;
+  border: 1px solid #c4ccbc;
+  border-left: 3px solid #214d3b;
+  border-radius: 5px;
+  background: #ffffff;
+  font-size: 12px;
+}
+
+.condNode-all_of { border-left-color: #214d3b; }
+.condNode-any_of { border-left-color: #4d7eb8; }
+.condNode-none_of { border-left-color: #b8534d; }
+.condNode-cluster { border-left-color: #b88a4d; }
+.condNode-spawn_biome,
+.condNode-nearby_biomes,
+.condNode-biome_area { border-left-color: #6da64a; }
+
+.condHeader {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.condHeader select {
+  height: 30px;
+  font-size: 12px;
+}
+
+.condRemove {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 4px;
+  background: #f3e0dc;
+  color: #7a1d12;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.condBody {
+  display: grid;
+  gap: 6px;
+}
+
+.condField {
+  display: grid;
+  gap: 3px;
+  font-size: 11.5px;
+}
+
+.condField > span {
+  color: #4f5b50;
+}
+
+.condField input,
+.condField select,
+.condField textarea {
+  width: 100%;
+  height: 28px;
+  font-size: 12px;
+  padding: 0 6px;
+}
+
+.condField textarea {
+  height: auto;
+  padding: 4px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.condRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.condRow:has(> :nth-child(3)) {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.condCheck {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+}
+
+.condChildren {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 1px dashed #c4ccbc;
+}
+
+.condAddChild {
+  margin-top: 6px;
+  height: 28px;
+  border: 1px dashed #c4ccbc;
+  border-radius: 4px;
+  background: transparent;
+  color: #243026;
+  cursor: pointer;
+  font-size: 12px;
+  width: 100%;
+}
+
+.condAddChild:hover {
+  background: #f0f3ec;
+}
+
+.biomePicker {
+  display: grid;
+  gap: 6px;
+}
+
+.biomeChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 24px;
+}
+
+.biomeChip {
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 999px;
+  background: #214d3b;
+  color: #f0f5ea;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.biomeChip:hover {
+  background: #b8534d;
+}
+
+.biomeChipEmpty {
+  color: #8a948c;
+  font-size: 11.5px;
+  font-style: italic;
+}
+
 .importControl {
   margin-top: 18px;
   padding-top: 16px;
