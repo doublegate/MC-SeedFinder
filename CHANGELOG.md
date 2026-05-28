@@ -9,6 +9,24 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Biome criteria in native desktop search (Phase 4b-4).** The Rust
+  `conditions` evaluator gains biome leaves (`spawn_biome`, `nearby_biomes`,
+  `biome_area`) that mirror the Python `SpawnBiome` / `NearbyBiomes` /
+  `BiomeArea` semantics 1:1 (same grid sampling, same `all_required` /
+  `min_samples` logic). Biomes are passed as numeric cubiomes IDs on the
+  wire to avoid duplicating the Python biome catalog in Rust.
+- New `evaluate_with_biomes` and `find_matches_range_with_biomes` that thread
+  a `BiomeBackend` through the recursive evaluator; one backend is allocated
+  per search, re-applying the seed only when it changes.
+- `has_biome_leaves(node)` helper so callers route correctly: pure-structure
+  trees keep the cheap structure-only `evaluate` path; biome-touching trees
+  use the biome-aware variant.
+- Tauri `start_search` now accepts conditions trees containing biome leaves;
+  `run_search` picks the evaluator based on `has_biome_leaves` and reports
+  both `structures` and `biomes` as `exact` in the `SeedReport.exactness`.
+- 5 new Rust tests in `conditions::biome_eval_tests` (parity with the existing
+  Python `test_biome_area_finds_ocean` / `test_provider_marks_biomes_exact`).
+
 - **Import seed from `level.dat` (Phase 4b-3).** The Tauri `import_level_dat`
   command parses a Minecraft world's gzipped NBT save header (via `fastnbt` +
   `flate2`) and returns its seed, version name, and level name. Handles both

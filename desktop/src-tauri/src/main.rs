@@ -93,17 +93,24 @@ struct JobInner {
 // Criteria → compiled native tree (structure-only)
 // ---------------------------------------------------------------------------
 
-/// Build a structure-only [`CompiledNode`] from a Python-style criteria spec,
-/// or return an error string if anything biome-related is present.
+/// Build a [`CompiledNode`] from a Python-style criteria spec. Supports the
+/// flat-keys form (`nearby_structures`) and the recursive `conditions` tree,
+/// including biome leaves. Flat `spawn_biome` / `nearby_biomes` keys are
+/// rejected with a hint to use the tree form (the flat shape carries biome
+/// *names*; the desktop tree path takes numeric cubiomes IDs to avoid
+/// duplicating the Python biome catalog in Rust).
 fn compile_criteria_tree(criteria: &serde_json::Value) -> Result<CompiledNode, String> {
     let obj = criteria
         .as_object()
         .ok_or("criteria must be a JSON object")?;
 
     if obj.contains_key("spawn_biome") || obj.contains_key("nearby_biomes") {
-        return Err("biome criteria are not yet supported in desktop search — \
-             use only structure conditions for now"
-            .to_string());
+        return Err(
+            "flat spawn_biome / nearby_biomes keys aren't supported by the \
+             desktop search; use a `conditions` tree with biome leaves carrying \
+             numeric cubiomes biome IDs"
+                .to_string(),
+        );
     }
 
     let mut children: Vec<Node> = Vec::new();
@@ -131,15 +138,12 @@ fn compile_criteria_tree(criteria: &serde_json::Value) -> Result<CompiledNode, S
         }
     }
 
-    // Recursive `conditions` tree → Node. Any biome leaf type causes serde
-    // deserialisation to fail (Node only knows structure types), which we
-    // surface as an error rather than silently dropping the criterion.
+    // Recursive `conditions` tree → Node. Supports structure leaves
+    // (NearbyStructure, Cluster), biome leaves (SpawnBiome, NearbyBiomes,
+    // BiomeArea — biomes given as numeric cubiomes IDs), and logic gates.
     if let Some(tree) = obj.get("conditions") {
-        let tree_node: Node = serde_json::from_value(tree.clone()).map_err(|e| {
-            format!(
-                "conditions tree contains unsupported / biome criteria for desktop search ({e})"
-            )
-        })?;
+        let tree_node: Node = serde_json::from_value(tree.clone())
+            .map_err(|e| format!("invalid conditions tree ({e})"))?;
         children.push(tree_node);
     }
 
@@ -237,6 +241,61 @@ fn run_search(
     compiled: CompiledNode,
     cancel: Arc<AtomicBool>,
 ) {
+    // Build a cubiomes biome backend ONCE per search, reused across seeds and
+    // all biome leaves. Only when the spec actually contains biome leaves —
+    // pure-structure searches stay on the cheap structure-only evaluator path.
+    let needs_biomes = conditions::has_biome_leaves(&compiled);
+    let mut biome_backend = if needs_biomes {
+        match BiomeBackend::from_strs(&spec.version, &spec.dimension, DEFAULT_Y) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                emit_completed(
+                    &app,
+                    &job_id,
+                    0,
+                    0,
+                    "error",
+                    Some(format!("biome backend init failed: {e}")),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let report_match = |seed: i64, scanned_at: u64, matches_so_far: u64| {
+        let mut exactness = HashMap::new();
+        exactness.insert("structures".to_string(), "exact".to_string());
+        if needs_biomes {
+            exactness.insert("biomes".to_string(), "exact".to_string());
+        }
+        let report = SeedReport {
+            seed,
+            edition: spec.edition.clone(),
+            version: spec.version.clone(),
+            dimension: spec.dimension.clone(),
+            score: 0.0,
+            matched_features: if needs_biomes {
+                vec!["structure_conditions".into(), "biome_conditions".into()]
+            } else {
+                vec!["structure_conditions".into()]
+            },
+            exactness,
+            warnings: Vec::new(),
+        };
+        if let Some(jobs) = app.try_state::<AppState>() {
+            if let Ok(mut guard) = jobs.jobs.lock() {
+                if let Some(inner) = guard.get_mut(&job_id) {
+                    inner.results.push(report.clone());
+                }
+            }
+        }
+        let _ = app.emit("search-match", &report);
+        let _ = scanned_at; // reserved for richer telemetry
+        let _ = matches_so_far;
+    };
+
     let chunk: u64 = 4096;
     let mut scanned: u64 = 0;
     let mut matches: u64 = 0;
@@ -249,26 +308,13 @@ fn run_search(
         let this_chunk = chunk.min(spec.count - scanned);
         for i in 0..this_chunk {
             let seed = spec.start_seed.wrapping_add((scanned + i) as i64);
-            if conditions::evaluate(&compiled, seed) {
-                let report = SeedReport {
-                    seed,
-                    edition: spec.edition.clone(),
-                    version: spec.version.clone(),
-                    dimension: spec.dimension.clone(),
-                    score: 0.0,
-                    matched_features: vec!["structure_conditions".to_string()],
-                    exactness: HashMap::from([("structures".to_string(), "exact".to_string())]),
-                    warnings: Vec::new(),
-                };
-                if let Some(jobs) = app.try_state::<AppState>() {
-                    if let Ok(mut guard) = jobs.jobs.lock() {
-                        if let Some(inner) = guard.get_mut(&job_id) {
-                            inner.results.push(report.clone());
-                        }
-                    }
-                }
-                let _ = app.emit("search-match", &report);
+            let hit = match biome_backend.as_mut() {
+                Some(backend) => conditions::evaluate_with_biomes(&compiled, seed, backend),
+                None => conditions::evaluate(&compiled, seed),
+            };
+            if hit {
                 matches += 1;
+                report_match(seed, scanned + i, matches);
                 if matches >= spec.max_matches {
                     let scanned_final = scanned + i + 1;
                     emit_completed(&app, &job_id, scanned_final, matches, "max_matches", None);
