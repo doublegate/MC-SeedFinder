@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the main window. Without this file, Tauri 2 denies the WebView permission to use listen()/emit() over IPC, so app.emit() from the Rust side is silently dropped on the frontend (invoke() of custom commands still works — that's not under the same ACL). `core:default` is the standard scaffold permission alias; `core:event:default` is the specific one we need for the streamed search events.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

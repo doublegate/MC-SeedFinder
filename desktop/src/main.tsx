@@ -108,7 +108,20 @@ function App() {
   const mapPaneRef = useRef<HTMLDivElement | null>(null);
 
   // Stale-event filter for streamed search.
+  // The ref holds one of:
+  //   ""    — no active search (drop any incoming event)
+  //   "*"   — search just kicked off, real jobId not yet known (accept anything)
+  //   <id>  — accept only events tagged with this job id
+  // The "*" sentinel exists because a structure-only search of a few hundred
+  // seeds can complete BEFORE invoke("start_search") resolves with the real
+  // jobId — without the sentinel, every event would arrive while the ref is
+  // still "" and get filtered out.
   const activeJobIdRef = useRef<string>("");
+
+  function jobMatches(eventJobId: string): boolean {
+    const active = activeJobIdRef.current;
+    return active !== "" && (active === "*" || active === eventJobId);
+  }
 
   const spec = useMemo(
     () => ({
@@ -139,7 +152,7 @@ function App() {
         await listen<{ job_id: string; scanned: number; matches: number }>(
           "search-progress",
           (event) => {
-            if (event.payload.job_id !== activeJobIdRef.current) return;
+            if (!jobMatches(event.payload.job_id)) return;
             setJob((j) => ({
               ...j,
               scanned: event.payload.scanned,
@@ -154,7 +167,7 @@ function App() {
           reason: string;
           error: string | null;
         }>("search-completed", (event) => {
-          if (event.payload.job_id !== activeJobIdRef.current) return;
+          if (!jobMatches(event.payload.job_id)) return;
           setJob((j) => ({
             ...j,
             status:
@@ -163,6 +176,9 @@ function App() {
             matches: event.payload.matches,
           }));
           if (event.payload.error) setError(event.payload.error);
+          // Job is over — drop the active flag so any straggler events from
+          // this job (or events emitted before a new Run begins) are ignored.
+          activeJobIdRef.current = "";
         }),
       );
     })();
@@ -179,6 +195,10 @@ function App() {
     setTile(null);
     setPins([]);
     setJob({ jobId: "", status: "running", scanned: 0, matches: 0 });
+    // CRITICAL: set the wildcard BEFORE invoke so events that fire during
+    // the IPC round-trip (instant for tiny structure-only searches) aren't
+    // dropped by the activeJobIdRef filter.
+    activeJobIdRef.current = "*";
     try {
       const jobId = await invoke<string>("start_search", { spec });
       activeJobIdRef.current = jobId;
