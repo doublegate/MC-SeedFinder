@@ -53,7 +53,9 @@ from .criteria import CriteriaSet, compile_criteria
 from .rust_backend import (
     RustStructureRequirement,
     compile_structure_only_requirements,
+    compile_structure_only_tree,
     find_structure_matches_range,
+    find_tree_matches_range,
     is_available as rust_backend_available,
 )
 
@@ -103,6 +105,7 @@ class Match:
 # pool startup so we don't recompile the criteria on every chunk.
 _WORKER_CRITERIA: Optional[CriteriaSet] = None
 _WORKER_RUST_STRUCTURE_REQUIREMENTS: Optional[List[RustStructureRequirement]] = None
+_WORKER_NATIVE_TREE: Optional[Mapping[str, Any]] = None
 
 
 def _worker_init(
@@ -115,7 +118,7 @@ def _worker_init(
     Each worker builds its own cubiomes backend (PyO3 objects aren't picklable),
     so only the version/dimension strings cross the process boundary.
     """
-    global _WORKER_CRITERIA, _WORKER_RUST_STRUCTURE_REQUIREMENTS
+    global _WORKER_CRITERIA, _WORKER_RUST_STRUCTURE_REQUIREMENTS, _WORKER_NATIVE_TREE
     _WORKER_CRITERIA = compile_criteria(
         criteria_spec,
         biome_version=biome_version,
@@ -124,6 +127,10 @@ def _worker_init(
     _WORKER_RUST_STRUCTURE_REQUIREMENTS = compile_structure_only_requirements(
         criteria_spec
     )
+    # The richer structure-only tree path covers clusters and logic gates. Falls
+    # back to None (forcing Python evaluation) when any biome criterion is
+    # present anywhere in the spec — biome conditions stay on Python for now.
+    _WORKER_NATIVE_TREE = compile_structure_only_tree(criteria_spec)
 
 
 def _check_chunk(seeds: List[int]) -> List[int]:
@@ -133,16 +140,17 @@ def _check_chunk(seeds: List[int]) -> List[int]:
     process boundaries on every Python version, including 3.13+.
     """
     assert _WORKER_CRITERIA is not None, "worker not initialised"
-    if (
-        _WORKER_RUST_STRUCTURE_REQUIREMENTS
-        and rust_backend_available()
-        and _is_contiguous(seeds)
-    ):
-        return find_structure_matches_range(
-            seeds[0],
-            len(seeds),
-            _WORKER_RUST_STRUCTURE_REQUIREMENTS,
-        )
+    if rust_backend_available() and _is_contiguous(seeds):
+        # Prefer the richer tree fast-path (covers cluster + logic gates); fall
+        # back to the legacy flat-structure path; finally Python evaluation.
+        if _WORKER_NATIVE_TREE is not None:
+            return find_tree_matches_range(seeds[0], len(seeds), _WORKER_NATIVE_TREE)
+        if _WORKER_RUST_STRUCTURE_REQUIREMENTS:
+            return find_structure_matches_range(
+                seeds[0],
+                len(seeds),
+                _WORKER_RUST_STRUCTURE_REQUIREMENTS,
+            )
     return [s for s in seeds if _WORKER_CRITERIA.matches(s)]
 
 

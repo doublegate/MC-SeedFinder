@@ -9,6 +9,27 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Native structure-only conditions-tree fast-path.** The Rust core gains a
+  `conditions` module that evaluates the structure-only subset of the Python
+  `conditions` tree (NearbyStructure + StructureCluster + all_of/any_of/none_of)
+  natively. Spec is serialised once per worker as JSON over PyO3; per-seed
+  evaluation never allocates or runs string comparisons. The worker pool prefers
+  this richer path over the legacy flat-structure path, and falls back to Python
+  evaluation only when a biome criterion is anywhere in the spec.
+- `structures::count_structures_in_radius` helper (mirrors the canonical region
+  walk used by `has_structure_in_radius`) so cluster predicates and "any in
+  radius" predicates cannot disagree about a single placement.
+- Rust/Python parity tests for flat structure, logic gates, cluster, none_of,
+  biome-mixed fallback routing, and unknown-structure rejection.
+
+### Architecture
+
+- Evaluator splits cleanly into a **prefilter** (structure RNG, native; in
+  scope for the Phase 6 wgpu compute shader) and a **confirmation** layer
+  (biome conditions, Python + cubiomes for now). Adding biome-native evaluation
+  in a later phase only extends the `conditions::Node` enum without touching
+  the existing layers.
+
 - **Advanced condition system.** New recursive ``conditions`` tree in the JSON
   schema with three combinators (``all_of`` / ``any_of`` / ``none_of``) and new
   leaf criteria: ``cluster`` (multi-structure / quad-hut style, generalized from

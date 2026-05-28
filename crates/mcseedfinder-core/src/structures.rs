@@ -234,6 +234,48 @@ fn floor_div(a: i32, b: i32) -> i32 {
     a.div_euclid(b)
 }
 
+/// Count every placement of `req.structure` within `req.max_distance` of the
+/// reference centre. Uses the same region walk as [`has_structure_in_radius`]
+/// so a cluster predicate (count >= N) cannot disagree with a "in radius"
+/// predicate about whether any single placement is in range.
+pub fn count_structures_in_radius(seed: i64, req: &StructureRequirement) -> u32 {
+    if req.structure == StructureType::Stronghold {
+        let max_dist_sq = (req.max_distance as i64) * (req.max_distance as i64);
+        return iter_strongholds(seed, 1)
+            .filter(|pos| {
+                let dx = (pos.block_x() - req.centre_x) as i64;
+                let dz = (pos.block_z() - req.centre_z) as i64;
+                dx * dx + dz * dz <= max_dist_sq
+            })
+            .count() as u32;
+    }
+
+    let cfg = structure_config(req.structure);
+    let chunk_radius = req.max_distance / 16 + 1;
+    let cx_min = req.centre_x.div_euclid(16) - chunk_radius;
+    let cx_max = req.centre_x.div_euclid(16) + chunk_radius;
+    let cz_min = req.centre_z.div_euclid(16) - chunk_radius;
+    let cz_max = req.centre_z.div_euclid(16) + chunk_radius;
+    let rx_min = floor_div(cx_min, cfg.spacing);
+    let rx_max = floor_div(cx_max, cfg.spacing);
+    let rz_min = floor_div(cz_min, cfg.spacing);
+    let rz_max = floor_div(cz_max, cfg.spacing);
+    let max_dist_sq = (req.max_distance as i64) * (req.max_distance as i64);
+
+    let mut count: u32 = 0;
+    for rx in rx_min..=rx_max {
+        for rz in rz_min..=rz_max {
+            let pos = get_structure_pos(req.structure, seed, rx as i64, rz as i64);
+            let dx = (pos.block_x() - req.centre_x) as i64;
+            let dz = (pos.block_z() - req.centre_z) as i64;
+            if dx * dx + dz * dz <= max_dist_sq {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 pub fn iter_strongholds(seed: i64, max_rings: usize) -> impl Iterator<Item = StructurePos> {
     assert!(
         (1..=8).contains(&max_rings),
