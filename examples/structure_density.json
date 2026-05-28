@@ -1,0 +1,9 @@
+{
+  "_comment": "Pure structure search (no biome filter, so this runs FAST — millions of seeds/sec). Find ocean monument + 2 shipwrecks all within 1500 blocks of origin.",
+
+  "nearby_structures": [
+    { "structure": "ocean_monument", "max_distance": 1500 },
+    { "structure": "shipwreck",      "max_distance": 1500 },
+    { "structure": "swamp_hut",      "max_distance": 2500 }
+  ]
+}

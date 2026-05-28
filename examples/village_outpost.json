@@ -1,0 +1,11 @@
+{
+  "_comment": "Find seeds that spawn in plains/savanna AND have a village within 1200 blocks AND a pillager outpost within 2000 blocks. Structure constraints are accurate; spawn biome filtering uses the approximate generator unless cubiomes-py is installed.",
+
+  "spawn_biome": ["plains", "sunflower_plains", "savanna"],
+  "spawn_radius": 96,
+
+  "nearby_structures": [
+    { "structure": "village",          "max_distance": 1200 },
+    { "structure": "pillager_outpost", "max_distance": 2000 }
+  ]
+}
