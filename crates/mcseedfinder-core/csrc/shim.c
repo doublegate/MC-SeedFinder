@@ -68,3 +68,14 @@ void mcsf_init_biome_colors(unsigned char *out) {
     /* cubiomes initBiomeColors expects unsigned char[256][3]. */
     initBiomeColors((unsigned char (*)[3]) out);
 }
+
+/* The buffer cubiomes needs for genBiomes can be larger than sx*sy*sz at
+ * certain (scale, dimension) combinations — cubiomes reuses it for layered
+ * scratch storage. Always allocate this many int32s before calling
+ * mcsf_gen_biomes, or you'll get heap corruption (malloc: corrupted top size).
+ * Pass sy=0 for a 2D plane. */
+size_t mcsf_min_cache_size(
+    const Generator *g, int scale, int sx, int sy, int sz
+) {
+    return getMinCacheSize(g, scale, sx, sy, sz);
+}

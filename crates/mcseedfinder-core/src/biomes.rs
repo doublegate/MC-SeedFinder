@@ -57,6 +57,13 @@ extern "C" {
         y: c_int,
     ) -> c_int;
     fn mcsf_init_biome_colors(out: *mut u8);
+    fn mcsf_min_cache_size(
+        g: *const CubGenerator,
+        scale: c_int,
+        sx: c_int,
+        sy: c_int,
+        sz: c_int,
+    ) -> usize;
 }
 
 /// 256-entry cubiomes biome RGB colormap, fetched once.
@@ -168,11 +175,19 @@ impl BiomeBackend {
         }
         self.ensure_seed(world_seed);
 
-        // Batched biome fill via cubiomes' genBiomes. `(sx*sz)` ints.
+        // CRITICAL: cubiomes' genBiomes may use the output buffer as scratch
+        // for its layered noise pipeline; the buffer MUST be at least
+        // getMinCacheSize ints, which can exceed sx*sz at certain scales.
+        // (Earlier this was sized at sx*sz and a zoom-out crashed glibc with
+        // "malloc(): corrupted top size" — the overrun trashed heap metadata.)
         let total = (sx as usize) * (sz as usize);
-        let mut ids = vec![0i32; total];
-        // SAFETY: generator is initialized + seeded; the buffer has exactly
-        // sx*sz entries; cubiomes y=0 means a 2D plane at the scaled height.
+        // SAFETY: generator is initialized + seeded.
+        let min_cache =
+            unsafe { mcsf_min_cache_size(self.generator, scale, sx as c_int, 0, sz as c_int) };
+        let cache_len = min_cache.max(total);
+        let mut ids = vec![0i32; cache_len];
+        // SAFETY: generator is initialized + seeded; the buffer is at least
+        // mcsf_min_cache_size ints; cubiomes y=0 means a 2D plane.
         let rc = unsafe {
             mcsf_gen_biomes(
                 self.generator,
@@ -189,10 +204,12 @@ impl BiomeBackend {
             return Err(format!("cubiomes genBiomes failed with rc={rc}"));
         }
 
-        // Map biome IDs → cubiomes RGB colormap → RGBA pixel buffer.
+        // Map biome IDs → cubiomes RGB colormap → RGBA pixel buffer. Only the
+        // first `total` ints are the readable output (the rest of the cache
+        // is post-generation scratch).
         let colors = biome_colormap();
         let mut rgba = Vec::with_capacity(total * 4);
-        for &bid in &ids {
+        for &bid in &ids[..total] {
             let [r, g, b] = if (0..256).contains(&bid) {
                 colors[bid as usize]
             } else {
@@ -283,6 +300,28 @@ mod tests {
         let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
         assert!(g.render_tile_png(1, 3, 0, 0, 32, 32).is_err());
         assert!(g.render_tile_png(1, 4, 0, 0, 0, 32).is_err());
+    }
+
+    // Regression: previously, sizing the genBiomes output buffer at sx*sz
+    // overran the heap at coarser scales (cubiomes uses the buffer as scratch
+    // and requires getMinCacheSize ints). A zoom-out from scale 4 → 16/64/256
+    // would corrupt the allocator and crash the app with
+    // "malloc(): corrupted top size". Exercise every supported scale at a
+    // realistic tile size; if any of them ever corrupts memory again, address
+    // sanitizers or just a fresh allocator state on the next test will trip.
+    #[test]
+    fn render_tile_succeeds_at_every_supported_scale() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        for &scale in &[1, 4, 16, 64, 256] {
+            let bytes = g
+                .render_tile_png(1, scale, -512, -512, 256, 256)
+                .unwrap_or_else(|e| panic!("scale {scale} failed: {e}"));
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+                "scale {scale} produced bad PNG header"
+            );
+        }
     }
 
     #[test]
