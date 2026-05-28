@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,10 @@ use uuid::Uuid;
 // it just looks unusual in `use` paths.
 use _native::biomes::{BiomeBackend, DEFAULT_Y};
 use _native::conditions::{self, CompiledNode, Node};
-use _native::structures::{iter_strongholds, iter_structures_in_radius, StructureType};
+use _native::gpu::GpuSearcher;
+use _native::structures::{
+    iter_strongholds, iter_structures_in_radius, StructureRequirement, StructureType,
+};
 
 // ---------------------------------------------------------------------------
 // Wire-format types
@@ -81,12 +84,37 @@ struct CompletedEvent {
 #[derive(Default)]
 struct AppState {
     jobs: Mutex<HashMap<String, JobInner>>,
+    /// Lazy GPU searcher. First search to qualify (single NearbyStructure leaf,
+    /// no biomes) attempts to init wgpu; subsequent searches reuse the result.
+    /// `Outer = "init has been attempted"`, `inner = "did it succeed"`.
+    gpu: OnceLock<Option<GpuSearcher>>,
 }
 
 #[derive(Default)]
 struct JobInner {
     results: Vec<SeedReport>,
     cancel: Arc<AtomicBool>,
+}
+
+/// If the compiled tree boils down to a single `NearbyStructure` predicate
+/// (possibly nested inside single-child groups, which is how the React tree
+/// builder represents a basic spec), return its requirement so the GPU
+/// prefilter can take the search. Returns `None` for clusters, multi-leaf
+/// groups, biome leaves, or stronghold (different RNG path).
+fn try_extract_single_nearby(node: &CompiledNode) -> Option<StructureRequirement> {
+    match node {
+        CompiledNode::Nearby(req) => {
+            if req.structure == StructureType::Stronghold {
+                None
+            } else {
+                Some(req.clone())
+            }
+        }
+        CompiledNode::AllOf(children) | CompiledNode::AnyOf(children) if children.len() == 1 => {
+            try_extract_single_nearby(&children[0])
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +262,96 @@ fn emit_completed(
     );
 }
 
+/// GPU fast-path. Chunks dispatches so the cancel flag can be checked between
+/// each, and so a `search-progress` event fires at chunk boundaries (same
+/// shape as the CPU path so the UI doesn't have to special-case it).
+fn run_search_gpu(
+    app: &AppHandle,
+    job_id: &str,
+    spec: &SearchSpec,
+    req: &StructureRequirement,
+    searcher: &GpuSearcher,
+    cancel: &AtomicBool,
+) {
+    // 65k seeds per dispatch ≈ a few tens of ms on a modern GPU — small enough
+    // for snappy cancellation, large enough that the per-dispatch overhead
+    // (uniform/buffer create + map_async) stays a small fraction of GPU time.
+    const CHUNK: u64 = 65_536;
+    let mut scanned: u64 = 0;
+    let mut matches: u64 = 0;
+
+    while scanned < spec.count {
+        if cancel.load(Ordering::Relaxed) {
+            emit_completed(app, job_id, scanned, matches, "cancelled", None);
+            return;
+        }
+        let this_chunk = CHUNK.min(spec.count - scanned);
+        let chunk_start = spec.start_seed.wrapping_add(scanned as i64);
+        let chunk_matches = match searcher.find_nearby_structure_matches(
+            chunk_start,
+            this_chunk,
+            req.structure,
+            req.max_distance,
+            req.centre_x,
+            req.centre_z,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                emit_completed(
+                    app,
+                    job_id,
+                    scanned,
+                    matches,
+                    "error",
+                    Some(format!("gpu dispatch failed: {e}")),
+                );
+                return;
+            }
+        };
+
+        for seed in chunk_matches {
+            let mut exactness = HashMap::new();
+            exactness.insert("structures".to_string(), "exact".to_string());
+            let report = SeedReport {
+                seed,
+                edition: spec.edition.clone(),
+                version: spec.version.clone(),
+                dimension: spec.dimension.clone(),
+                score: 0.0,
+                matched_features: vec!["structure_conditions".into(), "gpu_prefilter".into()],
+                exactness,
+                warnings: Vec::new(),
+            };
+            if let Some(jobs) = app.try_state::<AppState>() {
+                if let Ok(mut guard) = jobs.jobs.lock() {
+                    if let Some(inner) = guard.get_mut(job_id) {
+                        inner.results.push(report.clone());
+                    }
+                }
+            }
+            let _ = app.emit("search-match", &report);
+            matches += 1;
+            if matches >= spec.max_matches {
+                let scanned_final = scanned + this_chunk;
+                emit_completed(app, job_id, scanned_final, matches, "max_matches", None);
+                return;
+            }
+        }
+
+        scanned += this_chunk;
+        let _ = app.emit(
+            "search-progress",
+            ProgressEvent {
+                job_id: job_id.to_string(),
+                scanned,
+                matches,
+            },
+        );
+    }
+
+    emit_completed(app, job_id, scanned, matches, "range_exhausted", None);
+}
+
 fn run_search(
     app: AppHandle,
     job_id: String,
@@ -241,6 +359,24 @@ fn run_search(
     compiled: CompiledNode,
     cancel: Arc<AtomicBool>,
 ) {
+    // GPU fast-path: when the criteria boil down to a single NearbyStructure
+    // predicate (the default React-tree shape, or any single-child group of
+    // one), dispatch the search on wgpu. Falls through to the CPU evaluator
+    // for clusters, multi-leaf groups, biome conditions, or any GPU init
+    // failure. Init is attempted exactly once per process and cached.
+    if !conditions::has_biome_leaves(&compiled) {
+        if let Some(req) = try_extract_single_nearby(&compiled) {
+            let state = app.try_state::<AppState>();
+            let searcher = state
+                .as_ref()
+                .and_then(|s| s.gpu.get_or_init(GpuSearcher::try_new).as_ref());
+            if let Some(searcher) = searcher {
+                run_search_gpu(&app, &job_id, &spec, &req, searcher, &cancel);
+                return;
+            }
+        }
+    }
+
     // Build a cubiomes biome backend ONCE per search, reused across seeds and
     // all biome leaves. Only when the spec actually contains biome leaves —
     // pure-structure searches stay on the cheap structure-only evaluator path.

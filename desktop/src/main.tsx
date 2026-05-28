@@ -117,6 +117,48 @@ function pickScale(zoomLevel: number): number {
 function clampZoom(z: number): number {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
 }
+
+// ---------------------------------------------------------------------------
+// Tile LRU cache helpers
+// ---------------------------------------------------------------------------
+
+function tileKey(
+  seed: number,
+  version: string,
+  x: number,
+  z: number,
+  sx: number,
+  sz: number,
+  scale: number,
+): string {
+  return `${seed}|${version}|${x},${z}|${sx}x${sz}@${scale}`;
+}
+
+function getCachedTile(cache: Map<string, TileResponse>, key: string): TileResponse | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    // Touch — reinsert at end (Map iteration order = insertion order, which
+    // doubles as a tiny LRU without an extra data structure).
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+function putCachedTile(
+  cache: Map<string, TileResponse>,
+  key: string,
+  value: TileResponse,
+  capacity: number,
+): void {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > capacity) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
 // Structures shown as pins on the map (and queried in batch from the backend).
 const PIN_STRUCTURES = [
   "village",
@@ -161,6 +203,14 @@ function App() {
   // Pane dimensions in CSS pixels — drives the tile request size so the
   // rendered biome map fills the available area and reflows on resize.
   const [paneSize, setPaneSize] = useState({ w: 800, h: 600 });
+
+  // In-memory LRU cache of rendered biome tiles, keyed by the full request
+  // signature. Hits are served instantly so panning to recently-visited
+  // areas (or to a neighbor we prefetched) doesn't blink to the loading
+  // state. CSS transforms already run on the GPU compositor; the missing
+  // piece for fluid pan was tile *availability*, which this fixes.
+  const tileCacheRef = useRef<Map<string, TileResponse>>(new Map());
+  const TILE_CACHE_MAX = 32;
 
   // Active-drag pixel offset (CSS translate). Committed to viewCenter on
   // pointer-up, then the tile/pin fetch effect re-fires.
@@ -433,7 +483,10 @@ function App() {
     };
   }, []);
 
-  // Fetch the biome tile AND structure pins whenever the view changes.
+  // Fetch the biome tile AND structure pins whenever the view changes. Tiles
+  // pass through an LRU cache; once a tile is rendered (here or by a prefetch
+  // for a neighboring view) panning back to it is instant. Pins are not
+  // cached — they're cheap to recompute and we always want them current.
   useEffect(() => {
     if (selectedSeed == null) {
       setTile(null);
@@ -453,40 +506,84 @@ function App() {
     const tileSpanZ = sz * cubScale;
     const tileX = viewCenter.x - Math.round(tileSpanX / 2);
     const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
+
     let cancelled = false;
+
+    const key = tileKey(selectedSeed, version, tileX, tileZ, sx, sz, cubScale);
+    const cached = getCachedTile(tileCacheRef.current, key);
+
     (async () => {
+      // Show any cached tile immediately, then refresh pins (which we never
+      // cache) alongside a re-confirmation fetch only if the cache missed.
+      if (cached) {
+        setTile(cached);
+      }
+
       try {
-        const [t, ps] = await Promise.all([
-          invoke<TileResponse>("render_tile", {
-            request: {
-              seed: selectedSeed,
-              version,
-              dimension: "overworld",
-              x: tileX,
-              z: tileZ,
-              scale: cubScale,
-              sx,
-              sz,
-            },
-          }),
-          invoke<StructurePin[]>("list_structures_in_view", {
-            request: {
-              seed: selectedSeed,
-              structures: PIN_STRUCTURES,
-              x: tileX,
-              z: tileZ,
-              sx: tileSpanX,
-              sz: tileSpanZ,
-            },
-          }),
-        ]);
+        const tilePromise = cached
+          ? Promise.resolve(cached)
+          : invoke<TileResponse>("render_tile", {
+              request: {
+                seed: selectedSeed,
+                version,
+                dimension: "overworld",
+                x: tileX,
+                z: tileZ,
+                scale: cubScale,
+                sx,
+                sz,
+              },
+            });
+        const pinsPromise = invoke<StructurePin[]>("list_structures_in_view", {
+          request: {
+            seed: selectedSeed,
+            structures: PIN_STRUCTURES,
+            x: tileX,
+            z: tileZ,
+            sx: tileSpanX,
+            sz: tileSpanZ,
+          },
+        });
+        const [t, ps] = await Promise.all([tilePromise, pinsPromise]);
         if (cancelled) return;
         setTile(t);
         setPins(ps);
+        putCachedTile(tileCacheRef.current, key, t, TILE_CACHE_MAX);
       } catch (e) {
         if (!cancelled) setError(String(e));
       }
     })();
+
+    // Background prefetch: ask render_tile for the 4 neighboring views so the
+    // next pan in any direction can serve from cache. Fire-and-forget; even if
+    // the user pans elsewhere these go into the LRU and may help later.
+    const neighborOffsets: Array<[number, number]> = [
+      [tileSpanX, 0],
+      [-tileSpanX, 0],
+      [0, tileSpanZ],
+      [0, -tileSpanZ],
+    ];
+    for (const [ox, oz] of neighborOffsets) {
+      const nx = tileX + ox;
+      const nz = tileZ + oz;
+      const nkey = tileKey(selectedSeed, version, nx, nz, sx, sz, cubScale);
+      if (tileCacheRef.current.has(nkey)) continue;
+      invoke<TileResponse>("render_tile", {
+        request: {
+          seed: selectedSeed,
+          version,
+          dimension: "overworld",
+          x: nx,
+          z: nz,
+          scale: cubScale,
+          sx,
+          sz,
+        },
+      })
+        .then((t) => putCachedTile(tileCacheRef.current, nkey, t, TILE_CACHE_MAX))
+        .catch(() => undefined); // silent — stale prefetch failures don't matter
+    }
+
     return () => {
       cancelled = true;
     };

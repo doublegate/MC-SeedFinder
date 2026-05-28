@@ -16,13 +16,17 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["biomes"]
+default = ["biomes", "gpu"]
 # Exact biome generation via Cubitect's cubiomes C library, compiled from the
 # vendored submodule with the `cc` crate and a small hand-written FFI shim (no
 # bindgen — deterministic across toolchains/CI). On by default; disable with
 # --no-default-features to build the pure-Rust structure/RNG core without a C
 # toolchain (e.g. for the GPU/wasm-friendly prefilter path).
 biomes = []
+# wgpu-based compute prefilter for the structure-RNG hot path. On by default;
+# init falls back to CPU at runtime if no GPU adapter is reachable, so the
+# feature is safe to ship enabled in production builds.
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 # NOTE: `pyo3` is intentionally NOT declared as an explicit feature. It stays an
 # implicit feature of the optional `pyo3` dependency so that maturin's
 # `features = ["pyo3/extension-module"]` activates `#[cfg(feature = "pyo3")]`.
@@ -38,6 +42,13 @@ serde_json = "1"
 # `png` is much lighter than the `image` crate; we only need to write PNGs.
 png = "0.17"
 base64 = "0.22"
+# GPU compute prefilter for structure-RNG (gated on the `gpu` feature). wgpu
+# brings the portable Vulkan/Metal/DX12 backends; bytemuck handles the
+# Pod/Zeroable derives for buffer interop; pollster lets us drive wgpu's
+# async APIs synchronously from the search loop.
+wgpu = { version = "23", optional = true, default-features = false, features = ["metal", "dx12", "wgsl"] }
+bytemuck = { version = "1.16", optional = true, features = ["derive"] }
+pollster = { version = "0.4", optional = true }
 
 [build-dependencies]
 # Compiles the vendored cubiomes C sources + shim when the `biomes` feature is on.

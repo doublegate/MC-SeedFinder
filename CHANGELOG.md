@@ -9,6 +9,37 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **GPU compute prefilter via wgpu (Phase 6a).** New `crates/mcseedfinder-core/
+  src/gpu.{wgsl,rs}` implements Java's 48-bit LCG and structure placement in
+  WGSL, dispatched in parallel across a seed range. The WGSL kernel uses u32
+  limbs to emulate the 64-bit arithmetic WGSL lacks natively (schoolbook
+  multiply with explicit carries); the host passes every multi-limb constant
+  (RNG multiplier, region mixers, salts, distance threshold) via the uniform
+  buffer so hex transcription happens in one place. Three GPU↔CPU parity
+  tests assert byte-identical match lists across linear-spread, triangular-
+  spread, and off-origin centre cases — covering 3,500 seeds total.
+- **Tauri GPU fast-path.** `run_search` detects when the conditions tree
+  collapses to a single `NearbyStructure` predicate (the default React tree
+  shape, and any single-child group wrapping one) and dispatches via wgpu
+  in 65,536-seed chunks. Cancellation is checked between chunks; per-match
+  events stream as today; the `matched_features` array records
+  `"gpu_prefilter"` so the UI / consumers know which path ran. Init is
+  lazy + cached in `AppState.gpu: OnceLock<Option<GpuSearcher>>`; failure
+  falls back transparently to the CPU evaluator.
+- **Tile LRU cache + neighbor prefetch.** New 32-entry tile cache in
+  `main.tsx`, keyed by `(seed, version, x, z, sx, sz, scale)`. Hits serve
+  instantly so panning back to a recently-viewed area never blinks to
+  "Rendering biome tile…". On every view change, the four adjacent over-
+  rendered tiles are fetched in the background and inserted into the cache
+  — pan-on-release in any direction now usually hits a warm tile and
+  appears immediately. (CSS transforms continue to be GPU-composited by
+  the WebView, so the *visible* pan/zoom was already GPU-accelerated; the
+  missing piece was tile *availability*, which this fixes.)
+- `gpu` cargo feature on `mcseedfinder-core` (default-on) wires `wgpu`,
+  `bytemuck`, `pollster`. The wgpu backends gated to `metal` / `dx12` /
+  `wgsl` keep the dependency tree lean; Vulkan support comes for free with
+  the wgpu default backends on Linux.
+
 - **Bedrock Edition foundation (Phase 5).** First-class `BedrockProvider`
   replaces the Java-era stub: validates seeds against Bedrock's signed i32
   range, enumerates which criterion types the Bedrock backend can't yet

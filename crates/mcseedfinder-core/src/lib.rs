@@ -8,6 +8,8 @@ pub mod bedrock;
 #[cfg(feature = "biomes")]
 pub mod biomes;
 pub mod conditions;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod java_random;
 pub mod structures;
 
