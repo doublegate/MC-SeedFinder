@@ -11,6 +11,8 @@ pub mod conditions;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_biome;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
 pub mod gpu_btree;
 #[cfg(all(feature = "gpu", feature = "biomes"))]
 pub mod gpu_climate;

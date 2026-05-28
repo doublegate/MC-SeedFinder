@@ -307,3 +307,25 @@ int mcsf_sample_biome_at(
     setBiomeSeed(&bn, seed, large);
     return sampleBiomeNoise(&bn, out_np6, x, y, z, NULL, 0);
 }
+
+/* --- Phase 6c-5: depth-spline pre-computation -------------------------- */
+/* `getSpline` is exported from biomenoise.c but has no prototype in any
+ * cubiomes public header. Forward-declare it here so we can call it. */
+extern float getSpline(const Spline *sp, const float *vals);
+
+/* The spline tree in BiomeNoise.sp is seed-independent (built by
+ * initBiomeNoise from the MC version). This computes the `d` (depth)
+ * climate value the same way `sampleBiomeNoise` does internally, given
+ * the three already-sampled climate values c, e, w. Pulling the spline
+ * out of the inner loop lets the GPU pipeline batch-sample c/e/w then
+ * compute depth on the CPU once per pixel — the spline is f32 in
+ * cubiomes and is small per-pixel work compared to the noise stack. */
+double mcsf_compute_depth(int mc, double c, double e, double w, int y) {
+    BiomeNoise bn;
+    memset(&bn, 0, sizeof(bn));
+    initBiomeNoise(&bn, mc);
+    float w_t = -3.0F * (fabsf(fabsf((float)w) - 0.6666667F) - 0.33333334F);
+    float np_param[4] = {(float)c, (float)e, w_t, (float)w};
+    double off = getSpline(bn.sp, np_param) + 0.015F;
+    return 1.0 - (y * 4) / 128.0 - 83.0 / 160.0 + off;
+}
