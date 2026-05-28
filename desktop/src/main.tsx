@@ -94,6 +94,29 @@ function tileSizeForPane(w: number, h: number): { sx: number; sz: number } {
 // cubiomes' supported scales: 1, 4, 16, 64, 256. Lower index = closer zoom.
 const SCALE_LEVELS = [1, 4, 16, 64, 256] as const;
 const DEFAULT_SCALE = 4;
+const MIN_ZOOM = 0.05;
+const MAX_ZOOM = 8;
+
+/** Pick the cubiomes scale closest to "ideal" in log space.
+ *  ideal = DEFAULT_SCALE / zoomLevel — the cubiomesScale that lets cssScale ≈ 1. */
+function pickScale(zoomLevel: number): number {
+  const ideal = DEFAULT_SCALE / zoomLevel;
+  for (let i = 0; i < SCALE_LEVELS.length; i++) {
+    const s = SCALE_LEVELS[i];
+    if (s >= ideal) {
+      if (i === 0) return s;
+      const lower = SCALE_LEVELS[i - 1];
+      // Compare in log space: pick whichever is closer to `ideal`.
+      const logMid = Math.sqrt(lower * s);
+      return ideal < logMid ? lower : s;
+    }
+  }
+  return SCALE_LEVELS[SCALE_LEVELS.length - 1];
+}
+
+function clampZoom(z: number): number {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+}
 // Structures shown as pins on the map (and queried in batch from the backend).
 const PIN_STRUCTURES = [
   "village",
@@ -124,9 +147,16 @@ function App() {
   const [pins, setPins] = useState<StructurePin[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // Map view state (block coordinates of the view centre + cubiomes scale).
+  // Map view state. `zoomLevel` is a continuous float; `pickScale(zoomLevel)`
+  // chooses the cubiomes discrete scale to render with, and CSS scales the
+  // tile by the residual ratio so pinch/wheel feels smooth without forcing a
+  // cubiomes re-render at every micro-tick. zoomLevel = 1.0 → DEFAULT_SCALE.
   const [viewCenter, setViewCenter] = useState({ x: 0, z: 0 });
-  const [scale, setScale] = useState<number>(DEFAULT_SCALE);
+  const [zoomLevel, setZoomLevel] = useState(1.0);
+  // The cubiomes scale derived from zoomLevel. Memoized so the tile fetch
+  // effect doesn't re-run on every continuous-zoom tick — only when the
+  // chosen discrete scale actually changes.
+  const cubScale = useMemo(() => pickScale(zoomLevel), [zoomLevel]);
 
   // Pane dimensions in CSS pixels — drives the tile request size so the
   // rendered biome map fills the available area and reflows on resize.
@@ -276,7 +306,7 @@ function App() {
       },
       view:
         selectedSeed != null
-          ? { seed: selectedSeed, x: viewCenter.x, z: viewCenter.z, scale }
+          ? { seed: selectedSeed, x: viewCenter.x, z: viewCenter.z, zoom: zoomLevel }
           : null,
     };
     // btoa-safe UTF-8 round-trip.
@@ -314,7 +344,7 @@ function App() {
           // immediately clobber it.
           setTimeout(() => {
             setViewCenter({ x: v.x, z: v.z });
-            if (typeof v.scale === "number") setScale(v.scale);
+            if (typeof v.zoom === "number") setZoomLevel(clampZoom(v.zoom));
           }, 0);
         }
       }
@@ -327,7 +357,7 @@ function App() {
     if (!tile) return;
     const a = document.createElement("a");
     a.href = `data:image/png;base64,${tile.png_base64}`;
-    a.download = `seed-${tile.seed}-x${viewCenter.x}-z${viewCenter.z}-scale${scale}.png`;
+    a.download = `seed-${tile.seed}-x${viewCenter.x}-z${viewCenter.z}-zoom${zoomLevel.toFixed(2)}.png`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -377,7 +407,7 @@ function App() {
   // Re-centre on origin when a new seed is selected (don't carry pan/zoom).
   useEffect(() => {
     setViewCenter({ x: 0, z: 0 });
-    setScale(DEFAULT_SCALE);
+    setZoomLevel(1.0);
   }, [selectedSeed]);
 
   // Observe the map pane's CSS size and republish on resize (debounced so a
@@ -410,14 +440,17 @@ function App() {
       setPins([]);
       return;
     }
+    // Rendering happens at the cubiomes scale derived from zoomLevel (memoized
+    // above); CSS scale (computed downstream from the rendered tile's actual
+    // scale) handles the residual continuous zoom in/out.
     // Request a tile larger than the visible pane (over-render) so a
     // drag-pan reveals already-loaded content instead of black margins.
     const { sx, sz } = tileSizeForPane(
       paneSize.w * OVERSCAN,
       paneSize.h * OVERSCAN,
     );
-    const tileSpanX = sx * scale;
-    const tileSpanZ = sz * scale;
+    const tileSpanX = sx * cubScale;
+    const tileSpanZ = sz * cubScale;
     const tileX = viewCenter.x - Math.round(tileSpanX / 2);
     const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
     let cancelled = false;
@@ -431,7 +464,7 @@ function App() {
               dimension: "overworld",
               x: tileX,
               z: tileZ,
-              scale,
+              scale: cubScale,
               sx,
               sz,
             },
@@ -457,7 +490,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedSeed, version, viewCenter.x, viewCenter.z, scale, paneSize.w, paneSize.h]);
+  }, [selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
 
   // ---- Map pan handlers ----
   const onPanStart = useCallback(
@@ -485,48 +518,57 @@ function App() {
         setDrag(null);
         return;
       }
-      const pane = mapPaneRef.current;
-      if (pane && tile && (drag.dx !== 0 || drag.dz !== 0)) {
-        const rect = pane.getBoundingClientRect();
+      if (drag.dx !== 0 || drag.dz !== 0) {
         // Drag right → reveal LEFT of world → centre.x decreases.
-        // The tile is rendered into a CSS box `OVERSCAN ×` the pane on each
-        // axis, so divide by `rect.{width,height} * OVERSCAN` to convert
-        // a pane-pixel drag into a fraction of the tile, then multiply by
-        // the tile's per-axis block coverage.
-        const blockSpanX = tile.sx * tile.scale;
-        const blockSpanZ = tile.sz * tile.scale;
-        const tileCssW = rect.width * OVERSCAN;
-        const tileCssH = rect.height * OVERSCAN;
-        const blockDx = (-drag.dx / tileCssW) * blockSpanX;
-        const blockDz = (-drag.dz / tileCssH) * blockSpanZ;
+        // At the current view, 1 pane CSS pixel covers (DEFAULT_SCALE/zoomLevel)
+        // blocks — this is the user-perceived "blocks per screen pixel" and
+        // already accounts for any CSS scale, OVERSCAN, and tile.scale state.
+        const blocksPerPx = DEFAULT_SCALE / zoomLevel;
         setViewCenter((c) => ({
-          x: Math.round(c.x + blockDx),
-          z: Math.round(c.z + blockDz),
+          x: Math.round(c.x + -drag.dx * blocksPerPx),
+          z: Math.round(c.z + -drag.dz * blocksPerPx),
         }));
       }
       dragStartRef.current = null;
       setDrag(null);
       (e.target as Element).releasePointerCapture?.(e.pointerId);
     },
-    [drag, tile],
+    [drag, zoomLevel],
   );
 
+  // Zoom by a multiplicative step. 1.4× per click gives a noticeable but not
+  // jarring jump, ~5 clicks to traverse the full range. Continuous wheel
+  // (below) uses much finer steps.
   function zoomIn() {
-    setScale((s) => {
-      const i = SCALE_LEVELS.indexOf(s as (typeof SCALE_LEVELS)[number]);
-      return SCALE_LEVELS[Math.max(0, i - 1)];
-    });
+    setZoomLevel((z) => clampZoom(z * 1.4));
   }
   function zoomOut() {
-    setScale((s) => {
-      const i = SCALE_LEVELS.indexOf(s as (typeof SCALE_LEVELS)[number]);
-      return SCALE_LEVELS[Math.min(SCALE_LEVELS.length - 1, i + 1)];
-    });
+    setZoomLevel((z) => clampZoom(z / 1.4));
   }
   function resetView() {
     setViewCenter({ x: 0, z: 0 });
-    setScale(DEFAULT_SCALE);
+    setZoomLevel(1.0);
   }
+
+  // Wheel-to-zoom: each wheel tick multiplies zoom by exp(-deltaY/500),
+  // ~+10% per notch on most mice — natural, continuous, and rounds into the
+  // same cubScale boundary logic the buttons use.
+  const onWheel = useCallback(
+    (e: React.WheelEvent<HTMLDivElement>) => {
+      if (selectedSeed == null) return;
+      e.preventDefault();
+      const factor = Math.exp(-e.deltaY / 500);
+      setZoomLevel((z) => clampZoom(z * factor));
+    },
+    [selectedSeed],
+  );
+
+  // Smooth CSS-scale factor: applied to the over-rendered tile container so
+  // continuous zoomLevel changes show immediately without waiting for a
+  // cubiomes re-render. When `tile.scale` and `pickScale(zoomLevel)` agree
+  // (the steady-state after a refetch), cssScale ≈ 1 at the matching
+  // zoomLevel and grows/shrinks linearly until a scale boundary crosses.
+  const cssScale = tile ? (zoomLevel * tile.scale) / DEFAULT_SCALE : 1;
 
   // Helper: world (block) coord → percentage within the rendered tile.
   // Uses per-axis spans because the tile is no longer guaranteed square
@@ -603,6 +645,7 @@ function App() {
           onPointerMove={onPanMove}
           onPointerUp={onPanEnd}
           onPointerCancel={onPanEnd}
+          onWheel={onWheel}
           style={{ cursor: drag ? "grabbing" : selectedSeed != null ? "grab" : "default" }}
         >
           {tile ? (
@@ -612,12 +655,16 @@ function App() {
                 style={{
                   // Over-rendered tile: 150% of the pane, inset by -25% on
                   // each side so its centre aligns with the pane centre.
-                  // Drag's CSS translate stacks on top of the static inset.
+                  // Transform combines: continuous zoom (CSS scale) + pan
+                  // drag (CSS translate during a drag, identity otherwise).
                   top: `${OVERSCAN_INSET_PCT}%`,
                   left: `${OVERSCAN_INSET_PCT}%`,
                   width: `${OVERSCAN * 100}%`,
                   height: `${OVERSCAN * 100}%`,
-                  transform: drag ? `translate(${drag.dx}px, ${drag.dz}px)` : undefined,
+                  transformOrigin: "center center",
+                  transform: drag
+                    ? `translate(${drag.dx}px, ${drag.dz}px) scale(${cssScale})`
+                    : `scale(${cssScale})`,
                 }}
               >
                 <img
@@ -656,9 +703,9 @@ function App() {
                 <button onClick={resetView} title="Recenter on origin">⌂</button>
               </div>
               <div className="tileLabel">
-                seed {tile.seed} · 1:{scale} · centre ({viewCenter.x}, {viewCenter.z}) ·
-                {" "}
-                {pins.length} structure{pins.length === 1 ? "" : "s"} in view
+                seed {tile.seed} · zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
+                {" "}centre ({viewCenter.x}, {viewCenter.z}) ·
+                {" "}{pins.length} structure{pins.length === 1 ? "" : "s"} in view
               </div>
             </>
           ) : (

@@ -75,15 +75,28 @@ textarea {
   display: grid;
   grid-template-columns: 320px minmax(420px, 1fr) 360px;
   grid-template-rows: 1fr 36px;
-  min-height: 100vh;
+  /* Exactly viewport height so the bottom status row is pinned. Inner panels
+     scroll independently via overflow:auto + min-height:0 (without min-height:
+     0 a grid item refuses to shrink below its content, pushing the status row
+     off-screen). */
+  height: 100vh;
   background: var(--bg);
+  overflow: hidden;
+}
+
+.sidebar,
+.inspector,
+.mapPane {
+  min-height: 0;
+  min-width: 0;
 }
 
 .sidebar,
 .inspector {
   background: var(--panel);
   padding: 22px 18px 18px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .sidebar {
@@ -519,7 +532,9 @@ textarea {
   position: relative;
   width: 100%;
   height: 100%;
-  min-height: calc(100vh - 36px);
+  /* No min-height fallback — the parent .mapPane is now grid-sized to fit
+     within 100vh, so the map fills the available area without forcing the
+     shell to overflow when results pile up. */
   overflow: hidden;
   user-select: none;
   touch-action: none;
