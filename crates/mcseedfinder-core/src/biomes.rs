@@ -218,6 +218,30 @@ impl BiomeBackend {
         sz: u32,
         y_block: i32,
     ) -> Result<Vec<u8>, String> {
+        let (rgba, _) =
+            self.render_tile_rgba_and_ids_at_y(world_seed, scale, x, z, sx, sz, y_block)?;
+        Ok(rgba)
+    }
+
+    /// Like [`Self::render_tile_rgba_at_y`] but also returns the per-pixel
+    /// **biome IDs** as a `Vec<u8>` of length `sx * sz` (row-major, same
+    /// order as the RGBA bytes). The 3D voxel renderer + cursor biome
+    /// readout use the ids directly so they don't need to reverse-map RGB
+    /// → biome (which would be lossy at variants that share a colour).
+    ///
+    /// cubiomes biome IDs are in `0..=255`, fitting in `u8`. The magenta
+    /// sentinel (`bid` out of that range) maps to the same value (`255`)
+    /// in the id array so the renderer can detect it.
+    pub fn render_tile_rgba_and_ids_at_y(
+        &mut self,
+        world_seed: i64,
+        scale: i32,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+        y_block: i32,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
         if !matches!(scale, 1 | 4 | 16 | 64 | 256) {
             return Err(format!(
                 "invalid scale {scale}; expected 1, 4, 16, 64, or 256"
@@ -260,19 +284,23 @@ impl BiomeBackend {
 
         // Map biome IDs → cubiomes RGB colormap → RGBA pixel buffer. Only the
         // first `total` ints are the readable output (the rest of the cache
-        // is post-generation scratch).
+        // is post-generation scratch). At the same time, build a parallel
+        // Vec<u8> of biome IDs so callers can answer "what biome is here?"
+        // without a reverse colour lookup.
         let colors = biome_colormap();
         let mut rgba = Vec::with_capacity(total * 4);
+        let mut bid_bytes = Vec::with_capacity(total);
         for &bid in &ids[..total] {
-            let [r, g, b] = if (0..256).contains(&bid) {
-                colors[bid as usize]
+            let (rgb, id_u8) = if (0..256).contains(&bid) {
+                (colors[bid as usize], bid as u8)
             } else {
-                // Unknown / failure → magenta sentinel so it's visually obvious.
-                [255, 0, 255]
+                // Unknown / failure → magenta sentinel + 255 in the id array.
+                ([255, 0, 255], 255u8)
             };
-            rgba.extend_from_slice(&[r, g, b, 255]);
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            bid_bytes.push(id_u8);
         }
-        Ok(rgba)
+        Ok((rgba, bid_bytes))
     }
 
     /// **Approximate** surface block height at `(x, z)` for `world_seed`,

@@ -1,25 +1,47 @@
 /**
- * 3D isometric biome map (Phase 7+ — PR 2/3).
+ * 3D isometric biome map (Phase 7+).
  *
- * Renders the same biome tile bytes the 2D `<TileCanvas>` uses, but as a
- * `THREE.DataTexture` painted onto a `PlaneGeometry` whose per-vertex Y is
- * displaced by cubiomes' **approximate** surface heightmap. Pan = left-drag
- * (drei `<MapControls>`); zoom = buttons (orthographic `camera.zoom`); the
- * mouse wheel scrubs the Y biome-sample level (`onYDelta`).
+ * Renders the world as **true voxel columns** — one `InstancedMesh` instance
+ * per scale-grid cell — using:
+ *   • per-instance scale = approximate surface height (from cubiomes'
+ *     `mapApproxHeight`, labelled "approximate terrain" in the HUD),
+ *   • per-instance colour = biome at the wheel-driven Y level (bit-exact
+ *     via cubiomes' `genBiomes` at that Y).
  *
- * Accuracy: the biome texture is bit-exact via cubiomes (PR 1's
- * `render_tile_rgba_at_y`). The heightmap is approximate — the
- * "approximate terrain" badge in the HUD makes that visible to the user.
+ * The wheel scrubs the Y slice → biome IDs change → instance colours
+ * repaint. The heightmap doesn't depend on Y, so column heights persist
+ * while you scroll through Y.
+ *
+ * Pointer-driven biome readout uses R3F's `onPointerMove` on the
+ * InstancedMesh. `event.instanceId` identifies the cell; we look up its
+ * (x, z) world coord and biome ID in the cached tile arrays, then push
+ * the result to the parent's HUD via `onHover`.
+ *
+ * Accuracy: biome IDs and colours are bit-exact. The heightmap is
+ * approximate (cubiomes spline-based, NOT bit-exact Java terrain) and
+ * the "approximate terrain" pill in the HUD makes that visible.
  */
 
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
 import { Html, MapControls, OrthographicCamera } from "@react-three/drei";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 
+export type HoverInfo = {
+  /** Block X coordinate of the hovered cell (centre of the scale-grid cell). */
+  worldX: number;
+  /** Block Z coordinate of the hovered cell. */
+  worldZ: number;
+  /** Wheel-driven block Y (echoed for the HUD; biome is sampled at this Y). */
+  y: number;
+  /** cubiomes biome ID at (worldX, y, worldZ), 0..255. */
+  biomeId: number;
+};
+
 export type Map3DProps = {
   tile: {
     bytes: number[];
+    biomeIds?: number[]; // per-cell cubiomes biome IDs (u8 in number[])
     sx: number;
     sz: number;
     x: number; // top-left block X
@@ -32,12 +54,15 @@ export type Map3DProps = {
   cameraZoom: number;
   /** Block Y the wheel is currently scrubbed to. */
   yLevel: number;
-  /** Wheel delta callback (one Δy block per notch; Shift = ×16). */
+  /** Wheel delta callback (4-block step per notch; Shift = ×4 / 16 blocks). */
   onYDelta: (delta: number) => void;
+  /** Pointer hover callback. Fires when the hovered cell changes; null when
+   *  the pointer leaves the voxel mesh. */
+  onHover: (info: HoverInfo | null) => void;
 };
 
-/** Imperative helpers — the inner scene needs access to the camera and
- *  geometry to apply zoom changes and rebuild on (sx,sz) changes. */
+/** Imperative camera-zoom sync — the +/- buttons drive a prop, and the
+ *  orthographic camera's `zoom` field is updated here in response. */
 function CameraZoomSync({ cameraZoom }: { cameraZoom: number }) {
   const { camera } = useThree();
   useEffect(() => {
@@ -49,91 +74,166 @@ function CameraZoomSync({ cameraZoom }: { cameraZoom: number }) {
   return null;
 }
 
-/** Ground mesh: a unit `PlaneGeometry(sx-1, sz-1)` subdivisions rotated to
- *  lie flat on the XZ plane, textured with the biome RGBA bytes, and
- *  per-vertex Y displaced by the heightmap (when available). */
-function GroundMesh({
+/** RELIEF scales the heightmap into Three.js world units. heights are in
+ *  blocks; the voxel grid is in scale-grid units (1 unit = `scale` blocks).
+ *  We divide by scale to keep heights proportional to width, then multiply
+ *  by RELIEF to exaggerate vertical relief — 2.0 makes a 200-block
+ *  mountain ~100 grid units tall, unmistakeably 3D.
+ *
+ *  MIN_H ensures cells whose approximate height is ≤ 0 (deep ocean floor,
+ *  or absent heightmap) still render a thin slab the user can hover over.
+ */
+const RELIEF = 2.0;
+const MIN_H = 0.6;
+
+function cellHeight(rawY: number | undefined, scale: number): number {
+  if (rawY == null) return MIN_H;
+  const h = (rawY / scale) * RELIEF;
+  return Math.max(MIN_H, h);
+}
+
+/** InstancedMesh of one thin box per (i, j) cell. Per-instance scale →
+ *  voxel column height; per-instance colour → biome at current Y.
+ *
+ *  Update strategy:
+ *  - geometry/material/mesh are created once per (sx, sz) — recreating
+ *    65k instances per frame would be a real cost.
+ *  - per-instance MATRIX (scale + position) is rewritten when the
+ *    heightmap arrives or changes.
+ *  - per-instance COLOR is rewritten whenever the tile bytes change
+ *    (each wheel-Y scrub fires new bytes).
+ *  - both updates flag `instanceMatrix.needsUpdate` / `instanceColor.needsUpdate`. */
+function VoxelColumns({
   tile,
   heights,
+  yLevel,
+  onHover,
 }: {
   tile: Map3DProps["tile"];
   heights: number[] | null;
+  yLevel: number;
+  onHover: (info: HoverInfo | null) => void;
 }) {
-  // DataTexture lives across renders as long as (sx, sz, bytes) match. We
-  // recreate when sx/sz change (different tile dimensions); otherwise we
-  // mutate the buffer in place via `texture.image.data.set(...)` and flip
-  // `needsUpdate`. For now we recreate per change — cheap at 256x256 and
-  // keeps the React lifecycle simple.
-  const texture = useMemo(() => {
-    const data = new Uint8Array(tile.bytes);
-    const t = new THREE.DataTexture(data, tile.sx, tile.sz, THREE.RGBAFormat);
-    t.minFilter = THREE.NearestFilter;
-    t.magFilter = THREE.NearestFilter;
-    t.flipY = false; // tile bytes are top-left origin like ImageData
-    t.needsUpdate = true;
-    return t;
-  }, [tile.bytes, tile.sx, tile.sz]);
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const sx = tile.sx;
+  const sz = tile.sz;
+  const count = sx * sz;
 
-  useEffect(() => () => texture.dispose(), [texture]);
+  // Shared scratch objects — avoid per-instance allocations.
+  const tmpMatrix = useMemo(() => new THREE.Matrix4(), []);
+  const tmpColor = useMemo(() => new THREE.Color(), []);
 
-  // PlaneGeometry with (sx-1, sz-1) segments produces sx*sz vertices on the
-  // XZ grid. Index (j, i) → vertex (j*sx + i). Three.js's PlaneGeometry is
-  // initially in the XY plane; we rotate it -π/2 around X so it sits flat.
-  const geometry = useMemo(() => {
-    const g = new THREE.PlaneGeometry(tile.sx, tile.sz, tile.sx - 1, tile.sz - 1);
-    g.rotateX(-Math.PI / 2);
-    return g;
-  }, [tile.sx, tile.sz]);
-
-  useEffect(() => () => geometry.dispose(), [geometry]);
-
-  // Apply heightmap to position.y when available. heights[j*sx + i] is in
-  // (fractional) block Y; the plane is currently in scale-grid units, so
-  // we divide by the tile scale to keep the height visually proportional
-  // to the horizontal span (1 scale-grid step = `scale` blocks). For
-  // 1:4 that's a /4 — a 200-block-high mountain at scale 4 shows as 50
-  // grid units tall. Tunable scalar below ("relief") scales the result.
-  // RELIEF=2.0 makes a 200-block mountain visibly tower at ~100 grid units
-  // over a 192-unit-wide tile — exaggerated but unmistakeably 3D.
-  const RELIEF = 2.0;
+  // (Re)write per-instance matrices whenever sx/sz/heights change.
   useEffect(() => {
-    const pos = geometry.attributes.position as THREE.BufferAttribute;
-    const arr = pos.array as Float32Array;
-    const sx = tile.sx;
-    const sz = tile.sz;
-    if (heights && heights.length === sx * sz) {
-      for (let j = 0; j < sz; j++) {
-        for (let i = 0; i < sx; i++) {
-          const idx = (j * sx + i) * 3;
-          // PlaneGeometry after rotateX puts vertices as (x, y, z) where
-          // y is the up axis. position.y is what we want to displace.
-          arr[idx + 1] = (heights[j * sx + i] / tile.scale) * RELIEF;
-        }
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const halfX = sx / 2;
+    const halfZ = sz / 2;
+    for (let j = 0; j < sz; j++) {
+      for (let i = 0; i < sx; i++) {
+        const idx = j * sx + i;
+        const h = cellHeight(heights?.[idx], tile.scale);
+        // Centre each box at (i + 0.5 - sx/2, h/2, j + 0.5 - sz/2). Bottom
+        // sits on the ground plane (y=0); top reaches y=h.
+        const xCell = i + 0.5 - halfX;
+        const zCell = j + 0.5 - halfZ;
+        tmpMatrix.makeScale(1, h, 1);
+        tmpMatrix.setPosition(xCell, h * 0.5, zCell);
+        mesh.setMatrixAt(idx, tmpMatrix);
       }
-    } else {
-      // Flat — no heightmap available, fall back to a single plane.
-      for (let i = 1; i < arr.length; i += 3) arr[i] = 0;
     }
-    pos.needsUpdate = true;
-    geometry.computeVertexNormals();
-  }, [geometry, heights, tile.scale, tile.sx, tile.sz]);
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere(); // raycast culling
+  }, [heights, sx, sz, tile.scale, tmpMatrix]);
+
+  // (Re)write per-instance colours whenever tile.bytes change. Each wheel
+  // notch produces a fresh `tile` object with new bytes; this rewrites the
+  // 4 bytes/cell into normalised RGB on the instanceColor buffer.
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    for (let i = 0; i < count; i++) {
+      const off = i * 4;
+      tmpColor.setRGB(
+        tile.bytes[off] / 255,
+        tile.bytes[off + 1] / 255,
+        tile.bytes[off + 2] / 255,
+      );
+      mesh.setColorAt(i, tmpColor);
+    }
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  }, [tile.bytes, count, tmpColor]);
+
+  // Throttle hover-state writes: only push to the parent when the hovered
+  // cell index changes. Without this we'd fire a setState 60+ times per
+  // second while the cursor moves across cells.
+  const lastHoverIdRef = useRef<number | null>(null);
+
+  const handlePointerMove = (e: ThreeEvent<PointerEvent>) => {
+    const instanceId = e.instanceId;
+    if (instanceId == null) return;
+    if (lastHoverIdRef.current === instanceId) return;
+    lastHoverIdRef.current = instanceId;
+    const i = instanceId % sx;
+    const j = Math.floor(instanceId / sx);
+    const worldX = tile.x + (i + 0.5) * tile.scale; // centre of cell, block coords
+    const worldZ = tile.z + (j + 0.5) * tile.scale;
+    const biomeId = tile.biomeIds?.[instanceId] ?? 255;
+    onHover({ worldX: Math.floor(worldX), worldZ: Math.floor(worldZ), y: yLevel, biomeId });
+  };
+
+  const handlePointerOut = () => {
+    if (lastHoverIdRef.current != null) {
+      lastHoverIdRef.current = null;
+      onHover(null);
+    }
+  };
 
   return (
-    <mesh geometry={geometry}>
-      <meshBasicMaterial map={texture} toneMapped={false} />
+    <instancedMesh
+      ref={meshRef}
+      args={[undefined, undefined, count]}
+      onPointerMove={handlePointerMove}
+      onPointerOut={handlePointerOut}
+    >
+      <boxGeometry args={[1, 1, 1]} />
+      <meshBasicMaterial toneMapped={false} />
+    </instancedMesh>
+  );
+}
+
+/** Translucent yellow plane at Y = `yLevel` so the user sees where they
+ *  are inside the column stack. Only rendered when the heightmap is
+ *  available (otherwise there are no real columns to cut through). */
+function YPlaneIndicator({
+  tile,
+  yLevel,
+  show,
+}: {
+  tile: Map3DProps["tile"];
+  yLevel: number;
+  show: boolean;
+}) {
+  if (!show) return null;
+  const planeY = cellHeight(yLevel, tile.scale);
+  return (
+    <mesh position={[0, planeY, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2}>
+      <planeGeometry args={[tile.sx, tile.sz]} />
+      <meshBasicMaterial
+        color="#ffd966"
+        transparent
+        opacity={0.12}
+        side={THREE.DoubleSide}
+        depthWrite={false}
+      />
     </mesh>
   );
 }
 
-/** drei `<Html transform={false}>` markers for each structure pin. World
- *  coordinates are block-local; the tile mesh is centred at the origin and
- *  has integer-grid extents `(sx, sz)`, so we offset pins by the tile's
- *  top-left block coord. */
 function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps["pins"] }) {
-  // The mesh spans world coords [-sx/2, +sx/2] × [-sz/2, +sz/2] (after
-  // PlaneGeometry centring). The pin's block coord falls at
-  // (blockX - (tile.x + tile.sx*tile.scale/2)) / tile.scale in the same
-  // unit space.
+  // Mesh spans [-sx/2, +sx/2] × [-sz/2, +sz/2] grid units. World (block) coord
+  // for centre of pane is (tile.x + sx*scale/2, tile.z + sz*scale/2); each
+  // pin is offset by (blockX - centre) / scale grid units.
   const halfX = (tile.sx * tile.scale) / 2;
   const halfZ = (tile.sz * tile.scale) / 2;
   const centreX = tile.x + halfX;
@@ -141,12 +241,11 @@ function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps
 
   return (
     <>
-      {/* Spawn marker at world (0, 0). Only rendered if it's in the tile span. */}
       {Math.abs(0 - centreX) <= halfX && Math.abs(0 - centreZ) <= halfZ && (
         <Html
           transform={false}
           center
-          position={[(0 - centreX) / tile.scale, 0.5, (0 - centreZ) / tile.scale]}
+          position={[(0 - centreX) / tile.scale, 1.0, (0 - centreZ) / tile.scale]}
           className="spawn3d"
         >
           <div className="spawn">0,0</div>
@@ -159,7 +258,7 @@ function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps
           center
           position={[
             (p.block_x - centreX) / tile.scale,
-            0.5,
+            1.0,
             (p.block_z - centreZ) / tile.scale,
           ]}
         >
@@ -174,15 +273,11 @@ function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps
 }
 
 export function Map3D(props: Map3DProps) {
-  const { tile, heights, pins, cameraZoom, onYDelta } = props;
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const { tile, heights, pins, cameraZoom, yLevel, onYDelta, onHover } = props;
 
-  // Vanilla wheel handler — bypasses MapControls (which has wheel-zoom off).
-  // Step size = 4 blocks (one scale-Y unit at cubScale=4). cubiomes' Range.y
-  // is in scale-relative units, so adjacent block-Y values < 4 apart all
-  // map to the same scale-Y → identical biome bytes. Stepping by 4 makes
-  // every wheel notch produce a different cubiomes scale-Y. Shift = ×4
-  // (= 16-block / chunk-section step) for fast Y traversal.
+  // Wheel handler — bypasses MapControls (which has wheel-zoom off). Step
+  // size = 4 blocks (one scale-Y unit at cubScale=4) so every notch crosses
+  // a cubiomes scale-Y boundary; Shift = ×4 (one chunk-section).
   const onWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     e.preventDefault();
     const sign = e.deltaY > 0 ? -1 : 1;
@@ -190,19 +285,16 @@ export function Map3D(props: Map3DProps) {
     onYDelta(sign * mag);
   };
 
-  // Initial camera position for an isometric look: hover above the plane,
-  // rotated 45° around Y, tilted down ~30°. Orthographic projection means
-  // distance doesn't change apparent size; `zoom` does.
-  const camPos: [number, number, number] = [tile.sx * 0.6, tile.sx * 0.8, tile.sz * 0.6];
-  // Frustum derived from the tile span — keeps the entire mesh visible at
-  // zoom=1 regardless of pane aspect.
+  // Isometric-ish camera position: above and to the front-right, looking at
+  // the origin. Orthographic ignores distance for size; `zoom` does scale.
+  const camPos: [number, number, number] = [tile.sx * 0.7, tile.sx * 0.9, tile.sz * 0.7];
   const span = Math.max(tile.sx, tile.sz);
 
   return (
     <div
-      ref={wrapperRef}
       className="map3dCanvas"
       onWheel={onWheel}
+      onPointerLeave={() => onHover(null)}
       style={{ width: "100%", height: "100%" }}
     >
       <Canvas
@@ -231,7 +323,8 @@ export function Map3D(props: Map3DProps) {
           target={[0, 0, 0]}
         />
         <ambientLight intensity={1.0} />
-        <GroundMesh tile={tile} heights={heights} />
+        <VoxelColumns tile={tile} heights={heights} yLevel={yLevel} onHover={onHover} />
+        <YPlaneIndicator tile={tile} yLevel={yLevel} show={heights != null} />
         <PinOverlay tile={tile} pins={pins} />
       </Canvas>
     </div>

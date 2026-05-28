@@ -818,7 +818,7 @@ fn render_tile_rgba_cmd(
         release_biome_backend(&state, &request.version, &request.dimension, backend);
         return Err(SUPERSEDED.into());
     }
-    let rgba = backend.render_tile_rgba_at_y(
+    let result = backend.render_tile_rgba_and_ids_at_y(
         request.seed,
         request.scale,
         request.x,
@@ -834,9 +834,14 @@ fn render_tile_rgba_cmd(
     if superseded(&state.tile_counter, my_seq) {
         return Err(SUPERSEDED.into());
     }
-    rgba.map(|bytes| {
+    result.map(|(bytes, biome_ids)| {
         serde_json::json!({
             "bytes": bytes,
+            // Per-cell cubiomes biome IDs (u8). Same row-major order as
+            // `bytes`. Used by the 3D voxel renderer for per-instance
+            // colours and by the cursor-hover readout for instant biome
+            // name lookup with no IPC round-trip.
+            "biome_ids": biome_ids,
             "seed": request.seed,
             "version": request.version,
             "dimension": request.dimension,

@@ -651,6 +651,29 @@ textarea {
   background: #0e1410;
 }
 
+/* Hover readout in 3D mode: floats above the tileLabel showing the biome
+ * the cursor is over. Bold biome name + small (worldX, Y, worldZ) sub. */
+.cursorReadout {
+  position: absolute;
+  left: 14px;
+  bottom: 50px;
+  z-index: 4;
+  padding: 6px 12px;
+  border-radius: 5px;
+  background: rgba(15, 22, 18, 0.92);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 13px;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+
+.cursorReadoutSub {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-left: 6px;
+}
+
 /* "approximate terrain" pill, top-left of the 3D map pane. Keep it small
  * but always-visible so the heightmap's accuracy caveat travels with the
  * view. */

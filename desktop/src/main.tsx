@@ -9,7 +9,8 @@ import {
   wireToNode,
   type TreeNode,
 } from "./conditions";
-import { Map3D } from "./Map3D";
+import { Map3D, type HoverInfo } from "./Map3D";
+import { biomeLabel } from "./biomes";
 import "./styles.css";
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,10 @@ type Analysis = {
 // saved per tile vs the legacy PNG path).
 type TileResponse = {
   bytes: number[];
+  /** Per-cell cubiomes biome IDs (u8 stored as JS numbers), row-major,
+   *  same order as `bytes`. Used by the 3D voxel renderer and the cursor
+   *  biome-name readout. Optional for back-compat with older backends. */
+  biome_ids?: number[];
   seed: number;
   scale: number;
   x: number;
@@ -336,6 +341,9 @@ function App() {
   // 3D path proves out across Tauri WebView backends.
   const [mapView, setMapView] = useState<"2D" | "3D">("2D");
   const [yLevel, setYLevel] = useState<number>(Y_DEFAULT);
+  // Per-cell biome readout under the cursor in 3D mode. null when not
+  // hovering a column. Populated by Map3D's raycaster-driven onHover.
+  const [hover, setHover] = useState<HoverInfo | null>(null);
 
   // Ref to the on-screen canvas so `downloadTile` can pull the rendered PNG
   // from it (the canvas owns the rendered pixels; we don't ship a separate
@@ -945,12 +953,21 @@ function App() {
         {mapView === "3D" && tile ? (
           <div className="mapGrid">
             <Map3D
-              tile={tile}
+              tile={{
+                bytes: tile.bytes,
+                biomeIds: tile.biome_ids,
+                sx: tile.sx,
+                sz: tile.sz,
+                x: tile.x,
+                z: tile.z,
+                scale: tile.scale,
+              }}
               heights={heightTile?.heights ?? null}
               pins={pins}
               cameraZoom={zoomLevel}
               yLevel={yLevel}
               onYDelta={(d) => setYLevel((y) => clampY(y + d))}
+              onHover={setHover}
             />
             <div className="mapControls">
               <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
@@ -985,6 +1002,14 @@ function App() {
                   heightmap available at 1:4 only — zoom in
                 </div>
               )
+            )}
+            {hover && (
+              <div className="cursorReadout">
+                <strong>{biomeLabel(hover.biomeId)}</strong>{" "}
+                <span className="cursorReadoutSub">
+                  @ ({hover.worldX}, Y={hover.y}, {hover.worldZ}) · id {hover.biomeId}
+                </span>
+              </div>
             )}
             <div className="tileLabel">
               seed {tile.seed} · Y = {yLevel} {yBandLabel(yLevel)}
