@@ -158,6 +158,105 @@ impl GpuBiomeRenderer {
         let biomes_u = self.gpu_bt.lookup_batch(&np_inputs)?;
         Ok(biomes_u.into_iter().map(|b| b as i32).collect())
     }
+
+    /// Phase 6c-7 primitive: evaluate a "biome at coord is in `allowed`"
+    /// predicate across a batch of coords. Returns one `bool` per input
+    /// — the per-coord biome ID is computed via [`Self::biome_grid`] then
+    /// tested against the `allowed` set (sorted, binary search).
+    ///
+    /// This is the primitive a per-seed biome-area condition in the seed
+    /// searcher would call: a candidate seed is built once via
+    /// [`Self::try_new`], then this method evaluates the area's biome
+    /// constraint at the trial coords in a single GPU dispatch worth of
+    /// noise + b-tree work.
+    ///
+    /// **Multi-seed search integration is NOT done here.** Extending the
+    /// existing multi-predicate seed kernel (Phase 6b) to evaluate biome
+    /// conditions per seed requires porting cubiomes' Xoroshiro128++
+    /// (`xSetSeed`/`xNextLong`) and `setBiomeSeed` to WGSL so the
+    /// climate-noise stack can be (re)initialised per-thread on the GPU.
+    /// That is a sub-phase in its own right — tracked as future work —
+    /// and is intentionally out of scope for "Phase 6c: one MC version,
+    /// matching cubiomes". For now, search continues to evaluate biome
+    /// conditions on the CPU staging path; this primitive becomes the
+    /// per-seed building block once GPU climate init lands.
+    pub fn biomes_in_set(
+        &self,
+        coords: &[(i32, i32, i32)],
+        allowed: &[i32],
+    ) -> Result<Vec<bool>, &'static str> {
+        let biomes = self.biome_grid(coords)?;
+        // Sort + dedup `allowed` once; binary-search per result. For the
+        // typical small biome sets the search uses (<10 biome IDs), a
+        // sorted Vec scan is faster than HashSet hashing.
+        let mut set: Vec<i32> = allowed.to_vec();
+        set.sort_unstable();
+        set.dedup();
+        Ok(biomes
+            .into_iter()
+            .map(|b| set.binary_search(&b).is_ok())
+            .collect())
+    }
+
+    /// Render a biome tile to raw RGBA bytes, matching the layout produced
+    /// by [`crate::biomes::BiomeBackend::render_tile_rgba`] at the canonical
+    /// biome scale (1:4).
+    ///
+    /// Currently only `scale == 4` is supported. cubiomes' `r.scale` values
+    /// 1 (voronoi) and ≥16 (inner-scaling) need an extra coord-shaping pass
+    /// that hasn't been ported yet — for those, fall back to
+    /// `BiomeBackend::render_tile_rgba` (cubiomes CPU).
+    ///
+    /// `(x, z)` is the top-left **block** coordinate; `(sx, sz)` is the
+    /// tile size in scale-grid units (so the tile covers `sx*scale`
+    /// blocks). Returns `sx * sz * 4` bytes.
+    pub fn render_tile_rgba(
+        &self,
+        scale: i32,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+    ) -> Result<Vec<u8>, String> {
+        if scale != 4 {
+            return Err(format!(
+                "GpuBiomeRenderer::render_tile_rgba currently only supports \
+                 scale=4 (1:4 biome grid); got scale={scale}"
+            ));
+        }
+        if sx == 0 || sz == 0 {
+            return Err("tile size must be positive".into());
+        }
+        let total = (sx as usize) * (sz as usize);
+
+        // cubiomes' genBiomeNoise3D at r.scale=4: inner scale=1, mid=0.
+        // r.x = caller's x / scale. xi = r.x + i (in scale-4 grid units).
+        // sampleBiomeNoise input is the scale-4 grid coord.
+        let gx = x / scale;
+        let gz = z / scale;
+        let mut coords: Vec<(i32, i32, i32)> = Vec::with_capacity(total);
+        for j in 0..sz {
+            for i in 0..sx {
+                coords.push((gx + i as i32, 0, gz + j as i32));
+            }
+        }
+        let biomes = self
+            .biome_grid(&coords)
+            .map_err(|e| format!("biome_grid failed: {e}"))?;
+
+        let colors = crate::biomes::biome_colormap();
+        let mut rgba = Vec::with_capacity(total * 4);
+        for &bid in &biomes {
+            let [r, g, b] = if (0..256).contains(&bid) {
+                colors[bid as usize]
+            } else {
+                // Unknown / failure — same magenta sentinel as the CPU path.
+                [255, 0, 255]
+            };
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+        Ok(rgba)
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +336,114 @@ mod tests {
             rate >= 0.99,
             "biome match rate {rate:.4} below 99% threshold"
         );
+    }
+
+    /// Phase 6c-7 primitive test: `biomes_in_set` correctly tags coords
+    /// whose biome is in the allowed set. Uses the same 16-coord sample
+    /// as the 6c-5 grid; expected biomes come from cubiomes directly so
+    /// the test verifies (a) GPU produces the same biome IDs and (b) the
+    /// set-membership predicate works.
+    #[test]
+    fn gpu_biomes_in_set_matches_cubiomes_membership() {
+        let Some(mc) = parse_mc_version("1.21") else {
+            return;
+        };
+        let Some(rend) = GpuBiomeRenderer::try_new(mc, 12345, false) else {
+            eprintln!("skipping: no GPU adapter on this host");
+            return;
+        };
+
+        let mut coords: Vec<(i32, i32, i32)> = Vec::new();
+        let mut cubi_biomes: Vec<i32> = Vec::new();
+        for ix in -4..4 {
+            for iz in -4..4 {
+                let x = ix * 32;
+                let z = iz * 32;
+                coords.push((x, 0, z));
+                let mut np = [0i64; 6];
+                let biome = unsafe { mcsf_sample_biome_at(mc, 12345, 0, x, 0, z, np.as_mut_ptr()) };
+                cubi_biomes.push(biome);
+            }
+        }
+
+        // Pick the most common biome from the sample as the allowed set.
+        let mut counts = std::collections::HashMap::new();
+        for &b in &cubi_biomes {
+            *counts.entry(b).or_insert(0u32) += 1;
+        }
+        let common: i32 = *counts
+            .iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(b, _)| b)
+            .unwrap();
+        let allowed = vec![common];
+
+        let got = rend
+            .biomes_in_set(&coords, &allowed)
+            .expect("gpu biomes_in_set");
+        assert_eq!(got.len(), coords.len());
+
+        // Each `got[i]` should be true iff cubi_biomes[i] == common.
+        for (i, (g, &b)) in got.iter().zip(cubi_biomes.iter()).enumerate() {
+            assert_eq!(
+                *g,
+                b == common,
+                "idx {i} {coords:?}: cubiomes biome={b} common={common} got={g}",
+                coords = coords[i]
+            );
+        }
+    }
+
+    /// Phase 6c-6 cornerstone test: GPU-rendered RGBA tile must agree
+    /// with `BiomeBackend::render_tile_rgba` (cubiomes CPU) byte-for-byte.
+    /// Both paths feed through the same biome colormap, so any colour
+    /// difference is a biome-ID mismatch. Match rate ≥99% (same f32 drift
+    /// tolerance as the biome-grid test).
+    #[test]
+    fn gpu_render_tile_rgba_matches_biome_backend() {
+        use crate::biomes::BiomeBackend;
+        let Some(mc) = parse_mc_version("1.21") else {
+            return;
+        };
+        let Some(rend) = GpuBiomeRenderer::try_new(mc, 12345, false) else {
+            eprintln!("skipping: no GPU adapter on this host");
+            return;
+        };
+        let mut cpu = match BiomeBackend::from_strs("1.21", "overworld", 0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: BiomeBackend init failed: {e}");
+                return;
+            }
+        };
+
+        // 32×32 tile at scale 4 = 128 × 128 blocks. The GPU renderer's
+        // top-left is at (x=0, z=0) block coords.
+        let scale = 4i32;
+        let sx = 32u32;
+        let sz = 32u32;
+        let gpu_rgba = rend
+            .render_tile_rgba(scale, 0, 0, sx, sz)
+            .expect("gpu render");
+        let cpu_rgba = cpu
+            .render_tile_rgba(12345, scale, 0, 0, sx, sz)
+            .expect("cpu render");
+        assert_eq!(gpu_rgba.len(), cpu_rgba.len());
+
+        let mut equal_pixels = 0usize;
+        let total = (sx * sz) as usize;
+        for i in 0..total {
+            let a = &gpu_rgba[i * 4..i * 4 + 4];
+            let b = &cpu_rgba[i * 4..i * 4 + 4];
+            if a == b {
+                equal_pixels += 1;
+            }
+        }
+        let rate = equal_pixels as f64 / total as f64;
+        eprintln!(
+            "tile RGBA match rate: {equal_pixels}/{total} = {:.2}%",
+            rate * 100.0
+        );
+        assert!(rate >= 0.99, "tile RGBA match rate {rate:.4} below 99%");
     }
 }

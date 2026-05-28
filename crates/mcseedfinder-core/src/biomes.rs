@@ -67,7 +67,7 @@ extern "C" {
 }
 
 /// 256-entry cubiomes biome RGB colormap, fetched once.
-fn biome_colormap() -> [[u8; 3]; 256] {
+pub fn biome_colormap() -> [[u8; 3]; 256] {
     let mut buf = [0u8; 256 * 3];
     // SAFETY: cubiomes writes exactly 256*3 bytes; we hand it a matching buffer.
     unsafe { mcsf_init_biome_colors(buf.as_mut_ptr()) };
