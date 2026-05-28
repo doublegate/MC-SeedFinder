@@ -9,6 +9,18 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Pan/zoom map + structure pins (Phase 4b-2).** The biome tile is now an
+  interactive map: drag-to-pan (pointer events with capture, CSS transform
+  during drag, refetch on release), zoom in/out across all five cubiomes
+  scales (1, 4, 16, 64, 256), and a recenter button. Coloured pins for
+  villages, outposts, ocean monuments, woodland mansions, and ring-1
+  strongholds are queried in batch from the new `list_structures_in_view`
+  Tauri command and overlaid at their exact block coordinates. Hovering a
+  pin shows its structure name + coordinates.
+- `list_structures_in_view` Tauri command returning every placement of the
+  requested structure types whose block coordinate falls inside a given
+  rectangle.
+
 - **Desktop biome tile rendering (Phase 4b-1).** The Tauri `render_tile`
   command now returns a real base64-encoded PNG of the cubiomes biome map for
   a given seed. Implemented as `BiomeBackend::render_tile_png` /

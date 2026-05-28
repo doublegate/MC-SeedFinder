@@ -1,8 +1,12 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./styles.css";
+
+// ---------------------------------------------------------------------------
+// Types mirroring the Tauri command surface
+// ---------------------------------------------------------------------------
 
 type SearchResult = {
   seed: number;
@@ -17,7 +21,7 @@ type SearchResult = {
 
 type JobState = {
   jobId: string;
-  status: string;       // idle | running | completed | cancelled | error
+  status: string; // idle | running | completed | cancelled | error
   scanned: number;
   matches: number;
 };
@@ -42,6 +46,31 @@ type TileResponse = {
   sz: number;
 };
 
+type StructurePin = {
+  structure: string;
+  block_x: number;
+  block_z: number;
+};
+
+// ---------------------------------------------------------------------------
+// Map constants
+// ---------------------------------------------------------------------------
+
+const TILE_PX = 256;
+// cubiomes' supported scales: 1, 4, 16, 64, 256. Lower index = closer zoom.
+const SCALE_LEVELS = [1, 4, 16, 64, 256] as const;
+const DEFAULT_SCALE = 4;
+// Structures shown as pins on the map (and queried in batch from the backend).
+const PIN_STRUCTURES = [
+  "village",
+  "pillager_outpost",
+  "ocean_monument",
+  "woodland_mansion",
+  "stronghold",
+];
+
+// ---------------------------------------------------------------------------
+
 function App() {
   const [edition, setEdition] = useState("java");
   const [version, setVersion] = useState("1.21");
@@ -58,10 +87,20 @@ function App() {
   const [selectedSeed, setSelectedSeed] = useState<number | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [tile, setTile] = useState<TileResponse | null>(null);
+  const [pins, setPins] = useState<StructurePin[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // The backend emits events with a `job_id` payload; we ignore anything not
-  // for the currently-active job (stale events from a cancelled/restarted run).
+  // Map view state (block coordinates of the view centre + cubiomes scale).
+  const [viewCenter, setViewCenter] = useState({ x: 0, z: 0 });
+  const [scale, setScale] = useState<number>(DEFAULT_SCALE);
+
+  // Active-drag pixel offset (CSS translate). Committed to viewCenter on
+  // pointer-up, then the tile/pin fetch effect re-fires.
+  const [drag, setDrag] = useState<{ dx: number; dz: number } | null>(null);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const mapPaneRef = useRef<HTMLDivElement | null>(null);
+
+  // Stale-event filter for streamed search.
   const activeJobIdRef = useRef<string>("");
 
   const spec = useMemo(
@@ -81,20 +120,16 @@ function App() {
     [count, distance, edition, structure, version],
   );
 
-  // Subscribe once on mount; the Rust side streams events for the whole app
-  // lifetime, and we filter by job_id in the handler.
+  // ---- Streamed search events ----
   useEffect(() => {
     let unlistenFns: UnlistenFn[] = [];
     (async () => {
       unlistenFns.push(
         await listen<SearchResult>("search-match", (event) => {
-          const payload = event.payload;
-          // (job_id is in started/progress/completed events; match events carry
-          // the report directly. We accept any match while a job is active.)
           if (!activeJobIdRef.current) return;
-          setResults((prev) => [...prev, payload]);
+          setResults((prev) => [...prev, event.payload]);
           setJob((j) => ({ ...j, matches: j.matches + 1 }));
-          if (!selectedSeed) setSelectedSeed(payload.seed);
+          setSelectedSeed((s) => (s == null ? event.payload.seed : s));
         }),
         await listen<{ job_id: string; scanned: number; matches: number }>(
           "search-progress",
@@ -129,7 +164,6 @@ function App() {
     return () => {
       unlistenFns.forEach((fn) => fn());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function startSearch() {
@@ -138,6 +172,7 @@ function App() {
     setSelectedSeed(null);
     setAnalysis(null);
     setTile(null);
+    setPins([]);
     setJob({ jobId: "", status: "running", scanned: 0, matches: 0 });
     try {
       const jobId = await invoke<string>("start_search", { spec });
@@ -153,8 +188,6 @@ function App() {
   async function cancelSearch() {
     if (!job.jobId) return;
     await invoke("cancel_search", { jobId: job.jobId }).catch(() => undefined);
-    // The completed event with reason="cancelled" will flip status; this is
-    // just optimistic UI in case the worker is between chunk boundaries.
     setJob((j) => ({ ...j, status: "cancelling" }));
   }
 
@@ -172,32 +205,52 @@ function App() {
     }
   }
 
-  // When a seed is selected, fetch its biome tile centred on origin at 1:4 —
-  // a 256-pixel tile covers a 1024x1024-block region around (0, 0).
+  // Re-centre on origin when a new seed is selected (don't carry pan/zoom).
+  useEffect(() => {
+    setViewCenter({ x: 0, z: 0 });
+    setScale(DEFAULT_SCALE);
+  }, [selectedSeed]);
+
+  // Fetch the biome tile AND structure pins whenever the view changes.
   useEffect(() => {
     if (selectedSeed == null) {
       setTile(null);
+      setPins([]);
       return;
     }
-    const TILE_PX = 256;
-    const SCALE = 4;
-    const half_blocks = (TILE_PX * SCALE) / 2;
+    const tileWorldSpan = TILE_PX * scale;
+    const tileX = viewCenter.x - tileWorldSpan / 2;
+    const tileZ = viewCenter.z - tileWorldSpan / 2;
     let cancelled = false;
     (async () => {
       try {
-        const t = await invoke<TileResponse>("render_tile", {
-          request: {
-            seed: selectedSeed,
-            version,
-            dimension: "overworld",
-            x: -half_blocks,
-            z: -half_blocks,
-            scale: SCALE,
-            sx: TILE_PX,
-            sz: TILE_PX,
-          },
-        });
-        if (!cancelled) setTile(t);
+        const [t, ps] = await Promise.all([
+          invoke<TileResponse>("render_tile", {
+            request: {
+              seed: selectedSeed,
+              version,
+              dimension: "overworld",
+              x: tileX,
+              z: tileZ,
+              scale,
+              sx: TILE_PX,
+              sz: TILE_PX,
+            },
+          }),
+          invoke<StructurePin[]>("list_structures_in_view", {
+            request: {
+              seed: selectedSeed,
+              structures: PIN_STRUCTURES,
+              x: tileX,
+              z: tileZ,
+              sx: tileWorldSpan,
+              sz: tileWorldSpan,
+            },
+          }),
+        ]);
+        if (cancelled) return;
+        setTile(t);
+        setPins(ps);
       } catch (e) {
         if (!cancelled) setError(String(e));
       }
@@ -205,7 +258,78 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedSeed, version]);
+  }, [selectedSeed, version, viewCenter.x, viewCenter.z, scale]);
+
+  // ---- Map pan handlers ----
+  const onPanStart = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (selectedSeed == null) return;
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+      dragStartRef.current = { x: e.clientX, y: e.clientY };
+      setDrag({ dx: 0, dz: 0 });
+    },
+    [selectedSeed],
+  );
+
+  const onPanMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragStartRef.current) return;
+    setDrag({
+      dx: e.clientX - dragStartRef.current.x,
+      dz: e.clientY - dragStartRef.current.y,
+    });
+  }, []);
+
+  const onPanEnd = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!dragStartRef.current || !drag) {
+        dragStartRef.current = null;
+        setDrag(null);
+        return;
+      }
+      const pane = mapPaneRef.current;
+      if (pane && (drag.dx !== 0 || drag.dz !== 0)) {
+        const rect = pane.getBoundingClientRect();
+        // Drag right → reveal LEFT of world → centre.x decreases.
+        const blockDx = (-drag.dx / rect.width) * TILE_PX * scale;
+        const blockDz = (-drag.dz / rect.height) * TILE_PX * scale;
+        setViewCenter((c) => ({
+          x: Math.round(c.x + blockDx),
+          z: Math.round(c.z + blockDz),
+        }));
+      }
+      dragStartRef.current = null;
+      setDrag(null);
+      (e.target as Element).releasePointerCapture?.(e.pointerId);
+    },
+    [drag, scale],
+  );
+
+  function zoomIn() {
+    setScale((s) => {
+      const i = SCALE_LEVELS.indexOf(s as (typeof SCALE_LEVELS)[number]);
+      return SCALE_LEVELS[Math.max(0, i - 1)];
+    });
+  }
+  function zoomOut() {
+    setScale((s) => {
+      const i = SCALE_LEVELS.indexOf(s as (typeof SCALE_LEVELS)[number]);
+      return SCALE_LEVELS[Math.min(SCALE_LEVELS.length - 1, i + 1)];
+    });
+  }
+  function resetView() {
+    setViewCenter({ x: 0, z: 0 });
+    setScale(DEFAULT_SCALE);
+  }
+
+  // Helper: world (block) coord → percentage within the rendered tile.
+  function worldToTilePct(blockX: number, blockZ: number) {
+    if (!tile) return null;
+    const span = tile.sx * tile.scale;
+    const left = ((blockX - tile.x) / span) * 100;
+    const top = ((blockZ - tile.z) / span) * 100;
+    if (left < 0 || left > 100 || top < 0 || top > 100) return null;
+    return { left, top };
+  }
 
   return (
     <main className="shell">
@@ -256,19 +380,62 @@ function App() {
         {error && <div className="error">{error}</div>}
       </aside>
 
-      <section className="mapPane">
-        <div className="mapGrid">
+      <section className="mapPane" ref={mapPaneRef}>
+        <div
+          className="mapGrid"
+          onPointerDown={onPanStart}
+          onPointerMove={onPanMove}
+          onPointerUp={onPanEnd}
+          onPointerCancel={onPanEnd}
+          style={{ cursor: drag ? "grabbing" : selectedSeed != null ? "grab" : "default" }}
+        >
           {tile ? (
             <>
-              <img
-                className="tileImage"
-                src={`data:image/png;base64,${tile.png_base64}`}
-                alt={`Biome tile for seed ${tile.seed}`}
-                style={{ imageRendering: "pixelated" }}
-              />
-              <div className="spawn">0,0</div>
+              <div
+                className="mapContent"
+                style={{
+                  transform: drag ? `translate(${drag.dx}px, ${drag.dz}px)` : undefined,
+                }}
+              >
+                <img
+                  className="tileImage"
+                  src={`data:image/png;base64,${tile.png_base64}`}
+                  alt={`Biome tile for seed ${tile.seed}`}
+                  draggable={false}
+                />
+                {(() => {
+                  const origin = worldToTilePct(0, 0);
+                  return origin ? (
+                    <div
+                      className="spawn"
+                      style={{ left: `${origin.left}%`, top: `${origin.top}%` }}
+                    >
+                      0,0
+                    </div>
+                  ) : null;
+                })()}
+                {pins.map((p) => {
+                  const pos = worldToTilePct(p.block_x, p.block_z);
+                  if (!pos) return null;
+                  return (
+                    <button
+                      key={`${p.structure}-${p.block_x}-${p.block_z}`}
+                      className={`pin pin-${p.structure}`}
+                      style={{ left: `${pos.left}%`, top: `${pos.top}%` }}
+                      title={`${p.structure.replace(/_/g, " ")} @ (${p.block_x}, ${p.block_z})`}
+                    />
+                  );
+                })}
+              </div>
+              <div className="mapControls">
+                <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
+                <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
+                <button onClick={resetView} title="Recenter on origin">⌂</button>
+              </div>
               <div className="tileLabel">
-                seed {tile.seed} · 1:{tile.scale} · {tile.sx * tile.scale}×{tile.sz * tile.scale} blocks
+                seed {tile.seed} · 1:{scale} · centre ({viewCenter.x}, {viewCenter.z}) ·
+                {" "}
+                {pins.length} structure{pins.length === 1 ? "" : "s"} in view
               </div>
             </>
           ) : (

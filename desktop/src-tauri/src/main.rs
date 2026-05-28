@@ -419,6 +419,74 @@ fn render_tile(request: TileRequest) -> Result<serde_json::Value, String> {
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct StructuresInViewRequest {
+    seed: i64,
+    /// Structure types to query (e.g. ["village", "pillager_outpost"]).
+    structures: Vec<String>,
+    /// View rectangle in block coordinates.
+    x: i32,
+    z: i32,
+    sx: u32,
+    sz: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct StructurePinOut {
+    structure: String,
+    block_x: i32,
+    block_z: i32,
+}
+
+#[tauri::command]
+fn list_structures_in_view(
+    request: StructuresInViewRequest,
+) -> Result<Vec<StructurePinOut>, String> {
+    // Use the diagonal as a generous search radius around the view centre so
+    // we don't miss placements that just barely overlap the rectangle.
+    let centre_x = request.x + (request.sx as i32) / 2;
+    let centre_z = request.z + (request.sz as i32) / 2;
+    let half_diag =
+        (((request.sx as f64).powi(2) + (request.sz as f64).powi(2)).sqrt() / 2.0) as i32 + 16;
+
+    let mut out: Vec<StructurePinOut> = Vec::new();
+    for name in &request.structures {
+        let kind =
+            StructureType::from_name(name).ok_or_else(|| format!("unknown structure {name:?}"))?;
+        if kind == StructureType::Stronghold {
+            // Ring 1 strongholds (always 3) — only emit those inside the view.
+            for pos in iter_strongholds(request.seed, 1) {
+                if pos.block_x() >= request.x
+                    && pos.block_x() < request.x + request.sx as i32
+                    && pos.block_z() >= request.z
+                    && pos.block_z() < request.z + request.sz as i32
+                {
+                    out.push(StructurePinOut {
+                        structure: name.clone(),
+                        block_x: pos.block_x(),
+                        block_z: pos.block_z(),
+                    });
+                }
+            }
+            continue;
+        }
+        for pos in iter_structures_in_radius(kind, request.seed, centre_x, centre_z, half_diag) {
+            if pos.block_x() >= request.x
+                && pos.block_x() < request.x + request.sx as i32
+                && pos.block_z() >= request.z
+                && pos.block_z() < request.z + request.sz as i32
+            {
+                out.push(StructurePinOut {
+                    structure: name.clone(),
+                    block_x: pos.block_x(),
+                    block_z: pos.block_z(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 fn import_level_dat(path: String) -> serde_json::Value {
     // Phase 4a-2 — NBT parsing via fastnbt.
@@ -463,6 +531,7 @@ fn main() {
             cancel_search,
             analyze_seed,
             render_tile,
+            list_structures_in_view,
             import_level_dat,
             export_results
         ])
