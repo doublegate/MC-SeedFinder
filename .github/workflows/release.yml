@@ -1,0 +1,174 @@
+name: Release
+
+# Two ways to fire this workflow:
+#   1. `gh workflow run Release -f version=v0.2.0` (workflow_dispatch),
+#      handy for testing the packaging path without pushing a tag.
+#   2. Push a tag matching `v*.*.*` (e.g. `git tag v0.2.0 && git push --tags`),
+#      which is the canonical release trigger.
+#
+# Outputs (uploaded as workflow artifacts and, on a tag push, attached to a
+# *draft* GitHub release the maintainer can review and publish):
+#   - Linux x86_64 maturin wheel for mcseedfinder (pyo3 abi3-py310, so one
+#     wheel covers Python 3.10..3.13)
+#   - Linux x86_64 Tauri AppImage + .deb of the desktop app
+#
+# macOS and Windows targets are intentionally left as commented-out matrix
+# entries — they require platform-specific runners and (for macOS) signing
+# config that isn't yet wired into this repo. Uncomment the relevant rows
+# when those are ready.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version label (e.g. v0.2.0); used only for the draft release name when not triggered by a tag."
+        required: false
+        default: "v0.0.0-manual"
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: ""
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  wheel:
+    name: Build maturin wheel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact-name: wheel-linux-x86_64
+          # - os: macos-latest
+          #   target: x86_64-apple-darwin
+          #   artifact-name: wheel-macos-x86_64
+          # - os: macos-latest
+          #   target: aarch64-apple-darwin
+          #   artifact-name: wheel-macos-arm64
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact-name: wheel-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel (manylinux for Linux)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          # `auto` uses manylinux2014 on Linux, no manylinux on mac/Windows.
+          # The wheel bundles the native ext + cubiomes built statically.
+          manylinux: auto
+      - name: List built wheels
+        run: ls -la dist/
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: dist/
+
+  desktop-bundle:
+    name: Build Tauri bundle (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-name: desktop-linux-x86_64
+          # - os: macos-latest
+          #   artifact-name: desktop-macos-arm64
+          # - os: windows-latest
+          #   artifact-name: desktop-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install Tauri Linux deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+      - name: npm install (desktop)
+        run: npm install --prefix desktop
+      - name: tauri build (release bundle)
+        # No --target → host triple. The bundles land under
+        # desktop/src-tauri/target/release/bundle/<format>/.
+        run: npx --prefix desktop tauri build
+        working-directory: desktop
+      - name: Collect bundles
+        run: |
+          mkdir -p dist-bundle
+          # Linux: AppImage + .deb
+          shopt -s nullglob
+          for f in desktop/src-tauri/target/release/bundle/appimage/*.AppImage \
+                   desktop/src-tauri/target/release/bundle/deb/*.deb \
+                   desktop/src-tauri/target/release/bundle/dmg/*.dmg \
+                   desktop/src-tauri/target/release/bundle/macos/*.app \
+                   desktop/src-tauri/target/release/bundle/msi/*.msi \
+                   desktop/src-tauri/target/release/bundle/nsis/*.exe; do
+            cp -a "$f" dist-bundle/
+          done
+          ls -la dist-bundle/
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: dist-bundle/
+
+  draft-release:
+    name: Draft GitHub release
+    needs: [wheel, desktop-bundle]
+    runs-on: ubuntu-latest
+    # Only draft a release on actual tag pushes — workflow_dispatch is for
+    # exercising the packaging path, not for publishing.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( \
+            -name '*.whl' -o \
+            -name '*.AppImage' -o \
+            -name '*.deb' -o \
+            -name '*.dmg' -o \
+            -name '*.msi' -o \
+            -name '*.exe' \
+          \) -exec cp -v {} release-files/ \;
+          ls -la release-files/
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: release-files/*
+          fail_on_unmatched_files: false
