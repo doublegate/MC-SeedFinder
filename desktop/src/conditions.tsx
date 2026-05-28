@@ -121,6 +121,110 @@ export function defaultRoot(): TreeNode {
   return defaultLeaf("nearby_structure");
 }
 
+// ---------------------------------------------------------------------------
+// Preset templates (#8 — quad-hut / common multi-structure shapes)
+// ---------------------------------------------------------------------------
+//
+// Each preset returns a fresh TreeNode (with fresh ids) ready to drop into
+// the condition tree. The marquee one is the quad-witch-hut layout — the
+// holy grail of Minecraft seed prospecting. Adding more presets is a one-
+// line table entry below.
+
+export type PresetTemplate = {
+  key: string;
+  label: string;
+  description: string;
+  build: () => TreeNode;
+};
+
+export const PRESET_TEMPLATES: PresetTemplate[] = [
+  {
+    key: "quad_hut",
+    label: "Quad witch hut",
+    description:
+      "Four swamp huts within 128 blocks of (0, 0) — the classic XP / loot farm setup.",
+    build: () => ({
+      id: newId(),
+      type: "cluster",
+      structures: ["swamp_hut"],
+      max_distance: 128,
+      min_count: 4,
+      centre_x: 0,
+      centre_z: 0,
+    }),
+  },
+  {
+    key: "triple_village",
+    label: "Triple village near spawn",
+    description: "Three villages inside a 1500-block radius — quick trader hubs.",
+    build: () => ({
+      id: newId(),
+      type: "cluster",
+      structures: ["village"],
+      max_distance: 1500,
+      min_count: 3,
+      centre_x: 0,
+      centre_z: 0,
+    }),
+  },
+  {
+    key: "monument_mansion",
+    label: "Monument + mansion near spawn",
+    description:
+      "Both an ocean monument and a woodland mansion within 4 000 blocks of origin.",
+    build: () => ({
+      id: newId(),
+      type: "all_of",
+      of: [
+        {
+          id: newId(),
+          type: "nearby_structure",
+          structure: "ocean_monument",
+          max_distance: 4000,
+          centre_x: 0,
+          centre_z: 0,
+        },
+        {
+          id: newId(),
+          type: "nearby_structure",
+          structure: "woodland_mansion",
+          max_distance: 4000,
+          centre_x: 0,
+          centre_z: 0,
+        },
+      ],
+    }),
+  },
+  {
+    key: "deep_dark_stronghold",
+    label: "Stronghold + ancient city",
+    description:
+      "A stronghold and an ancient city both within 3 000 blocks — speedrun-friendly.",
+    build: () => ({
+      id: newId(),
+      type: "all_of",
+      of: [
+        {
+          id: newId(),
+          type: "nearby_structure",
+          structure: "stronghold",
+          max_distance: 3000,
+          centre_x: 0,
+          centre_z: 0,
+        },
+        {
+          id: newId(),
+          type: "nearby_structure",
+          structure: "ancient_city",
+          max_distance: 3000,
+          centre_x: 0,
+          centre_z: 0,
+        },
+      ],
+    }),
+  },
+];
+
 /** Convert a UI tree to the wire-format JSON the backend accepts. */
 export function nodeToWire(n: TreeNode): Record<string, unknown> {
   switch (n.type) {

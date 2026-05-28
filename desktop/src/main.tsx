@@ -6,6 +6,7 @@ import {
   ConditionBuilder,
   defaultRoot,
   nodeToWire,
+  PRESET_TEMPLATES,
   wireToNode,
   type TreeNode,
 } from "./conditions";
@@ -1308,6 +1309,39 @@ function App() {
           <h3>Conditions</h3>
           <small>Build a tree; any seed matching the root will be returned.</small>
         </div>
+        <div className="presetTemplates">
+          <small>Quick start:</small>
+          <div className="presetTemplateButtons">
+            {PRESET_TEMPLATES.map((p) => (
+              <button
+                key={p.key}
+                className="presetTemplate"
+                title={p.description}
+                onClick={() => {
+                  // Wrap existing tree + preset in an all_of unless the
+                  // current tree is the default sole leaf — in which case
+                  // just replace.
+                  const preset = p.build();
+                  if (
+                    conditionTree.type === "nearby_structure" &&
+                    conditionTree.structure === "village" &&
+                    conditionTree.max_distance === 1000
+                  ) {
+                    setConditionTree(preset);
+                  } else {
+                    setConditionTree({
+                      id: `preset-wrap-${Date.now()}`,
+                      type: "all_of",
+                      of: [conditionTree, preset],
+                    });
+                  }
+                }}
+              >
+                + {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
         <ConditionBuilder root={conditionTree} onChange={setConditionTree} />
         <div className="actions">
           <button onClick={startSearch} disabled={job.status === "running"}>Run</button>
@@ -1584,6 +1618,33 @@ function App() {
       <aside className="inspector">
         <section className="panel">
           <h2>Live Results ({results.length})</h2>
+          {/* #5 — Match histogram across the searched seed range. Buckets
+              the results into 32 columns by `(seed - start_seed) / count`
+              ratio, so the user can see at a glance which parts of the
+              range were productive. Pure visualisation — clicking a bucket
+              does nothing (yet). */}
+          {results.length > 1 && (
+            <div className="matchHistogram" title={`${results.length} matches across the search range`}>
+              {(() => {
+                const BUCKETS = 32;
+                const counts = new Array(BUCKETS).fill(0);
+                for (const r of results) {
+                  // seed in i64 range; bucket on the low 32 bits relative to count.
+                  const idx = Math.abs(Math.floor(((r.seed % count) / count) * BUCKETS));
+                  counts[Math.min(BUCKETS - 1, idx)] += 1;
+                }
+                const maxCount = Math.max(1, ...counts);
+                return counts.map((c, i) => (
+                  <div
+                    key={i}
+                    className="histBar"
+                    style={{ height: `${(c / maxCount) * 100}%` }}
+                    title={`bucket ${i}: ${c} matches`}
+                  />
+                ));
+              })()}
+            </div>
+          )}
           <div className="resultList">
             {results.map((result) => (
               <button
