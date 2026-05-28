@@ -92,9 +92,10 @@ function GroundMesh({
   // we divide by the tile scale to keep the height visually proportional
   // to the horizontal span (1 scale-grid step = `scale` blocks). For
   // 1:4 that's a /4 — a 200-block-high mountain at scale 4 shows as 50
-  // grid units tall. Tunable scalar below ("relief") flattens it further
-  // so the view isn't dominated by Y when scrubbing through the range.
-  const RELIEF = 0.4;
+  // grid units tall. Tunable scalar below ("relief") scales the result.
+  // RELIEF=2.0 makes a 200-block mountain visibly tower at ~100 grid units
+  // over a 192-unit-wide tile — exaggerated but unmistakeably 3D.
+  const RELIEF = 2.0;
   useEffect(() => {
     const pos = geometry.attributes.position as THREE.BufferAttribute;
     const arr = pos.array as Float32Array;
@@ -177,10 +178,15 @@ export function Map3D(props: Map3DProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
 
   // Vanilla wheel handler — bypasses MapControls (which has wheel-zoom off).
+  // Step size = 4 blocks (one scale-Y unit at cubScale=4). cubiomes' Range.y
+  // is in scale-relative units, so adjacent block-Y values < 4 apart all
+  // map to the same scale-Y → identical biome bytes. Stepping by 4 makes
+  // every wheel notch produce a different cubiomes scale-Y. Shift = ×4
+  // (= 16-block / chunk-section step) for fast Y traversal.
   const onWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     e.preventDefault();
     const sign = e.deltaY > 0 ? -1 : 1;
-    const mag = e.shiftKey ? 16 : 1;
+    const mag = e.shiftKey ? 16 : 4;
     onYDelta(sign * mag);
   };
 

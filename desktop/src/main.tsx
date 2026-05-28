@@ -972,14 +972,24 @@ function App() {
               <span className="legendItem"><span className="legendDot pin-stronghold" />Stronghold</span>
               <span className="legendItem"><span className="legendDot legendSpawn" />Spawn (0,0)</span>
             </div>
-            {heightTile && (
-              <div className="terrainBadge" title="Surface heights come from cubiomes' mapApproxHeight — depth-spline-based, not bit-exact Java terrain.">
-                approximate terrain
+            {heightTile ? (
+              <div
+                className="terrainBadge"
+                title={`Surface heights come from cubiomes' mapApproxHeight — depth-spline-based, not bit-exact Java terrain. (${heightTile.heights.length} samples)`}
+              >
+                approximate terrain (y {Math.round(Math.min(...heightTile.heights))}..{Math.round(Math.max(...heightTile.heights))})
               </div>
+            ) : (
+              cubScale !== 4 && (
+                <div className="terrainBadge" style={{ background: "rgba(60, 60, 60, 0.75)", color: "#bbb" }}>
+                  heightmap available at 1:4 only — zoom in
+                </div>
+              )
             )}
             <div className="tileLabel">
-              seed {tile.seed} · Y = {yLevel} {yBandLabel(yLevel)} ·
-              {" "}zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
+              seed {tile.seed} · Y = {yLevel} {yBandLabel(yLevel)}
+              {tile.y != null && tile.y !== yLevel ? ` [rendered @ y=${tile.y}]` : ""}
+              {" "}· zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
               {" "}centre ({viewCenter.x}, {viewCenter.z}) ·
               {" "}{pins.length} structure{pins.length === 1 ? "" : "s"} in view
             </div>
