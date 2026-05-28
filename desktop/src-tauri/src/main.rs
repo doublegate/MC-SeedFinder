@@ -623,6 +623,19 @@ fn export_results(
 }
 
 fn main() {
+    // WebKitGTK 2.42+ ships a new DMA-BUF renderer that crashes the WebView on
+    // a number of Wayland compositors with "Gdk-Message: Error 71 (Protocol
+    // error) dispatching to Wayland display." Disabling it falls back to the
+    // older shared-memory path, which is universally compatible. Safe / no-op
+    // on X11 and on builds where the new renderer works fine; only set if the
+    // user hasn't already chosen a value.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
