@@ -77,6 +77,12 @@ export type Map3DProps = {
   /** Pointer hover callback. Fires when the hovered cell changes; null when
    *  the pointer leaves the voxel mesh. */
   onHover: (info: HoverInfo | null) => void;
+  /** Optional slime-chunk overlay: `[chunkX, chunkZ]` pairs that fall in
+   *  the tile span. Rendered as flat green plates at the ground plane. */
+  slimeChunks?: number[][];
+  /** Whether to render the world-border wireframe (the canonical
+   *  ±29 999 984 block rectangle). */
+  showBorder?: boolean;
 };
 
 /** Imperative camera-zoom sync — the +/- buttons drive a prop, and the
@@ -350,9 +356,161 @@ function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps
   );
 }
 
+/** Flat green plates for slime chunks. One InstancedMesh of small boxes
+ *  at the ground plane (y ≈ 0.1, just above the bottom of the voxel
+ *  columns). Each chunk = 16 blocks = 16/scale grid units. */
+function SlimeChunksOverlay({
+  tile,
+  chunks,
+}: {
+  tile: Map3DProps["tile"];
+  chunks: number[][];
+}) {
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const tmpMatrix = useMemo(() => new THREE.Matrix4(), []);
+  const halfX = tile.sx / 2;
+  const halfZ = tile.sz / 2;
+  // Tile origin (top-left) in block coords; chunk (cx, cz) covers
+  // [cx*16, (cx+1)*16). Map to grid units (1 unit = scale blocks).
+  const chunkSpan = 16 / tile.scale; // 4 grid units at scale=4
+
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    for (let i = 0; i < chunks.length; i++) {
+      const cx = chunks[i][0];
+      const cz = chunks[i][1];
+      const worldX = cx * 16; // top-left block of chunk
+      const worldZ = cz * 16;
+      // Centre of the chunk in grid units relative to tile centre.
+      const gx = (worldX + 8 - tile.x) / tile.scale - halfX;
+      const gz = (worldZ + 8 - tile.z) / tile.scale - halfZ;
+      tmpMatrix.makeScale(chunkSpan, 0.2, chunkSpan);
+      tmpMatrix.setPosition(gx, 0.1, gz);
+      mesh.setMatrixAt(i, tmpMatrix);
+    }
+    mesh.count = chunks.length;
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere();
+  }, [chunks, tile.x, tile.z, tile.scale, halfX, halfZ, chunkSpan, tmpMatrix]);
+
+  if (chunks.length === 0) return null;
+  return (
+    <instancedMesh ref={meshRef} args={[undefined, undefined, Math.max(1, chunks.length)]}>
+      <boxGeometry args={[1, 1, 1]} />
+      <meshBasicMaterial color="#3aff8a" transparent opacity={0.55} toneMapped={false} />
+    </instancedMesh>
+  );
+}
+
+/** World border wireframe — the canonical ±29 999 984 block rectangle.
+ *  Rendered as four vertical line segments at the cardinal edges when
+ *  any of them falls inside the tile's world bounds. */
+function WorldBorderWireframe({ tile, height }: { tile: Map3DProps["tile"]; height: number }) {
+  const B = 29_999_984;
+  // Map a world block coord to grid units relative to tile centre.
+  const halfX = (tile.sx * tile.scale) / 2;
+  const halfZ = (tile.sz * tile.scale) / 2;
+  const centreX = tile.x + halfX;
+  const centreZ = tile.z + halfZ;
+  const toGrid = (worldX: number, worldZ: number) => ({
+    gx: (worldX - centreX) / tile.scale,
+    gz: (worldZ - centreZ) / tile.scale,
+  });
+  // The border is far outside any practical tile, so usually nothing renders.
+  // Build a vertex array for whichever edges are in view. Each edge is a
+  // line segment at y=0 ↔ y=height so it's visible above the columns.
+  const points = useMemo(() => {
+    const out: number[] = [];
+    const push = (x1: number, z1: number, x2: number, z2: number) => {
+      const a = toGrid(x1, z1);
+      const b = toGrid(x2, z2);
+      out.push(a.gx, 0, a.gz, b.gx, 0, b.gz);
+      out.push(a.gx, height, a.gz, b.gx, height, b.gz);
+      out.push(a.gx, 0, a.gz, a.gx, height, a.gz);
+      out.push(b.gx, 0, b.gz, b.gx, height, b.gz);
+    };
+    // West (x = -B) — visible if any of the tile's X range is east of it.
+    if (tile.x <= -B && tile.x + tile.sx * tile.scale >= -B) {
+      push(-B, tile.z, -B, tile.z + tile.sz * tile.scale);
+    }
+    // East (x = +B)
+    if (tile.x <= B && tile.x + tile.sx * tile.scale >= B) {
+      push(B, tile.z, B, tile.z + tile.sz * tile.scale);
+    }
+    // North (z = -B)
+    if (tile.z <= -B && tile.z + tile.sz * tile.scale >= -B) {
+      push(tile.x, -B, tile.x + tile.sx * tile.scale, -B);
+    }
+    // South (z = +B)
+    if (tile.z <= B && tile.z + tile.sz * tile.scale >= B) {
+      push(tile.x, B, tile.x + tile.sx * tile.scale, B);
+    }
+    return new Float32Array(out);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tile.x, tile.z, tile.sx, tile.sz, tile.scale, height]);
+  if (points.length === 0) return null;
+  return (
+    <lineSegments>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" args={[points, 3]} />
+      </bufferGeometry>
+      <lineBasicMaterial color="#ff5050" transparent opacity={0.9} toneMapped={false} />
+    </lineSegments>
+  );
+}
+
+/** Async-gl factory for the R3F `<Canvas>`. Tries WebGPURenderer when
+ *  navigator.gpu is available; falls back to R3F's default WebGLRenderer
+ *  by returning `null`-equivalent (a plain WebGLRenderer params object).
+ *  On Linux WebKitGTK navigator.gpu is undefined → the WebGL2 path is
+ *  taken unchanged. */
+async function makeRenderer(props: {
+  canvas: HTMLCanvasElement;
+}): Promise<THREE.WebGLRenderer> {
+  if (hasWebGPU()) {
+    try {
+      // Dynamic import so WebGL-only platforms never load three/webgpu.
+      // Three.js 0.171+: WebGPURenderer is the default export of three/webgpu.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod: any = await import("three/webgpu");
+      const WebGPURenderer = mod.WebGPURenderer ?? mod.default;
+      if (WebGPURenderer) {
+        const r = new WebGPURenderer({ canvas: props.canvas, antialias: false });
+        await r.init();
+        // R3F's gl callback contract wants a WebGLRenderer-compatible
+        // shape; WebGPURenderer implements the same surface (render,
+        // setSize, setPixelRatio, dispose, etc.) but TS doesn't know.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return r as any;
+      }
+    } catch (e) {
+      console.warn("[Map3D] WebGPU init failed, falling back to WebGL2:", e);
+    }
+  }
+  const fallback = new THREE.WebGLRenderer({
+    canvas: props.canvas,
+    antialias: false,
+    alpha: false,
+  });
+  return fallback;
+}
+
 export function Map3D(props: Map3DProps) {
-  const { tile, heights, pins, cameraZoom, yLevel, yMin, yMax, onYDelta, onYSet, onHover } =
-    props;
+  const {
+    tile,
+    heights,
+    pins,
+    cameraZoom,
+    yLevel,
+    yMin,
+    yMax,
+    onYDelta,
+    onYSet,
+    onHover,
+    slimeChunks,
+    showBorder,
+  } = props;
 
   // Wheel handler — bypasses MapControls (which has wheel-zoom off). Step
   // size = 4 blocks (one scale-Y unit at cubScale=4) so every notch crosses
@@ -379,7 +537,8 @@ export function Map3D(props: Map3DProps) {
       <Canvas
         orthographic
         dpr={[1, 2]}
-        gl={{ antialias: false, alpha: false }}
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        gl={makeRenderer as any}
         flat
         style={{ background: "#0e1410" }}
       >
@@ -404,6 +563,10 @@ export function Map3D(props: Map3DProps) {
         <ambientLight intensity={1.0} />
         <VoxelColumns tile={tile} heights={heights} yLevel={yLevel} onHover={onHover} />
         <YPlaneIndicator tile={tile} yLevel={yLevel} show={heights != null} />
+        {slimeChunks && slimeChunks.length > 0 && (
+          <SlimeChunksOverlay tile={tile} chunks={slimeChunks} />
+        )}
+        {showBorder && <WorldBorderWireframe tile={tile} height={Math.max(tile.sx, tile.sz) * 0.1} />}
         <PinOverlay tile={tile} pins={pins} />
       </Canvas>
       <YSlider y={yLevel} yMin={yMin} yMax={yMax} onChange={onYSet} />

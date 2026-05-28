@@ -674,6 +674,80 @@ textarea {
   margin-left: 6px;
 }
 
+/* Top bar above the map: dimension tabs (left) + overlay toggles (right). */
+.mapTopBar {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  background: rgba(15, 22, 18, 0.85);
+  padding: 4px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  backdrop-filter: blur(6px);
+}
+
+.dimTabs {
+  display: flex;
+  gap: 2px;
+}
+
+.dimTab {
+  background: transparent;
+  color: var(--text-dim);
+  border: none;
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  text-transform: uppercase;
+}
+
+.dimTab:hover {
+  color: var(--text);
+}
+
+.dimTab.active {
+  background: var(--accent);
+  color: #0a120c;
+}
+
+.overlayToggles {
+  display: flex;
+  gap: 4px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border-strong);
+}
+
+.overlayToggle {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+}
+
+.overlayToggle:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.overlayToggle.active {
+  background: rgba(58, 255, 138, 0.18);
+  color: #b6ffd5;
+  border-color: rgba(58, 255, 138, 0.4);
+}
+
 /* Stack the terrain + renderer badges in the top-left corner so they
  * don't fight for the same spot. */
 .badgeStack {

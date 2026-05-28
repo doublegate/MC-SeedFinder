@@ -209,6 +209,7 @@ function isSupersededError(e: unknown): boolean {
 function tileKey(
   seed: number,
   version: string,
+  dimension: string,
   x: number,
   z: number,
   sx: number,
@@ -216,21 +217,22 @@ function tileKey(
   scale: number,
   y: number,
 ): string {
-  return `${seed}|${version}|${x},${z}|${sx}x${sz}@${scale}|y${y}`;
+  return `${seed}|${version}|${dimension}|${x},${z}|${sx}x${sz}@${scale}|y${y}`;
 }
 
 function heightKey(
   seed: number,
   version: string,
+  dimension: string,
   x: number,
   z: number,
   sx: number,
   sz: number,
 ): string {
   // Heightmaps are seed/dimension-dependent but NOT y-dependent — there's
-  // one surface per (seed, x, z). Separate key from biome tiles so they
-  // share the cache cleanly.
-  return `h:${seed}|${version}|${x},${z}|${sx}x${sz}`;
+  // one surface per (seed, dim, x, z). Separate key from biome tiles so
+  // they share the cache cleanly.
+  return `h:${seed}|${version}|${dimension}|${x},${z}|${sx}x${sz}`;
 }
 
 /** Minecraft 1.18+ build range. The wheel-driven Y scrubber in the 3D
@@ -347,6 +349,17 @@ function App() {
   // Per-cell biome readout under the cursor in 3D mode. null when not
   // hovering a column. Populated by Map3D's raycaster-driven onHover.
   const [hover, setHover] = useState<HoverInfo | null>(null);
+  // Dimension tabs (Overworld / Nether / End). All three are supported
+  // by cubiomes; tile rendering threads the value through directly.
+  // The Nether/End heightmaps behave differently (Nether is constant Y=127,
+  // End uses getEndSurfaceHeight) — the existing Tauri command handles both.
+  type Dimension = "overworld" | "nether" | "end";
+  const [dimension, setDimension] = useState<Dimension>("overworld");
+  // Overlay toggles (slime chunks, world border). Slime chunks are
+  // computed via the new list_slime_chunks_cmd Tauri command. World
+  // border is the static ±29,999,984 block rectangle.
+  const [overlays, setOverlays] = useState({ slime: false, border: false });
+  const [slimeChunks, setSlimeChunks] = useState<number[][]>([]);
 
   // Ref to the on-screen canvas so `downloadTile` can pull the rendered PNG
   // from it (the canvas owns the rendered pixels; we don't ship a separate
@@ -660,14 +673,28 @@ function App() {
     // unchanged); 3D mode samples at the wheel-driven Y. Cache key includes
     // Y in both modes so an A/B toggle never serves a wrong-Y tile.
     const fetchY = mapView === "3D" ? yLevel : Y_DEFAULT;
-    const key = tileKey(selectedSeed, version, tileX, tileZ, sx, sz, cubScale, fetchY);
+    const key = tileKey(
+      selectedSeed,
+      version,
+      dimension,
+      tileX,
+      tileZ,
+      sx,
+      sz,
+      cubScale,
+      fetchY,
+    );
     const cached = getCachedTile(tileCacheRef.current, key);
 
     // The 3D view also needs the approximate surface heightmap to extrude
-    // the ground plane. Heightmap is Y-independent — one per (seed, x, z, sx,
-    // sz) — and only fetched in 3D mode.
-    const hKey = heightKey(selectedSeed, version, tileX, tileZ, sx, sz);
-    const cachedHeight = mapView === "3D" ? heightCacheRef.current.get(hKey) : undefined;
+    // the ground plane. Heightmap is Y-independent — one per (seed, dim, x,
+    // z, sx, sz) — and only fetched in 3D Overworld (Nether returns Y=127,
+    // End uses different math the surface_height_tile_cmd doesn't surface yet).
+    const hKey = heightKey(selectedSeed, version, dimension, tileX, tileZ, sx, sz);
+    const cachedHeight =
+      mapView === "3D" && dimension === "overworld"
+        ? heightCacheRef.current.get(hKey)
+        : undefined;
 
     (async () => {
       // Show any cached tile immediately, then refresh pins (which we never
@@ -686,7 +713,7 @@ function App() {
               request: {
                 seed: selectedSeed,
                 version,
-                dimension: "overworld",
+                dimension,
                 x: tileX,
                 z: tileZ,
                 scale: cubScale,
@@ -710,12 +737,12 @@ function App() {
         // surface_height_map (still scale-4 internally) sampled wider, so
         // for now restrict to scale 4 and fall back to a flat plane otherwise.
         const heightPromise: Promise<HeightTileResponse | null> =
-          mapView === "3D" && cubScale === 4 && !cachedHeight
+          mapView === "3D" && cubScale === 4 && dimension === "overworld" && !cachedHeight
             ? invoke<HeightTileResponse>("surface_height_tile_cmd", {
                 request: {
                   seed: selectedSeed,
                   version,
-                  dimension: "overworld",
+                  dimension,
                   x: tileX,
                   z: tileZ,
                   sx,
@@ -756,6 +783,7 @@ function App() {
   }, [
     selectedSeed,
     version,
+    dimension,
     viewCenter.x,
     viewCenter.z,
     cubScale,
@@ -789,6 +817,7 @@ function App() {
         const key = tileKey(
           selectedSeed,
           version,
+          dimension,
           tileX,
           tileZ,
           sx,
@@ -802,7 +831,7 @@ function App() {
             request: {
               seed: selectedSeed,
               version,
-              dimension: "overworld",
+              dimension,
               x: tileX,
               z: tileZ,
               scale: cubScale,
@@ -829,7 +858,113 @@ function App() {
     }, 200);
 
     return () => window.clearTimeout(handle);
-  }, [mapView, selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h, yLevel]);
+  }, [mapView, selectedSeed, version, dimension, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h, yLevel]);
+
+  // Slime-chunk fetch (#10). Fires when the slime overlay is toggled on
+  // and on any view-rectangle change. Slime is dimension-independent
+  // (pure Java RNG of (seed, chunk_x, chunk_z)), so we don't refetch on
+  // dimension change. The list goes into local state; Map3D renders it
+  // as a green flat overlay over the voxel columns.
+  useEffect(() => {
+    if (!overlays.slime || selectedSeed == null) {
+      setSlimeChunks([]);
+      return;
+    }
+    const { sx, sz } = tileSizeForPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN);
+    const tileSpanX = sx * cubScale;
+    const tileSpanZ = sz * cubScale;
+    const tileX = viewCenter.x - Math.round(tileSpanX / 2);
+    const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
+    let cancelled = false;
+    (async () => {
+      try {
+        const chunks = await invoke<number[][]>("list_slime_chunks_cmd", {
+          request: { seed: selectedSeed, x: tileX, z: tileZ, sx: tileSpanX, sz: tileSpanZ },
+        });
+        if (!cancelled) setSlimeChunks(chunks);
+      } catch (e) {
+        if (!cancelled && !isSupersededError(e)) {
+          // best-effort; don't surface in UI
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [overlays.slime, selectedSeed, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
+
+  // Keyboard shortcuts (#18). Vim-like. j/k = Y -4/+4 (Shift = ×4 = 16);
+  // h/l = zoom out/in (one notch); 2/3 = mapView toggle; arrows = pan;
+  // r = recenter. Ignored while typing in an input/textarea/contentEditable.
+  useEffect(() => {
+    function isTyping(target: EventTarget | null): boolean {
+      if (!(target instanceof HTMLElement)) return false;
+      if (target.isContentEditable) return true;
+      const tag = target.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    }
+    function onKey(e: KeyboardEvent) {
+      if (isTyping(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const big = e.shiftKey;
+      // Pan step in BLOCKS — same step as the view-pan integration.
+      const panStep = (big ? 4 : 1) * cubScale * 16;
+      switch (e.key) {
+        case "j":
+        case "J":
+          setYLevel((y) => clampY(y - (big ? 16 : 4)));
+          e.preventDefault();
+          return;
+        case "k":
+        case "K":
+          setYLevel((y) => clampY(y + (big ? 16 : 4)));
+          e.preventDefault();
+          return;
+        case "h":
+        case "H":
+          setZoomLevel((z) => clampZoom(z / 1.4));
+          e.preventDefault();
+          return;
+        case "l":
+        case "L":
+          setZoomLevel((z) => clampZoom(z * 1.4));
+          e.preventDefault();
+          return;
+        case "2":
+          setMapView("2D");
+          e.preventDefault();
+          return;
+        case "3":
+          setMapView("3D");
+          e.preventDefault();
+          return;
+        case "r":
+        case "R":
+          setViewCenter({ x: 0, z: 0 });
+          setZoomLevel(1.0);
+          e.preventDefault();
+          return;
+        case "ArrowLeft":
+          setViewCenter((v) => ({ ...v, x: v.x - panStep }));
+          e.preventDefault();
+          return;
+        case "ArrowRight":
+          setViewCenter((v) => ({ ...v, x: v.x + panStep }));
+          e.preventDefault();
+          return;
+        case "ArrowUp":
+          setViewCenter((v) => ({ ...v, z: v.z - panStep }));
+          e.preventDefault();
+          return;
+        case "ArrowDown":
+          setViewCenter((v) => ({ ...v, z: v.z + panStep }));
+          e.preventDefault();
+          return;
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [cubScale]);
 
   // Background prefetch was disabled in Phase 6b. It compounded with rapid
   // pan/click into a Tauri command-pool storm (5× tile fetches per view
@@ -1019,6 +1154,41 @@ function App() {
       </aside>
 
       <section className="mapPane" ref={mapPaneRef}>
+        {/* Dimension tabs + overlay toggles — shared across 2D and 3D
+            modes. Positioned absolutely so they overlay both
+            conditional branches without code duplication. */}
+        <div className="mapTopBar">
+          <div className="dimTabs" role="tablist" aria-label="Dimension">
+            {(["overworld", "nether", "end"] as const).map((dim) => (
+              <button
+                key={dim}
+                role="tab"
+                aria-selected={dimension === dim}
+                className={`dimTab ${dimension === dim ? "active" : ""}`}
+                onClick={() => setDimension(dim)}
+                title={`Render the ${dim} dimension`}
+              >
+                {dim === "overworld" ? "Overworld" : dim === "nether" ? "Nether" : "End"}
+              </button>
+            ))}
+          </div>
+          <div className="overlayToggles">
+            <button
+              className={`overlayToggle ${overlays.slime ? "active" : ""}`}
+              onClick={() => setOverlays((o) => ({ ...o, slime: !o.slime }))}
+              title="Toggle slime-chunk overlay (green plates over slime chunks)"
+            >
+              🟢 slime
+            </button>
+            <button
+              className={`overlayToggle ${overlays.border ? "active" : ""}`}
+              onClick={() => setOverlays((o) => ({ ...o, border: !o.border }))}
+              title="Toggle world border wireframe (±29 999 984)"
+            >
+              ▢ border
+            </button>
+          </div>
+        </div>
         {mapView === "3D" && tile ? (
           <div className="mapGrid">
             <Map3D
@@ -1040,6 +1210,8 @@ function App() {
               onYDelta={(d) => setYLevel((y) => clampY(y + d))}
               onYSet={(y) => setYLevel(clampY(y))}
               onHover={setHover}
+              slimeChunks={overlays.slime ? slimeChunks : []}
+              showBorder={overlays.border}
             />
             <div className="mapControls">
               <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>

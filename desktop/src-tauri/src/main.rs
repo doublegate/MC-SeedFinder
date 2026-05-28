@@ -26,7 +26,8 @@ use _native::biomes::{BiomeBackend, DEFAULT_Y};
 use _native::conditions::{self, CompiledNode, Node};
 use _native::gpu::{Combinator, GpuPredicate, GpuSearchSpec, GpuSearcher, MAX_PREDICATES};
 use _native::structures::{
-    iter_strongholds, iter_structures_in_radius, StructureRequirement, StructureType,
+    is_slime_chunk, iter_strongholds, iter_structures_in_radius, StructureRequirement,
+    StructureType,
 };
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1008,46 @@ fn list_structures_in_view(
     Ok(out)
 }
 
+/// Wire-format for `list_slime_chunks_cmd` — view rectangle in BLOCK
+/// coords; we convert to chunk bounds internally.
+#[derive(Debug, Deserialize)]
+struct SlimeChunksRequest {
+    seed: i64,
+    x: i32,
+    z: i32,
+    sx: u32,
+    sz: u32,
+}
+
+/// Enumerate slime chunks whose chunk rect (`16×16 blocks each`) overlaps
+/// the requested block-coord view rectangle. Returns `[chunk_x, chunk_z]`
+/// pairs as flat arrays of i32. Dimension-independent — slime chunks are
+/// a property of Java RNG mixing of (world_seed, chunk_x, chunk_z) only.
+#[tauri::command]
+fn list_slime_chunks_cmd(request: SlimeChunksRequest) -> Vec<[i32; 2]> {
+    // Convert block bounds to chunk bounds (inclusive). `div_euclid`
+    // handles negative coords correctly (Rust integer division rounds
+    // toward zero, which is wrong for negative-block → chunk mapping).
+    let cx0 = request.x.div_euclid(16);
+    let cz0 = request.z.div_euclid(16);
+    let cx1 = (request.x + request.sx as i32 - 1).div_euclid(16);
+    let cz1 = (request.z + request.sz as i32 - 1).div_euclid(16);
+    let mut out: Vec<[i32; 2]> = Vec::new();
+    // The expected chunk count for a typical tile (1024×1024 blocks = 64×64
+    // chunks = 4096 chunks) caps at ~410 slime chunks; allocating up front
+    // avoids reallocation during the inner loop.
+    let total = ((cx1 - cx0 + 1) as usize) * ((cz1 - cz0 + 1) as usize);
+    out.reserve(total / 8);
+    for cz in cz0..=cz1 {
+        for cx in cx0..=cx1 {
+            if is_slime_chunk(request.seed, cx, cz) {
+                out.push([cx, cz]);
+            }
+        }
+    }
+    out
+}
+
 /// Read the world seed (and a few labels) out of a Minecraft `level.dat`.
 /// Accepts the raw gzipped NBT bytes — the frontend reads the file with an
 /// HTML `<input type="file">` and passes the bytes through, so we don't need a
@@ -1121,6 +1162,7 @@ fn main() {
             render_tile,
             render_tile_rgba_cmd,
             surface_height_tile_cmd,
+            list_slime_chunks_cmd,
             list_structures_in_view,
             import_level_dat,
             export_results
