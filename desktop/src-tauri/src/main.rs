@@ -785,6 +785,60 @@ fn render_tile(
     })
 }
 
+/// Faster variant of [`render_tile`]: returns the raw RGBA pixel buffer
+/// instead of a PNG. The frontend blits it via Canvas2D `putImageData`,
+/// skipping PNG encode (~15-25 ms), base64 (~5 ms), and the browser's PNG
+/// decode (~5-10 ms) — together a ~30-45 ms speedup per tile.
+///
+/// Wire shape: returns `bytes` (Vec<u8>, length `sx * sz * 4`) alongside
+/// the same metadata `render_tile` returns. Tauri serialises Vec<u8> as a
+/// JSON array of numbers; for the typical 768x576 tile (~1.7 MB raw) that
+/// adds ~3-5 MB of JSON text, but the in-process IPC handles it quickly
+/// and the net is still well ahead of the PNG path.
+#[tauri::command]
+fn render_tile_rgba_cmd(
+    request: TileRequest,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
+    if superseded(&state.tile_counter, my_seq) {
+        release_biome_backend(&state, &request.version, &request.dimension, backend);
+        return Err(SUPERSEDED.into());
+    }
+    let rgba = backend.render_tile_rgba(
+        request.seed,
+        request.scale,
+        request.x,
+        request.z,
+        request.sx,
+        request.sz,
+    );
+    let version = request.version.clone();
+    let dimension = request.dimension.clone();
+    release_biome_backend(&state, &version, &dimension, backend);
+
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    rgba.map(|bytes| {
+        serde_json::json!({
+            "bytes": bytes,
+            "seed": request.seed,
+            "version": request.version,
+            "dimension": request.dimension,
+            "scale": request.scale,
+            "x": request.x,
+            "z": request.z,
+            "sx": request.sx,
+            "sz": request.sz,
+        })
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct StructuresInViewRequest {
     seed: i64,
@@ -973,6 +1027,7 @@ fn main() {
             cancel_search,
             analyze_seed,
             render_tile,
+            render_tile_rgba_cmd,
             list_structures_in_view,
             import_level_dat,
             export_results

@@ -152,11 +152,16 @@ impl BiomeBackend {
         }
     }
 
-    /// Render a biome tile as PNG bytes. `(x, z)` is the top-left **block**
-    /// coordinate; `(sx, sz)` is the tile size in *scaled* units (so the tile
-    /// covers `sx*scale` × `sz*scale` blocks). `scale` must be a cubiomes scale
+    /// Render a biome tile to raw RGBA pixels (4 bytes per pixel, row-major,
+    /// top-left origin). `(x, z)` is the top-left **block** coordinate; `(sx,
+    /// sz)` is the tile size in *scaled* units (so the tile covers
+    /// `sx*scale` × `sz*scale` blocks). `scale` must be a cubiomes scale
     /// (1, 4, 16, 64, or 256); 4 is the standard biome-map scale.
-    pub fn render_tile_png(
+    ///
+    /// Returns `sx * sz * 4` bytes. Prefer this over `render_tile_png` when
+    /// the consumer can blit raw RGBA (e.g. a Canvas2D `putImageData`); it
+    /// skips PNG encode + base64 + browser decode (~30–45 ms / tile saved).
+    pub fn render_tile_rgba(
         &mut self,
         world_seed: i64,
         scale: i32,
@@ -218,9 +223,25 @@ impl BiomeBackend {
             };
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
+        Ok(rgba)
+    }
 
-        // PNG-encode in-memory.
-        let mut png_bytes: Vec<u8> = Vec::with_capacity(total + 1024);
+    /// Render a biome tile as PNG bytes. Wraps [`render_tile_rgba`] with a
+    /// PNG encode — useful when the consumer is an `<img src="data:…">` or
+    /// the network needs the compression. Prefer `render_tile_rgba` for
+    /// in-process Tauri↔WebView transport: it skips PNG encode + base64 +
+    /// browser decode (saves ~30–45 ms / tile).
+    pub fn render_tile_png(
+        &mut self,
+        world_seed: i64,
+        scale: i32,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+    ) -> Result<Vec<u8>, String> {
+        let rgba = self.render_tile_rgba(world_seed, scale, x, z, sx, sz)?;
+        let mut png_bytes: Vec<u8> = Vec::with_capacity(rgba.len() / 2 + 1024);
         {
             let mut encoder = png::Encoder::new(&mut png_bytes, sx, sz);
             encoder.set_color(png::ColorType::Rgba);
