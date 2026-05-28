@@ -22,10 +22,23 @@
  * the "approximate terrain" pill in the HUD makes that visible.
  */
 
-import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
 import { Html, MapControls, OrthographicCamera } from "@react-three/drei";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
+import { YSlider } from "./YSlider";
+
+/** True when the host WebView advertises WebGPU. Tauri's WebView is one
+ *  of WebKitGTK (Linux, no WebGPU as of late 2025), WebView2 (Windows,
+ *  WebGPU behind --enable-unsafe-webgpu), or WKWebView (macOS, WebGPU
+ *  baseline in Safari 26+). The current `<Canvas>` ships on WebGL2 in
+ *  all cases — we only surface the capability so the HUD can communicate
+ *  which path is in use. The async-gl swap to WebGPURenderer is a
+ *  follow-up commit once R3F v9 + three/webgpu integration is stable
+ *  enough to gate on. */
+export function hasWebGPU(): boolean {
+  return typeof navigator !== "undefined" && "gpu" in navigator;
+}
 
 export type HoverInfo = {
   /** Block X coordinate of the hovered cell (centre of the scale-grid cell). */
@@ -54,8 +67,13 @@ export type Map3DProps = {
   cameraZoom: number;
   /** Block Y the wheel is currently scrubbed to. */
   yLevel: number;
+  /** 1.18+ build range — defines the YSlider track extent. */
+  yMin: number;
+  yMax: number;
   /** Wheel delta callback (4-block step per notch; Shift = ×4 / 16 blocks). */
   onYDelta: (delta: number) => void;
+  /** Direct Y setter (used by the side YSlider's drag handler). */
+  onYSet: (y: number) => void;
   /** Pointer hover callback. Fires when the hovered cell changes; null when
    *  the pointer leaves the voxel mesh. */
   onHover: (info: HoverInfo | null) => void;
@@ -82,9 +100,13 @@ function CameraZoomSync({ cameraZoom }: { cameraZoom: number }) {
  *
  *  MIN_H ensures cells whose approximate height is ≤ 0 (deep ocean floor,
  *  or absent heightmap) still render a thin slab the user can hover over.
- */
+ *
+ *  FADE_MS is the crossfade duration when new tile bytes arrive. ~120ms
+ *  is long enough to read as a "transition" rather than a snap, short
+ *  enough not to feel laggy. */
 const RELIEF = 2.0;
 const MIN_H = 0.6;
+const FADE_MS = 120;
 
 function cellHeight(rawY: number | undefined, scale: number): number {
   if (rawY == null) return MIN_H;
@@ -146,23 +168,79 @@ function VoxelColumns({
     mesh.computeBoundingSphere(); // raycast culling
   }, [heights, sx, sz, tile.scale, tmpMatrix]);
 
-  // (Re)write per-instance colours whenever tile.bytes change. Each wheel
-  // notch produces a fresh `tile` object with new bytes; this rewrites the
-  // 4 bytes/cell into normalised RGB on the instanceColor buffer.
+  // Crossfade animation state. When new tile bytes arrive, snapshot the
+  // CURRENTLY-displayed RGB into `prevColorsRef` and start a fresh fade
+  // timer. The useFrame loop below blends prev → new over FADE_MS.
+  //
+  // We snapshot the live instanceColor buffer (which itself may be
+  // mid-fade) so rapid wheel scrubs animate from "whatever you're seeing
+  // right now" → "the freshly-arrived bytes", never snapping back to a
+  // pre-fade baseline.
+  const prevColorsRef = useRef<Float32Array | null>(null);
+  const animStartRef = useRef<number | null>(null);
+
   useEffect(() => {
     const mesh = meshRef.current;
     if (!mesh) return;
+    // Initialise the prev buffer on first tile, or resize on (sx, sz) change.
+    if (!prevColorsRef.current || prevColorsRef.current.length !== count * 3) {
+      prevColorsRef.current = new Float32Array(count * 3);
+      // First render: bake new bytes directly so we don't fade from black.
+      for (let i = 0; i < count; i++) {
+        const off = i * 4;
+        const cOff = i * 3;
+        prevColorsRef.current[cOff] = tile.bytes[off] / 255;
+        prevColorsRef.current[cOff + 1] = tile.bytes[off + 1] / 255;
+        prevColorsRef.current[cOff + 2] = tile.bytes[off + 2] / 255;
+      }
+      // Write to instanceColor so something is visible before useFrame runs.
+      for (let i = 0; i < count; i++) {
+        const cOff = i * 3;
+        tmpColor.setRGB(
+          prevColorsRef.current[cOff],
+          prevColorsRef.current[cOff + 1],
+          prevColorsRef.current[cOff + 2],
+        );
+        mesh.setColorAt(i, tmpColor);
+      }
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      animStartRef.current = null;
+      return;
+    }
+    // Subsequent updates: snapshot live colours (possibly mid-fade) as
+    // the new starting point, then start a fresh animation.
+    if (mesh.instanceColor) {
+      prevColorsRef.current.set(mesh.instanceColor.array as Float32Array);
+    }
+    animStartRef.current = performance.now();
+  }, [tile.bytes, count, tmpColor]);
+
+  useFrame(() => {
+    if (animStartRef.current == null) return;
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const prev = prevColorsRef.current;
+    if (!prev) return;
+    const elapsed = performance.now() - animStartRef.current;
+    const t = Math.min(1, elapsed / FADE_MS);
     for (let i = 0; i < count; i++) {
-      const off = i * 4;
+      const cOff = i * 3;
+      const bOff = i * 4;
+      const newR = tile.bytes[bOff] / 255;
+      const newG = tile.bytes[bOff + 1] / 255;
+      const newB = tile.bytes[bOff + 2] / 255;
       tmpColor.setRGB(
-        tile.bytes[off] / 255,
-        tile.bytes[off + 1] / 255,
-        tile.bytes[off + 2] / 255,
+        prev[cOff] + (newR - prev[cOff]) * t,
+        prev[cOff + 1] + (newG - prev[cOff + 1]) * t,
+        prev[cOff + 2] + (newB - prev[cOff + 2]) * t,
       );
       mesh.setColorAt(i, tmpColor);
     }
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }, [tile.bytes, count, tmpColor]);
+    if (t >= 1) {
+      animStartRef.current = null;
+    }
+  });
 
   // Throttle hover-state writes: only push to the parent when the hovered
   // cell index changes. Without this we'd fire a setState 60+ times per
@@ -273,7 +351,8 @@ function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps
 }
 
 export function Map3D(props: Map3DProps) {
-  const { tile, heights, pins, cameraZoom, yLevel, onYDelta, onHover } = props;
+  const { tile, heights, pins, cameraZoom, yLevel, yMin, yMax, onYDelta, onYSet, onHover } =
+    props;
 
   // Wheel handler — bypasses MapControls (which has wheel-zoom off). Step
   // size = 4 blocks (one scale-Y unit at cubScale=4) so every notch crosses
@@ -327,6 +406,7 @@ export function Map3D(props: Map3DProps) {
         <YPlaneIndicator tile={tile} yLevel={yLevel} show={heights != null} />
         <PinOverlay tile={tile} pins={pins} />
       </Canvas>
+      <YSlider y={yLevel} yMin={yMin} yMax={yMax} onChange={onYSet} />
     </div>
   );
 }

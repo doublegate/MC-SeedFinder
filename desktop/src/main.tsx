@@ -9,9 +9,12 @@ import {
   wireToNode,
   type TreeNode,
 } from "./conditions";
-import { Map3D, type HoverInfo } from "./Map3D";
+import { Map3D, hasWebGPU, type HoverInfo } from "./Map3D";
 import { biomeLabel } from "./biomes";
 import "./styles.css";
+
+// Cached at module-init so we don't repeatedly check navigator.gpu.
+const WEBGPU_AVAILABLE = hasWebGPU();
 
 // ---------------------------------------------------------------------------
 // Types mirroring the Tauri command surface
@@ -762,6 +765,72 @@ function App() {
     yLevel,
   ]);
 
+  // Y-axis prefetch (3D only). After the current tile settles, fire two
+  // background fetches at y±4 (the wheel step size). When the user scrolls
+  // the wheel a notch in either direction, the next tile is already in
+  // cache and the wheel-driven refresh is instant. Debounced 200ms so a
+  // rapid scroll doesn't queue noise.
+  useEffect(() => {
+    if (mapView !== "3D" || selectedSeed == null) return;
+    if (cubScale !== 4) return; // mirrors the heightmap path's gate
+
+    const handle = window.setTimeout(() => {
+      const { sx, sz } = tileSizeForPane(
+        paneSize.w * OVERSCAN,
+        paneSize.h * OVERSCAN,
+      );
+      const tileSpanX = sx * cubScale;
+      const tileSpanZ = sz * cubScale;
+      const tileX = viewCenter.x - Math.round(tileSpanX / 2);
+      const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
+
+      const prefetchAt = async (targetY: number) => {
+        if (targetY < Y_MIN || targetY > Y_MAX) return;
+        const key = tileKey(
+          selectedSeed,
+          version,
+          tileX,
+          tileZ,
+          sx,
+          sz,
+          cubScale,
+          targetY,
+        );
+        if (tileCacheRef.current.has(key)) return; // already cached
+        try {
+          const t = await invoke<TileResponse>("render_tile_rgba_cmd", {
+            request: {
+              seed: selectedSeed,
+              version,
+              dimension: "overworld",
+              x: tileX,
+              z: tileZ,
+              scale: cubScale,
+              sx,
+              sz,
+              y: targetY,
+            },
+          });
+          // Cache only — don't update visible state.
+          putCachedTile(tileCacheRef.current, key, t, TILE_CACHE_MAX);
+        } catch (e) {
+          // Silently drop supersession; ignore other errors (best effort).
+          if (!isSupersededError(e)) {
+            // Don't surface — prefetch is opportunistic.
+          }
+        }
+      };
+
+      // Wheel step size — see Map3D's wheel handler. Mirror it here so
+      // a single notch lands in cache. Shift+wheel jumps 16; we don't
+      // prefetch those bigger steps (they're explicitly fast-traversal).
+      void prefetchAt(yLevel + 4);
+      void prefetchAt(yLevel - 4);
+    }, 200);
+
+    return () => window.clearTimeout(handle);
+  }, [mapView, selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h, yLevel]);
+
   // Background prefetch was disabled in Phase 6b. It compounded with rapid
   // pan/click into a Tauri command-pool storm (5× tile fetches per view
   // change), and after the foreground-only path got fast via the BiomePool +
@@ -966,7 +1035,10 @@ function App() {
               pins={pins}
               cameraZoom={zoomLevel}
               yLevel={yLevel}
+              yMin={Y_MIN}
+              yMax={Y_MAX}
               onYDelta={(d) => setYLevel((y) => clampY(y + d))}
+              onYSet={(y) => setYLevel(clampY(y))}
               onHover={setHover}
             />
             <div className="mapControls">
@@ -989,20 +1061,32 @@ function App() {
               <span className="legendItem"><span className="legendDot pin-stronghold" />Stronghold</span>
               <span className="legendItem"><span className="legendDot legendSpawn" />Spawn (0,0)</span>
             </div>
-            {heightTile ? (
-              <div
-                className="terrainBadge"
-                title={`Surface heights come from cubiomes' mapApproxHeight — depth-spline-based, not bit-exact Java terrain. (${heightTile.heights.length} samples)`}
-              >
-                approximate terrain (y {Math.round(Math.min(...heightTile.heights))}..{Math.round(Math.max(...heightTile.heights))})
-              </div>
-            ) : (
-              cubScale !== 4 && (
-                <div className="terrainBadge" style={{ background: "rgba(60, 60, 60, 0.75)", color: "#bbb" }}>
-                  heightmap available at 1:4 only — zoom in
+            <div className="badgeStack">
+              {heightTile ? (
+                <div
+                  className="terrainBadge"
+                  title={`Surface heights come from cubiomes' mapApproxHeight — depth-spline-based, not bit-exact Java terrain. (${heightTile.heights.length} samples)`}
+                >
+                  approximate terrain (y {Math.round(Math.min(...heightTile.heights))}..{Math.round(Math.max(...heightTile.heights))})
                 </div>
-              )
-            )}
+              ) : (
+                cubScale !== 4 && (
+                  <div className="terrainBadge" style={{ background: "rgba(60, 60, 60, 0.75)", color: "#bbb" }}>
+                    heightmap available at 1:4 only — zoom in
+                  </div>
+                )
+              )}
+              <div
+                className="rendererBadge"
+                title={
+                  WEBGPU_AVAILABLE
+                    ? "Host WebView advertises navigator.gpu — WebGPU available. (Renderer is still WebGL2; async-gl swap to WebGPURenderer is a future PR.)"
+                    : "Host WebView has no navigator.gpu (typical on Linux/WebKitGTK as of 2025). Running on WebGL2."
+                }
+              >
+                {WEBGPU_AVAILABLE ? "webgl2 · webgpu ready" : "webgl2"}
+              </div>
+            </div>
             {hover && (
               <div className="cursorReadout">
                 <strong>{biomeLabel(hover.biomeId)}</strong>{" "}

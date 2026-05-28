@@ -674,6 +674,119 @@ textarea {
   margin-left: 6px;
 }
 
+/* Stack the terrain + renderer badges in the top-left corner so they
+ * don't fight for the same spot. */
+.badgeStack {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.badgeStack .terrainBadge {
+  position: static; /* parent now positions it */
+}
+
+/* WebGL2 / WebGPU capability badge. Muted grey so it stays informational
+ * — the "approximate terrain" amber pill above is the louder warning. */
+.rendererBadge {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(28, 36, 30, 0.85);
+  color: var(--text-dim);
+  border: 1px solid var(--border-strong);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  backdrop-filter: blur(6px);
+  cursor: help;
+}
+
+/* Vertical Y slider pinned to the right edge of the 3D pane. The wheel
+ * is the primary Y-scrub; this slider is for direct manipulation
+ * ("take me to Y=192 now"). */
+.ySlider {
+  position: absolute;
+  right: 56px; /* clear the mapControls column on the right */
+  top: 14px;
+  bottom: 56px; /* clear the tileLabel at the bottom */
+  width: 32px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  user-select: none;
+  pointer-events: auto;
+}
+
+.ySliderLabel {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 2px 0;
+  white-space: nowrap;
+}
+.ySliderTop { margin-bottom: 4px; }
+.ySliderBottom { margin-top: 4px; }
+
+.ySliderTrack {
+  position: relative;
+  flex: 1;
+  width: 8px;
+  border-radius: 4px;
+  /* Sky → surface → sea → caves → deepslate gradient, top-down. */
+  background: linear-gradient(
+    to bottom,
+    #5fa4d8 0%,
+    #8fb867 32%,
+    #2e6e9f 38%,
+    #4a3f2a 75%,
+    #1c1714 100%
+  );
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.ySliderBand {
+  position: absolute;
+  left: 12px;
+  transform: translateY(-50%);
+  font-size: 9px;
+  color: var(--text-dim);
+  opacity: 0.7;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.ySliderBand span {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.ySliderThumb {
+  position: absolute;
+  left: -12px;
+  right: -12px;
+  transform: translateY(-50%);
+  height: 18px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: #0a120c;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  line-height: 18px;
+  letter-spacing: 0.02em;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  cursor: ns-resize;
+}
+
 /* "approximate terrain" pill, top-left of the 3D map pane. Keep it small
  * but always-visible so the heightmap's accuracy caveat travels with the
  * view. */
