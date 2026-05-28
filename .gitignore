@@ -26,6 +26,12 @@ env/
 
 # Rust build outputs
 target/
+*.profraw
+*.orig
+*.rej
+
+# maturin wheelhouse
+wheelhouse/
 
 # Node and frontend outputs
 node_modules/
@@ -54,3 +60,10 @@ Thumbs.db
 
 # Personal, machine-local Claude Code instructions (not shared)
 CLAUDE.local.md
+
+# Per-tool agent caches (Codex CLI, .agents/*, etc.)
+.agents/
+.codex/
+
+# Local plan/scratch notes
+.claude/plans/

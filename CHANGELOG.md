@@ -9,6 +9,90 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Bit-exact GPU biome generation matching cubiomes (Phase 6c).** Ports the
+  full Minecraft 1.21 Overworld biome pipeline to WebGPU compute shaders, one
+  primitive at a time, each validated against cubiomes' f64 reference via
+  GPU↔CPU parity tests. cubiomes is f64 throughout; WebGPU compute is f32-only,
+  so "matching" means matching modulo float tolerance at climate boundaries —
+  except for the integer-only b-tree walker, which is bit-exact.
+  - **Phase 6c-1: WGSL `samplePerlin`.** Hand-written C shim (`mcsf_perlin_init`,
+    `mcsf_perlin_sample`) extracts cubiomes' `PerlinNoise` state (a/b/c,
+    h2/d2/t2, 256-byte permutation table) so it can be uploaded as a uniform.
+    `crates/mcseedfinder-core/src/gpu_noise.{wgsl,rs}` mirrors `samplePerlin`
+    step-for-step — fade poly, 16-way indexed-lerp switch, trilinear
+    interpolation, zero-y fast path. Permutation table packed into
+    `array<vec4<u32>, 16>` with bit-shift extraction. GPU↔CPU parity test
+    over 12 diverse coords: max drift **2.9 × 10⁻⁵**.
+  - **Phase 6c-2: WGSL `sampleOctave` + `sampleDoublePerlin`.** C shim
+    `mcsf_double_perlin_sample` reconstructs cubiomes' `DoublePerlinNoise`
+    from packed octave arrays and calls real `sampleDoublePerlin` — true
+    oracle, not a re-port. WGSL `cs_double_perlin` entry stacks N octaves
+    per A/B half with per-octave amplitude+lacunarity, applies the 337/331
+    frequency shift on half B. cubiomes' `maintainPrecision` is a no-op so
+    WGSL uses plain multiplication. New `src/gpu_double_perlin.rs`. Parity
+    over 8 octaves × 8 coords: max drift **3.6 × 10⁻⁵** — octave summation
+    does not compound drift.
+  - **Phase 6c-3: Climate noise stack for MC 1.21.** C shim
+    `mcsf_climate_init_field` runs cubiomes' `setBiomeSeed` and extracts
+    per-field octave state (temperature, humidity, continentalness, erosion,
+    shift, weirdness). New `src/gpu_climate.rs` — `ClimateNoise::for_overworld(mc,
+    seed, large)` builds six `DoublePerlinSpec`s ready for GPU dispatch.
+    Subtle accuracy fix: cubiomes aliases `NP_SHIFT == NP_DEPTH` (same enum
+    value 4) and `sampleClimatePara(NP_DEPTH)` runs a composite C/E/W spline,
+    NOT the underlying shift double-perlin; CPU reference shim bypasses
+    `sampleClimatePara` and goes straight to `sampleDoublePerlin` on the
+    requested field. Parity for seed 12345 × 6 coords × 6 fields: max drift
+    **2.2 × 10⁻⁵** (continentalness, 18 octaves).
+  - **Phase 6c-4: Biome b-tree walker (btree21wd).** Iterative WGSL port of
+    cubiomes' recursive `get_resulting_node` (WGSL has no recursion).
+    Explicit 6-frame stack with PRE/LOOP/RETURN state machine matches
+    cubiomes' control flow exactly. `u64` emulated as `vec2<u32>` (lo, hi)
+    with manual add/sub/lt; `np[6]` uploaded as packed 2×u32 pairs.
+    Required limit bumped to `max_storage_buffers_per_shader_stage = 6`
+    (downlevel default is 4). New `src/gpu_btree.{wgsl,rs}` with both a
+    CPU walker (validates data extraction + algorithm port independent of
+    WGSL) and the GPU dispatcher. **Bit-exact** match to cubiomes
+    `climateToBiome` across all 64 grid points — pure integer arithmetic,
+    no tolerance involved.
+  - **Phase 6c-5: Full `sampleBiomeNoise` integration.** New
+    `src/gpu_biome.rs` orchestrates the four GPU primitives plus a CPU
+    pass for the depth-spline (cubiomes' `getSpline` tree, hard to
+    parallelize and small per-pixel work). Pipeline: 2× shift dispatch →
+    5× climate dispatch → CPU `mcsf_compute_depth` → assemble `np[6]` →
+    GPU b-tree walk. Key accuracy insight: cubiomes' `(int64_t)(10000.0F
+    * value)` cast pattern absorbs all f32 climate drift below the
+    1/10000 boundary, so as long as `np[6]` lands within ±1 of cubiomes',
+    the b-tree returns the identical biome. C shim `mcsf_compute_depth`
+    runs cubiomes' depth-spline computation given (c, e, w, y) — forward-
+    declares `getSpline` since cubiomes has no public prototype for it.
+    Parity for 32×32 grid (1024 pixels, MC 1.21, seed 12345):
+    **1024 / 1024 = 100.00 %**.
+  - **Phase 6c-6: GPU tile rendering matches cubiomes byte-for-byte.**
+    `GpuBiomeRenderer::render_tile_rgba(scale, x, z, sx, sz)` produces RGBA
+    bytes byte-identical to `BiomeBackend::render_tile_rgba` (cubiomes
+    CPU) for `scale = 4` (canonical biome-map resolution). `biome_colormap()`
+    in `biomes.rs` promoted from `fn` to `pub fn` so the GPU path reuses the
+    same cubiomes-derived colormap. RGBA byte parity for a 32×32 tile:
+    **1024 / 1024 = 100.00 %**. Other scales (1 voronoi, ≥16 inner-scaling)
+    fall back to the cubiomes CPU path for now — that's purely coord-shaping
+    work that doesn't touch the GPU primitives.
+  - **Phase 6c-7: GPU biome-condition primitive (search-side scaffold).**
+    `GpuBiomeRenderer::biomes_in_set(coords, allowed)` returns one `bool`
+    per coord: "is the biome at this coord in the allowed set". Sorted-Vec
+    membership (binary search) — biome filter sets are typically <10 IDs,
+    so a sorted scan beats hash overhead. This is the per-seed building
+    block a future GPU-accelerated biome condition in the seed searcher
+    will call. Documented deferral: extending the Phase-6b multi-predicate
+    kernel to evaluate biome conditions per candidate seed needs a WGSL
+    port of cubiomes' Xoroshiro128++ (`xSetSeed`/`xNextLong`) + full
+    `setBiomeSeed` so per-thread climate init runs on the GPU — that is
+    a sub-phase in its own right and intentionally not bundled with
+    "Phase 6c: one MC version, matching cubiomes" (which 6c-1..6c-6
+    fully delivered with bit-identical tile output).
+- 9 new GPU↔cubiomes parity tests covering each Phase 6c sub-phase, plus
+  a CPU walker test (Phase 6c-4) that catches data-extraction bugs
+  independent of WGSL.
+
 - **GPU acceleration for cluster + multi-leaf groups (Phase 6b).** The WGSL
   kernel is generalised from "one NearbyStructure" to "up to 8 predicates +
   combinator". Three combinators land: `any_of`, `all_of`, and `cluster`

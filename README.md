@@ -31,10 +31,13 @@ labeled as approximate only on builds compiled without it.
 | `java.util.Random` | Python and Rust 48-bit LCG ports | Exact, tested against OpenJDK vectors |
 | Random-spread structures | Cubiomes-derived salts and region math | Exact candidate placement for Java 1.18+ |
 | Strongholds | Concentric-ring algorithm | Exact candidate placement, Python and Rust |
-| Biome lookup | Vendored cubiomes via Rust FFI | Exact for Java 1.18+ when the native extension is built |
-| Biome lookup (fallback) | Local climate-noise approximation | Approximate; used only when built without cubiomes |
-| Bedrock Edition | Provider placeholder | Not implemented; fails explicitly |
-| Desktop map tiles | UI/backend placeholders | Not implemented yet |
+| Biome lookup (CPU) | Vendored cubiomes via Rust FFI | Exact for Java 1.18+ when the native extension is built |
+| Biome lookup (GPU, MC 1.21) | WGSL port of cubiomes (Phase 6c) | Bit-exact tile rendering vs cubiomes — 1024/1024 RGBA bytes match |
+| Biome lookup (approximate fallback) | Local climate-noise approximation | Approximate; used only when built without cubiomes |
+| Structure prefilter (GPU) | WGSL port of structure RNG + cluster/all_of/any_of | Bit-exact vs CPU evaluator (Phase 6, 6b) |
+| Bedrock Edition (text-seed → i32) | Java `String.hashCode()` over UTF-16 | Exact (Phase 5) |
+| Bedrock Edition (worldgen) | Provider with explicit rejection | Not implemented; worldgen criteria fail with edition-aware errors |
+| Desktop map tiles | Tauri + cubiomes RGB colormap | Pan/zoom 1:1–1:256, structure pins, raw-RGBA transport |
 
 Important distinction: structure placement means the chunk where Minecraft
 attempts to place a structure. In-game generation can still reject a structure
@@ -262,6 +265,10 @@ The Rust core lives in `crates/mcseedfinder-core/` and provides:
 - random-spread structure placement
 - stronghold ring generation
 - native batch filtering for structure-only searches
+- exact biome lookup via vendored cubiomes (C, compiled with `cc`; no `bindgen`/
+  `libclang` dependency)
+- GPU compute prefilter for structures via wgpu (Phase 6/6b)
+- GPU biome generation for MC 1.21 via wgpu (Phase 6c, bit-exact tile rendering)
 - PyO3 bindings exposed as `mcseedfinder._native`
 
 Run the Rust tests:
@@ -372,10 +379,48 @@ showed:
 These numbers vary by machine, query, build mode, and whether the native
 extension was built in release mode.
 
+## GPU Acceleration
+
+Two GPU pipelines via [wgpu](https://wgpu.rs/) (Vulkan/Metal/DX12 backends,
+auto-selected) are gated by the default-on `gpu` cargo feature on
+`mcseedfinder-core`. Both are validated by GPU↔CPU parity tests on every
+build and fall back to the CPU path transparently when no compatible adapter
+is present.
+
+| Pipeline | Phase | Status | Tested against |
+| --- | --- | --- | --- |
+| Structure-RNG seed prefilter | 6a, 6b | **Bit-exact** vs CPU evaluator (3,500-seed parity runs) | The pure-Rust structure RNG |
+| Multi-predicate kernel: `cluster`, `any_of`, `all_of` of `NearbyStructure` leaves | 6b | **Bit-exact** vs CPU (2,000-seed parity runs each) | The pure-Rust conditions evaluator |
+| `samplePerlin` (Phase 6c-1) | 6c | f32 drift ≤ 2.9 × 10⁻⁵ | cubiomes `samplePerlin` |
+| `sampleOctave` + `sampleDoublePerlin` (Phase 6c-2) | 6c | f32 drift ≤ 3.6 × 10⁻⁵ | cubiomes `sampleDoublePerlin` (via shim) |
+| Climate noise stack — 6 fields for MC 1.21 (Phase 6c-3) | 6c | f32 drift ≤ 2.2 × 10⁻⁵ (worst: continentalness, 18 octaves) | cubiomes `setBiomeSeed` + per-field sample |
+| Biome b-tree walker — btree21wd (Phase 6c-4) | 6c | **Bit-exact** | cubiomes `climateToBiome` |
+| Full `sampleBiomeNoise` integration (Phase 6c-5) | 6c | **100 % (1024 / 1024)** biome IDs match | cubiomes `sampleBiomeNoise` |
+| `render_tile_rgba` for MC 1.21 (Phase 6c-6) | 6c | **100 % (1024 / 1024)** RGBA bytes match | `BiomeBackend::render_tile_rgba` (cubiomes CPU) |
+
+Phase 6c is bit-exact-modulo-f32-tolerance for **one** Minecraft version
+(1.21). cubiomes uses f64 throughout; WebGPU compute is f32-only, so even
+"matching" means matching within float tolerance at climate boundaries —
+except for the b-tree walker, which is integer-only and exactly bit-exact.
+The i64 truncation of `(int64_t)(10000.0F * climate)` that cubiomes does
+internally absorbs all f32 drift below the 1/10000 boundary, which is why
+tile RGBA can match cubiomes byte-for-byte despite the precision gap.
+
+Multi-seed search integration of the GPU biome pipeline is documented as
+future work in `crates/mcseedfinder-core/src/gpu_biome.rs` — it requires
+porting cubiomes' Xoroshiro128++ (`xSetSeed`/`xNextLong`) and
+`setBiomeSeed` to WGSL so per-thread climate init runs on the GPU. The
+per-seed `biomes_in_set` primitive that integration would call is
+already shipped (Phase 6c-7).
+
 ## Limitations
 
 - Java Edition 1.18+ is the only edition with a full worldgen backend
   (exact biomes via cubiomes; exact structures/strongholds in pure Rust).
+- GPU biome generation is implemented for **Minecraft 1.21 only** (Phase 6c).
+  Other 1.18+ versions continue to use the cubiomes CPU path. Adding more
+  versions is mechanical (different `btreeN.h` + matching `init_climate_seed`
+  constants), tracked in `docs/GPU.md`.
 - Bedrock Edition: foundation only. Text-seed → i32 hashing works
   (`--seed-string`); worldgen-dependent criteria (biomes, structures,
   strongholds) are rejected with a clear edition-aware error. See
@@ -383,8 +428,8 @@ extension was built in release mode.
 - Biome filtering is exact via cubiomes when the native extension is built; the
   approximate climate-noise generator is used only as a no-cubiomes fallback.
 - Structure candidate placement does not prove in-world structure validity.
-- The desktop UI is an MVP scaffold, not a finished map viewer.
-- GPU search planning is not implemented yet.
+- The seed-search kernel evaluates biome conditions on the CPU; GPU per-seed
+  biome conditions are blocked on a future WGSL port of `setBiomeSeed`.
 
 ## References
 
