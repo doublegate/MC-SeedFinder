@@ -42,6 +42,34 @@ def java_random(seed: int) -> Any:
     return _native.JavaRandom(seed)
 
 
+def has_cubiomes() -> bool:
+    """Return True if the native extension links the exact cubiomes biome backend."""
+    return _native is not None and bool(getattr(_native, "HAS_CUBIOMES", False))
+
+
+def make_biome_backend(
+    version: str,
+    dimension: str = "overworld",
+    y: Optional[int] = None,
+) -> Optional[Any]:
+    """Construct an exact cubiomes biome backend, or ``None`` if unavailable.
+
+    The returned object implements ``get_biome(world_seed, x, z) -> int`` (the
+    ``BiomeGenerator`` protocol), so it drops straight into ``BiomeLookup``.
+    Returns ``None`` when the native extension lacks cubiomes or the version /
+    dimension is not recognised — callers then fall back to the approximate
+    backend rather than failing a search.
+    """
+    if not has_cubiomes():
+        return None
+    try:
+        if y is None:
+            return _native.CubiomesBiomeBackend(version, dimension)
+        return _native.CubiomesBiomeBackend(version, dimension, y)
+    except (ValueError, RuntimeError):
+        return None
+
+
 def get_structure_pos(
     structure: str,
     world_seed: int,

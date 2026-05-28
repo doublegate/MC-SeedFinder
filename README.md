@@ -6,8 +6,8 @@ and an early Tauri desktop shell.
 
 The project is designed around one rule: never present approximate worldgen as
 exact. Structure placement and Java RNG math are tested against golden vectors.
-Biome filtering is clearly labeled as approximate unless an exact backend is
-installed.
+Biome filtering is exact via the bundled cubiomes backend, and is clearly
+labeled as approximate only on builds compiled without it.
 
 ## What It Does
 
@@ -31,8 +31,8 @@ installed.
 | `java.util.Random` | Python and Rust 48-bit LCG ports | Exact, tested against OpenJDK vectors |
 | Random-spread structures | Cubiomes-derived salts and region math | Exact candidate placement for Java 1.18+ |
 | Strongholds | Concentric-ring algorithm | Exact candidate placement, Python and Rust |
-| Biome lookup | Local climate-noise fallback | Approximate candidate filtering |
-| Exact biome lookup | Optional `cubiomes-py` integration point | Exact when installed and wired |
+| Biome lookup | Vendored cubiomes via Rust FFI | Exact for Java 1.18+ when the native extension is built |
+| Biome lookup (fallback) | Local climate-noise approximation | Approximate; used only when built without cubiomes |
 | Bedrock Edition | Provider placeholder | Not implemented; fails explicitly |
 | Desktop map tiles | UI/backend placeholders | Not implemented yet |
 
@@ -58,12 +58,24 @@ because of biome or terrain validity. The candidate chunk math itself is exact.
 
 - Python 3.10+
 - Rust stable toolchain
+- A C compiler (the native extension compiles the vendored cubiomes C sources)
 - Node.js and npm for the desktop frontend
 - Linux desktop builds of Tauri may require WebKitGTK and related system
   packages, depending on distribution
 
-The runtime Python package is stdlib-only unless optional extras are installed.
-The editable install uses `maturin` to build the native extension.
+The runtime Python package is stdlib-only. Exact biome generation is provided by
+the native extension, which statically compiles Cubitect's `cubiomes` C library
+from a git submodule — there is no `bindgen`/`libclang` build dependency. After
+cloning, initialize the submodule:
+
+```bash
+git submodule update --init --recursive
+```
+
+The editable install uses `maturin` to build the native extension. To build the
+pure-Rust structure/RNG core without a C toolchain, disable the default `biomes`
+feature (`cargo build --no-default-features`); biome filtering then falls back to
+the approximate generator.
 
 ## Install
 
@@ -73,7 +85,9 @@ For normal local development:
 pip install -e ".[dev]"
 ```
 
-For accurate biome backend experiments:
+Biomes are exact out of the box (the native extension bundles cubiomes). The
+optional `accurate` extra remains for experimenting with an alternative
+`cubiomes-py` backend:
 
 ```bash
 pip install -e ".[dev,accurate]"
@@ -351,7 +365,8 @@ extension was built in release mode.
 
 - Java Edition 1.18+ is the only implemented edition/version target.
 - Bedrock is represented in the API but not implemented.
-- Biome filtering is approximate unless an exact backend is installed and used.
+- Biome filtering is exact via cubiomes when the native extension is built; the
+  approximate climate-noise generator is used only as a no-cubiomes fallback.
 - Structure candidate placement does not prove in-world structure validity.
 - The desktop UI is an MVP scaffold, not a finished map viewer.
 - GPU search planning is not implemented yet.

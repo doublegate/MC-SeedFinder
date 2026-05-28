@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 This project follows the spirit of [Keep a Changelog](https://keepachangelog.com/)
 and uses semantic versioning while the public API settles.
 
+## [Unreleased]
+
+### Added
+
+- **Exact biome generation via cubiomes.** Cubitect's `cubiomes` C library is
+  vendored as a git submodule (`crates/mcseedfinder-core/vendor/cubiomes`) and
+  compiled with the `cc` crate plus a small hand-written FFI shim (`csrc/shim.c`)
+  — no bindgen, so the build is reproducible across clang/libclang versions.
+- `CubiomesBiomeBackend` exposed through the `_native` extension, implementing
+  the existing `BiomeGenerator` protocol (`get_biome(world_seed, x, z)`), plus a
+  `HAS_CUBIOMES` flag and `rust_backend.make_biome_backend()` helper.
+- Biome backend is threaded from `SearchSpec` version/dimension down through the
+  criteria, finder (per-worker), and engine layers; `CriteriaSet.uses_exact_biomes`
+  reports whether exact biomes are active.
+- `--dimension {overworld,nether,end}` CLI flag; `--show-seed` now reports the
+  origin biome exactly when cubiomes is available.
+- Integration-regression biome vectors (Rust and Python) for MC 1.21.
+- `cargo` feature `biomes` (default-on) gating the cubiomes build; build with
+  `--no-default-features` for the pure-Rust structure/RNG core with no C toolchain.
+
+### Changed
+
+- Biome filtering is now **exact** by default (cubiomes), not approximate. The
+  Perlin climate-noise generator remains a fallback when the extension is built
+  without cubiomes. `SeedReport.exactness` marks biome features `exact` accordingly.
+- The Java provider now accepts the overworld, nether, and end dimensions.
+- Building the native extension requires a C compiler and the cubiomes submodule
+  (`git submodule update --init`).
+
 ## [0.1.0] - 2026-05-27
 
 ### Added

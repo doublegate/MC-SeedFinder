@@ -117,11 +117,16 @@ class JavaPythonProvider:
 
     edition = "java"
 
+    _SUPPORTED_DIMENSIONS = ("overworld", "the_overworld", "nether", "the_nether", "end", "the_end")
+
     def validate_spec(self, spec: SearchSpec) -> None:
         if spec.edition != self.edition:
             raise ValueError(f"Java provider cannot run edition {spec.edition!r}")
-        if spec.dimension != "overworld":
-            raise ValueError("only the overworld dimension is currently supported")
+        if spec.dimension not in self._SUPPORTED_DIMENSIONS:
+            raise ValueError(
+                f"unsupported dimension {spec.dimension!r}; expected one of "
+                f"{self._SUPPORTED_DIMENSIONS}"
+            )
 
     def evaluate_seed(
         self,
@@ -132,12 +137,12 @@ class JavaPythonProvider:
         matched, _, passed = criteria.evaluate_staged(seed)
         if not matched:
             return None
-        exactness = _exactness_for_spec(spec.criteria)
+        exactness = _exactness_for_spec(spec.criteria, criteria.uses_exact_biomes)
         warnings: List[str] = []
         if "candidate" in exactness.values():
             warnings.append(
-                "biome filters use the local fallback unless cubiomes-backed "
-                "lookup is installed"
+                "biome filters use the approximate local fallback; the exact "
+                "cubiomes backend was not available for this build"
             )
         return SeedReport(
             seed=seed,
@@ -198,7 +203,11 @@ def run_staged_search(
     """
     active_provider = provider or provider_for(spec.edition)
     active_provider.validate_spec(spec)
-    criteria = compile_criteria(spec.criteria)
+    criteria = compile_criteria(
+        spec.criteria,
+        biome_version=spec.version,
+        biome_dimension=spec.dimension,
+    )
 
     jid = job_id or str(uuid.uuid4())
     start = time.monotonic()
@@ -303,12 +312,18 @@ def run_staged_search(
     )
 
 
-def _exactness_for_spec(criteria_spec: Mapping[str, Any]) -> Dict[str, Exactness]:
+def _exactness_for_spec(
+    criteria_spec: Mapping[str, Any], biome_exact: bool
+) -> Dict[str, Exactness]:
+    # Structure placement is always exact (pure-Rust/Python golden-tested math).
+    # Biome filters are exact only when the cubiomes backend was active for the
+    # search; otherwise they are approximate candidates.
+    biome_level: Exactness = "exact" if biome_exact else "candidate"
     exactness: Dict[str, Exactness] = {}
     if criteria_spec.get("nearby_structures"):
         exactness["structures"] = "exact"
     if criteria_spec.get("spawn_biome") is not None:
-        exactness["spawn_biome"] = "candidate"
+        exactness["spawn_biome"] = biome_level
     if criteria_spec.get("nearby_biomes") is not None:
-        exactness["nearby_biomes"] = "candidate"
+        exactness["nearby_biomes"] = biome_level
     return exactness

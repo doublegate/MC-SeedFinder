@@ -4,6 +4,8 @@
 //! structure-placement math ported from the Python implementation. It is kept
 //! dependency-free while the public API settles.
 
+#[cfg(feature = "biomes")]
+pub mod biomes;
 pub mod java_random;
 pub mod structures;
 
@@ -86,6 +88,32 @@ fn iter_strongholds_py(world_seed: i64, max_rings: usize) -> PyResult<Vec<(Strin
         .collect())
 }
 
+/// Exact biome backend exposed to Python. Implements the duck-typed
+/// `get_biome(world_seed, x, z) -> int` contract that `BiomeLookup` expects, so
+/// it slots into the criteria layer in place of the approximate Perlin backend.
+#[cfg(all(feature = "pyo3", feature = "biomes"))]
+#[pyclass(name = "CubiomesBiomeBackend")]
+struct PyCubiomesBiomeBackend {
+    inner: biomes::BiomeBackend,
+}
+
+#[cfg(all(feature = "pyo3", feature = "biomes"))]
+#[pymethods]
+impl PyCubiomesBiomeBackend {
+    #[new]
+    #[pyo3(signature = (version, dimension = "overworld", y = biomes::DEFAULT_Y))]
+    fn new(version: &str, dimension: &str, y: i32) -> PyResult<Self> {
+        let inner = biomes::BiomeBackend::from_strs(version, dimension, y)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Numeric cubiomes biome ID at block coord `(x, z)`; -1 if unresolved.
+    fn get_biome(&mut self, world_seed: i64, x: i32, z: i32) -> i32 {
+        self.inner.get_biome(world_seed, x, z)
+    }
+}
+
 #[cfg(feature = "pyo3")]
 #[pyfunction]
 fn find_structure_matches_range(
@@ -127,5 +155,14 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_structure_pos_py, m)?)?;
     m.add_function(wrap_pyfunction!(iter_strongholds_py, m)?)?;
     m.add_function(wrap_pyfunction!(find_structure_matches_range, m)?)?;
+    // Whether this build links cubiomes for exact biomes. Lets the Python side
+    // decide between the exact backend and the approximate fallback.
+    #[cfg(feature = "biomes")]
+    {
+        m.add_class::<PyCubiomesBiomeBackend>()?;
+        m.add("HAS_CUBIOMES", true)?;
+    }
+    #[cfg(not(feature = "biomes"))]
+    m.add("HAS_CUBIOMES", false)?;
     Ok(())
 }

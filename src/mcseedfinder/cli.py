@@ -56,8 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mcseedfinder",
         description="Find Minecraft Java Edition world seeds matching given "
-                    "criteria (accurate structure placement, approximate "
-                    "biome filtering).",
+                    "criteria. Structure placement is exact; biome filtering is "
+                    "exact when the cubiomes backend is built, else approximate.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -114,8 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan.add_argument(
         "--version", default="1.21",
-        help="Minecraft version label to attach to reports/exports "
-             "(default: 1.21)."
+        help="Minecraft version for exact biome generation and report/export "
+             "labels (default: 1.21). Accepts versions cubiomes knows, e.g. "
+             "1.18, 1.20.4, 1.21."
+    )
+    plan.add_argument(
+        "--dimension", choices=("overworld", "nether", "end"), default="overworld",
+        help="Dimension for biome lookups (default: overworld)."
     )
     plan.add_argument(
         "--mode", choices=("sequential", "random"), default="sequential",
@@ -202,10 +207,19 @@ def compile_args_to_criteria(args: argparse.Namespace) -> CriteriaSet:
     ``--config`` takes precedence over inline flags when both are present
     (the assumption being that anyone with a config file knows what they want).
     """
+    dimension = getattr(args, "dimension", "overworld")
     if args.spec:
-        return compile_criteria(_load_criteria_spec(args.spec))
+        return compile_criteria(
+            _load_criteria_spec(args.spec),
+            biome_version=args.version,
+            biome_dimension=dimension,
+        )
     if args.config:
-        return compile_criteria(_load_criteria_spec(args.config))
+        return compile_criteria(
+            _load_criteria_spec(args.config),
+            biome_version=args.version,
+            biome_dimension=dimension,
+        )
 
     # Otherwise, build from inline flags.
     structures: List[Tuple[str, int]] = []
@@ -229,7 +243,9 @@ def compile_args_to_criteria(args: argparse.Namespace) -> CriteriaSet:
             "radius": args.nearby_biomes_radius,
             "all": args.nearby_biomes_all,
         }
-    return compile_criteria(spec)
+    return compile_criteria(
+        spec, biome_version=args.version, biome_dimension=dimension
+    )
 
 
 def _load_criteria_spec(path: Path) -> Mapping[str, Any]:
@@ -244,11 +260,18 @@ def _load_criteria_spec(path: Path) -> Mapping[str, Any]:
 # --------------------------------------------------------------------------- #
 # Seed verification report
 # --------------------------------------------------------------------------- #
-def report_seed(seed: int, out=sys.stdout) -> None:
+def report_seed(
+    seed: int,
+    out=sys.stdout,
+    *,
+    version: str = "1.21",
+    dimension: str = "overworld",
+) -> None:
     """Pretty-print structure positions and a spawn biome for a single seed.
 
     This is the inverse of the search: given a candidate seed, show what's
-    in it so the user can sanity-check before loading the world.
+    in it so the user can sanity-check before loading the world. Uses the
+    exact cubiomes biome backend when available, else the approximation.
     """
     print(f"Seed: {seed}", file=out)
     print("=" * 70, file=out)
@@ -276,10 +299,13 @@ def report_seed(seed: int, out=sys.stdout) -> None:
     for sh in iter_strongholds(seed, max_rings=1):
         print(f"  block=({sh.block_x:6d},{sh.block_z:6d}) "
               f"dist={sh.distance_to(0, 0):7.1f}", file=out)
-    # Approximate biome at origin
-    lookup = BiomeLookup(seed)
+    # Biome at origin — exact via cubiomes when available, else approximate.
+    from .rust_backend import make_biome_backend
+
+    backend = make_biome_backend(version, dimension)
+    lookup = BiomeLookup(seed, backend=backend)
     info = lookup.biome_info_at(0, 0)
-    label = " (approximate)" if lookup.is_approximate else ""
+    label = " (approximate)" if lookup.is_approximate else " (exact)"
     print("-" * 70, file=out)
     print(f"Origin biome{label}: {info.namespaced_id}", file=out)
 
@@ -301,7 +327,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(k)
         return 0
     if args.show_seed is not None:
-        report_seed(args.show_seed)
+        report_seed(args.show_seed, version=args.version, dimension=args.dimension)
         return 0
 
     if args.edition != "java":
@@ -338,6 +364,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         criteria_spec=spec,
         plan=plan,
         max_matches=args.max_matches,
+        biome_version=args.version,
+        biome_dimension=args.dimension,
     )
     if args.workers is not None:
         cfg_kwargs["workers"] = max(1, args.workers)

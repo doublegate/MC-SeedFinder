@@ -10,5 +10,22 @@ name = "_native"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["biomes"]
+# Exact biome generation via Cubitect's cubiomes C library, compiled from the
+# vendored submodule with the `cc` crate and a small hand-written FFI shim (no
+# bindgen — deterministic across toolchains/CI). On by default; disable with
+# --no-default-features to build the pure-Rust structure/RNG core without a C
+# toolchain (e.g. for the GPU/wasm-friendly prefilter path).
+biomes = []
+# NOTE: `pyo3` is intentionally NOT declared as an explicit feature. It stays an
+# implicit feature of the optional `pyo3` dependency so that maturin's
+# `features = ["pyo3/extension-module"]` activates `#[cfg(feature = "pyo3")]`.
+# Declaring `pyo3 = ["dep:pyo3"]` here would decouple the two and break the build.
+
 [dependencies]
 pyo3 = { version = "0.21", optional = true, features = ["abi3-py310"] }
+
+[build-dependencies]
+# Compiles the vendored cubiomes C sources + shim when the `biomes` feature is on.
+cc = "1.0"

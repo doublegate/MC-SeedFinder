@@ -82,6 +82,10 @@ class SearchConfig:
     max_matches: int = 10
     workers: int = field(default_factory=lambda: max(1, (os.cpu_count() or 2) - 1))
     progress_interval: float = 2.0      # seconds between progress callbacks
+    # Enable the exact cubiomes biome backend in each worker. None keeps the
+    # approximate fallback (e.g. for pure-structure searches or no-cubiomes builds).
+    biome_version: Optional[str] = None
+    biome_dimension: str = "overworld"
 
 
 @dataclass
@@ -101,10 +105,22 @@ _WORKER_CRITERIA: Optional[CriteriaSet] = None
 _WORKER_RUST_STRUCTURE_REQUIREMENTS: Optional[List[RustStructureRequirement]] = None
 
 
-def _worker_init(criteria_spec: Mapping[str, Any]) -> None:
-    """Pool initialiser — compile the criteria once per worker."""
+def _worker_init(
+    criteria_spec: Mapping[str, Any],
+    biome_version: Optional[str] = None,
+    biome_dimension: str = "overworld",
+) -> None:
+    """Pool initialiser — compile the criteria once per worker.
+
+    Each worker builds its own cubiomes backend (PyO3 objects aren't picklable),
+    so only the version/dimension strings cross the process boundary.
+    """
     global _WORKER_CRITERIA, _WORKER_RUST_STRUCTURE_REQUIREMENTS
-    _WORKER_CRITERIA = compile_criteria(criteria_spec)
+    _WORKER_CRITERIA = compile_criteria(
+        criteria_spec,
+        biome_version=biome_version,
+        biome_dimension=biome_dimension,
+    )
     _WORKER_RUST_STRUCTURE_REQUIREMENTS = compile_structure_only_requirements(
         criteria_spec
     )
@@ -166,7 +182,7 @@ def run_search(
     pool = ctx.Pool(
         processes=config.workers,
         initializer=_worker_init,
-        initargs=(dict(config.criteria_spec),),
+        initargs=(dict(config.criteria_spec), config.biome_version, config.biome_dimension),
     )
 
     start_time = time.monotonic()

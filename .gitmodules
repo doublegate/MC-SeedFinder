@@ -1,0 +1,3 @@
+[submodule "crates/mcseedfinder-core/vendor/cubiomes"]
+	path = crates/mcseedfinder-core/vendor/cubiomes
+	url = https://github.com/Cubitect/cubiomes.git

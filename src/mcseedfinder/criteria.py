@@ -207,14 +207,38 @@ class CriteriaSet:
 
     ``needs_biome_lookup`` is precomputed so the finder can skip building a
     :class:`BiomeLookup` for purely-structural searches (much faster).
+
+    When ``biome_version`` is set and the native cubiomes backend is available,
+    biome lookups are **exact** for that version/dimension; otherwise they fall
+    back to the approximate climate-noise generator. The backend is built once
+    and reused across seeds (it re-applies the world seed internally), so a
+    multi-million-seed sweep allocates a single generator per process.
     """
 
     criteria: List[Criterion]
     needs_biome_lookup: bool
+    biome_version: Optional[str] = None
+    biome_dimension: str = "overworld"
+    biome_y: Optional[int] = None
 
     def __post_init__(self) -> None:
         # Sort by cost so cheap predicates fail-fast on bad seeds.
         self.criteria.sort(key=lambda c: c.cost)
+        # Build the exact biome backend eagerly (cheap) so callers can report
+        # exactness deterministically. None means "use the approximate fallback".
+        self._biome_backend = None
+        if self.needs_biome_lookup and self.biome_version is not None:
+            # Imported lazily to keep the optional native bridge truly optional.
+            from .rust_backend import make_biome_backend
+
+            self._biome_backend = make_biome_backend(
+                self.biome_version, self.biome_dimension, self.biome_y
+            )
+
+    @property
+    def uses_exact_biomes(self) -> bool:
+        """True when biome lookups are cubiomes-exact (not the approximation)."""
+        return self.needs_biome_lookup and self._biome_backend is not None
 
     def matches(self, world_seed: int) -> bool:
         """True iff every criterion holds for ``world_seed``."""
@@ -228,7 +252,11 @@ class CriteriaSet:
         by the CLI. This richer form supports product search events and
         rejected-stage telemetry without duplicating criterion evaluation.
         """
-        lookup = BiomeLookup(world_seed) if self.needs_biome_lookup else None
+        lookup = (
+            BiomeLookup(world_seed, backend=self._biome_backend)
+            if self.needs_biome_lookup
+            else None
+        )
         passed: List[str] = []
         for crit in self.criteria:
             if not crit.evaluate(world_seed, lookup):
@@ -244,15 +272,37 @@ class CriteriaSet:
 # --------------------------------------------------------------------------- #
 # Compilation: spec dict / file → CriteriaSet
 # --------------------------------------------------------------------------- #
-def load_criteria_file(path: Union[str, Path]) -> CriteriaSet:
+def load_criteria_file(
+    path: Union[str, Path],
+    *,
+    biome_version: Optional[str] = None,
+    biome_dimension: str = "overworld",
+    biome_y: Optional[int] = None,
+) -> CriteriaSet:
     """Load a JSON criteria file and compile it."""
     with open(path, encoding="utf-8") as f:
         spec = json.load(f)
-    return compile_criteria(spec)
+    return compile_criteria(
+        spec,
+        biome_version=biome_version,
+        biome_dimension=biome_dimension,
+        biome_y=biome_y,
+    )
 
 
-def compile_criteria(spec: Mapping[str, Any]) -> CriteriaSet:
-    """Compile a spec dict (the JSON schema described at module top) to a set."""
+def compile_criteria(
+    spec: Mapping[str, Any],
+    *,
+    biome_version: Optional[str] = None,
+    biome_dimension: str = "overworld",
+    biome_y: Optional[int] = None,
+) -> CriteriaSet:
+    """Compile a spec dict (the JSON schema described at module top) to a set.
+
+    Pass ``biome_version``/``biome_dimension`` to enable the exact cubiomes
+    biome backend for biome criteria; without them, biome lookups use the
+    approximate fallback.
+    """
     criteria: List[Criterion] = []
     needs_biome = False
 
@@ -283,7 +333,13 @@ def compile_criteria(spec: Mapping[str, Any]) -> CriteriaSet:
     if not criteria:
         raise ValueError("criteria spec is empty — nothing to search for")
 
-    return CriteriaSet(criteria=criteria, needs_biome_lookup=needs_biome)
+    return CriteriaSet(
+        criteria=criteria,
+        needs_biome_lookup=needs_biome,
+        biome_version=biome_version,
+        biome_dimension=biome_dimension,
+        biome_y=biome_y,
+    )
 
 
 def _compile_structure_entry(entry: Mapping[str, Any]) -> NearbyStructure:
