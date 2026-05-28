@@ -10,6 +10,14 @@ pub mod biomes;
 pub mod conditions;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_btree;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_climate;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_double_perlin;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_noise;
 pub mod java_random;
 pub mod structures;
 
