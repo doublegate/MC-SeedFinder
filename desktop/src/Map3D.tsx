@@ -89,6 +89,8 @@ export type Map3DProps = {
   /** Cubiomes-computed world spawn (x, z) in block coords. Rendered
    *  as a star marker via drei `<Html>` when present and in tile span. */
   spawnPos?: { x: number; z: number } | null;
+  /** Render the 16×16 spawn-chunks square centred on `spawnPos`. */
+  showSpawnChunks?: boolean;
 };
 
 /** Java Edition stronghold ring (inner, outer) block radii. cubiomes'
@@ -138,6 +140,44 @@ function StrongholdRingsOverlay({ tile }: { tile: Map3DProps["tile"] }) {
         );
       })}
     </group>
+  );
+}
+
+/** Spawn-chunks tint: the 16×16-chunk (= 256×256 block) region centred
+ *  on the world spawn point. Always loaded in vanilla, so e.g. AFK farm
+ *  builders care about this rect. */
+function SpawnChunksOverlay({
+  tile,
+  spawnPos,
+}: {
+  tile: Map3DProps["tile"];
+  spawnPos: { x: number; z: number };
+}) {
+  const halfX = (tile.sx * tile.scale) / 2;
+  const halfZ = (tile.sz * tile.scale) / 2;
+  const centreX = tile.x + halfX;
+  const centreZ = tile.z + halfZ;
+  // Spawn chunks are 16 chunks * 16 blocks/chunk = 256 blocks across,
+  // centred on spawn. In grid units: 256 / tile.scale.
+  const sideGrid = 256 / tile.scale;
+  const gx = (spawnPos.x - centreX) / tile.scale;
+  const gz = (spawnPos.z - centreZ) / tile.scale;
+  return (
+    <mesh
+      position={[gx, 0.12, gz]}
+      rotation={[-Math.PI / 2, 0, 0]}
+      renderOrder={1}
+    >
+      <planeGeometry args={[sideGrid, sideGrid]} />
+      <meshBasicMaterial
+        color="#ffcf3a"
+        transparent
+        opacity={0.18}
+        side={THREE.DoubleSide}
+        depthWrite={false}
+        toneMapped={false}
+      />
+    </mesh>
   );
 }
 
@@ -446,7 +486,20 @@ function PinOverlay({ tile, pins }: { tile: Map3DProps["tile"]; pins: Map3DProps
         >
           <button
             className={`pin pin-${p.structure}`}
-            title={`${p.structure.replace(/_/g, " ")} @ (${p.block_x}, ${p.block_z})`}
+            title={`${p.structure.replace(/_/g, " ")} @ (${p.block_x}, ${p.block_z}) — right-click to copy coords`}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              // Copy coords on right-click. Browser-native; succeeds in
+              // any Tauri WebView (clipboard-write is allowed by default).
+              const coords = `${p.block_x}, ${p.block_z}`;
+              navigator.clipboard?.writeText(coords).catch(() => {
+                /* clipboard denied; silently noop */
+              });
+              // Visual cue: briefly add a class so CSS animates a flash.
+              const target = e.currentTarget;
+              target.classList.add("pinFlash");
+              window.setTimeout(() => target.classList.remove("pinFlash"), 600);
+            }}
           />
         </Html>
       ))}
@@ -610,6 +663,7 @@ export function Map3D(props: Map3DProps) {
     showBorder,
     showStrongholdRings,
     spawnPos,
+    showSpawnChunks,
   } = props;
 
   // Wheel handler — bypasses MapControls (which has wheel-zoom off). Step
@@ -668,6 +722,7 @@ export function Map3D(props: Map3DProps) {
         )}
         {showBorder && <WorldBorderWireframe tile={tile} height={Math.max(tile.sx, tile.sz) * 0.1} />}
         {showStrongholdRings && <StrongholdRingsOverlay tile={tile} />}
+        {showSpawnChunks && spawnPos && <SpawnChunksOverlay tile={tile} spawnPos={spawnPos} />}
         {spawnPos && <SpawnMarker tile={tile} spawnPos={spawnPos} />}
         <PinOverlay tile={tile} pins={pins} />
       </Canvas>

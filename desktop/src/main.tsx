@@ -344,7 +344,11 @@ function App() {
   // 3D isometric map view + the Y the wheel scrubs to. Behind a toggle
   // during PR 2 (default 2D); flipped to 3D-default in PR 3 once the
   // 3D path proves out across Tauri WebView backends.
-  const [mapView, setMapView] = useState<"2D" | "3D">("2D");
+  // PR 3 (Phase 7+): flipped default to "3D" once the voxel pipeline +
+  // overlays proved stable across WebKitGTK / WebView2 / WKWebView.
+  // 2D mode (TileCanvas) remains accessible via the in-pane toggle for
+  // any user who prefers the flat view or hits a WebGL2 init failure.
+  const [mapView, setMapView] = useState<"2D" | "3D">("3D");
   const [yLevel, setYLevel] = useState<number>(Y_DEFAULT);
   // Per-cell biome readout under the cursor in 3D mode. null when not
   // hovering a column. Populated by Map3D's raycaster-driven onHover.
@@ -358,7 +362,18 @@ function App() {
   // Overlay toggles (slime chunks, world border). Slime chunks are
   // computed via the new list_slime_chunks_cmd Tauri command. World
   // border is the static ±29,999,984 block rectangle.
-  const [overlays, setOverlays] = useState({ slime: false, border: false, rings: false });
+  const [overlays, setOverlays] = useState({
+    slime: false,
+    border: false,
+    rings: false,
+    spawn: true, // spawn star + chunks ON by default; visually subtle
+    npDebug: false,
+  });
+  // Cached climate np[6] for the most recently rested hover. Cleared on
+  // dimension/seed change. Six i64 values cubiomes computes at the
+  // hovered cell — temperature, humidity, continentalness, erosion,
+  // depth, weirdness — useful for power users.
+  const [climateNp, setClimateNp] = useState<number[] | null>(null);
   const [slimeChunks, setSlimeChunks] = useState<number[][]>([]);
   // World spawn (x, z) for the selected seed. Fetched lazily on seed/
   // dimension change via world_spawn_cmd. Rendered as a star pin in
@@ -598,6 +613,8 @@ function App() {
                 slime: !!v.overlays.slime,
                 border: !!v.overlays.border,
                 rings: !!v.overlays.rings,
+                spawn: v.overlays.spawn !== false, // default true
+                npDebug: !!v.overlays.npDebug,
               });
             }
           }, 0);
@@ -942,6 +959,35 @@ function App() {
       cancelled = true;
     };
   }, [overlays.slime, selectedSeed, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
+
+  // Climate np[6] debug overlay (#11). Debounced: only fires after the
+  // cursor rests on the same cell for ~300ms, so dragging the mouse
+  // doesn't spam Tauri with single-point cubiomes calls. Disabled
+  // entirely unless overlays.npDebug is on.
+  useEffect(() => {
+    if (!overlays.npDebug || !hover || selectedSeed == null) {
+      setClimateNp(null);
+      return;
+    }
+    const handle = window.setTimeout(async () => {
+      try {
+        const np = await invoke<number[]>("climate_np_cmd", {
+          request: {
+            seed: selectedSeed,
+            version,
+            dimension,
+            x: hover.worldX,
+            y: hover.y,
+            z: hover.worldZ,
+          },
+        });
+        setClimateNp(np);
+      } catch {
+        setClimateNp(null);
+      }
+    }, 300);
+    return () => window.clearTimeout(handle);
+  }, [overlays.npDebug, hover, selectedSeed, version, dimension]);
 
   // World-spawn fetch (#10). Lazy; only when a seed is selected. Backed
   // by cubiomes getSpawn which is fast (single call, no batch).
@@ -1320,6 +1366,20 @@ function App() {
             >
               ◯ rings
             </button>
+            <button
+              className={`overlayToggle ${overlays.spawn ? "active" : ""}`}
+              onClick={() => setOverlays((o) => ({ ...o, spawn: !o.spawn }))}
+              title="Toggle world-spawn star + spawn chunks (16×16 chunks centred on spawn)"
+            >
+              ★ spawn
+            </button>
+            <button
+              className={`overlayToggle ${overlays.npDebug ? "active" : ""}`}
+              onClick={() => setOverlays((o) => ({ ...o, npDebug: !o.npDebug }))}
+              title="Show cubiomes np[6] climate values at cursor (debounced)"
+            >
+              🔬 np
+            </button>
           </div>
         </div>
         {mapView === "3D" && tile ? (
@@ -1346,7 +1406,8 @@ function App() {
               slimeChunks={overlays.slime ? slimeChunks : []}
               showBorder={overlays.border}
               showStrongholdRings={overlays.rings}
-              spawnPos={worldSpawn}
+              spawnPos={overlays.spawn ? worldSpawn : null}
+              showSpawnChunks={overlays.spawn}
             />
             <div className="mapControls">
               <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
@@ -1400,6 +1461,25 @@ function App() {
                 <span className="cursorReadoutSub">
                   @ ({hover.worldX}, Y={hover.y}, {hover.worldZ}) · id {hover.biomeId}
                 </span>
+                {climateNp && (
+                  <div className="climateNp" title="cubiomes np[6] climate values at cursor (×10000, i64)">
+                    {(
+                      [
+                        ["T", climateNp[0]],
+                        ["H", climateNp[1]],
+                        ["C", climateNp[2]],
+                        ["E", climateNp[3]],
+                        ["D", climateNp[4]],
+                        ["W", climateNp[5]],
+                      ] as const
+                    ).map(([k, v]) => (
+                      <span key={k} className="climateNpField">
+                        <span className="climateNpKey">{k}</span>
+                        {(v / 10000).toFixed(3)}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
             <div className="tileLabel">

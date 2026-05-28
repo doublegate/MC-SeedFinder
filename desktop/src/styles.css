@@ -734,6 +734,43 @@ textarea {
   letter-spacing: 0.02em;
 }
 
+/* Climate np[6] debug panel (#11) — six tiny chips under the cursor
+ * readout, showing the raw cubiomes values fed to the b-tree. */
+.climateNp {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 10px;
+  font-family: var(--mono, ui-monospace, "Cascadia Mono", "Roboto Mono",
+    Menlo, monospace);
+  color: var(--text-dim);
+}
+.climateNpField {
+  background: rgba(50, 70, 50, 0.5);
+  border-radius: 3px;
+  padding: 1px 6px;
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.climateNpKey {
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+}
+
+/* Right-click pin flash (#17) — flash green for ~600ms to confirm the
+ * coord copy succeeded. */
+@keyframes pinFlashAnim {
+  0%   { box-shadow: 0 0 0 0 rgba(58, 255, 138, 0.0); }
+  20%  { box-shadow: 0 0 0 8px rgba(58, 255, 138, 0.6); }
+  100% { box-shadow: 0 0 0 16px rgba(58, 255, 138, 0.0); }
+}
+.pin.pinFlash {
+  animation: pinFlashAnim 0.6s ease-out;
+}
+
 /* Spawn marker (#10): a small golden star anchored at the cubiomes
  * world-spawn block coord in the 3D map. */
 .spawnStar {
