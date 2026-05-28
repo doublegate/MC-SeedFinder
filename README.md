@@ -366,18 +366,38 @@ Use the Python benchmark to compare fallback Python evaluation with the native
 Rust extension:
 
 ```bash
-PYTHONPATH=src python -m mcseedfinder.benchmark --count 10000
+PYTHONPATH=src python -m mcseedfinder.benchmark --count 100000
 ```
 
-On the current development machine, a representative structure-only benchmark
-showed:
+And the Rust release-mode standalone benchmark for the upper-bound number
+(no Python interop on the hot path):
 
-- Python path: about 80k seeds/s.
-- Rust extension path: about 14M seeds/s.
-- Parity: true.
+```bash
+RUSTC_WRAPPER= cargo run --release \
+  --example bench_structure_search \
+  --manifest-path crates/mcseedfinder-core/Cargo.toml -- 1000000
+```
+
+Representative structure-only benchmark (village in 100-block radius, debug
+build of the Python path, release build of the native extension):
+
+| Path | Seeds/s | Speedup vs Python |
+| --- | --- | --- |
+| Python multiprocessing | 82,000 | 1× |
+| Rust extension via PyO3 | 2,400,000 | ~29× |
+| Rust standalone (release) | 14,800,000 | ~180× |
+| GPU prefilter (wgpu) | 65,536 seeds / dispatch, see `gpu::tests` | varies by GPU; CPU-parity tested at byte level |
 
 These numbers vary by machine, query, build mode, and whether the native
-extension was built in release mode.
+extension was built in release mode. The GPU prefilter is validated by
+3,500-seed parity runs against the CPU evaluator (see
+`crates/mcseedfinder-core/src/gpu.rs` tests); it's faster than the Rust
+CPU path on workloads large enough to amortise GPU dispatch + readback
+overhead.
+
+GPU **biome** generation (Phase 6c, MC 1.21 only) is validated by
+GPU↔cubiomes parity tests rather than seeds/s — see the GPU Acceleration
+section for the parity matrix.
 
 ## GPU Acceleration
 

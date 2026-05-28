@@ -9,6 +9,61 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **GitHub Actions CI + release pipeline (Phase 7).** `.github/workflows/ci.yml`
+  runs four jobs on every push and PR: `rust-lint` (`cargo fmt --check` plus
+  `cargo clippy --all-targets -- -D warnings`, on both default features AND
+  `--no-default-features` so the pure-Rust core stays buildable without
+  cubiomes), `python-lint` (`ruff check`), `test` (`cargo test --features
+  pyo3` + Python `unittest`, with the cubiomes submodule checked out so the
+  maturin build succeeds; GPU tests gracefully skip on the headless runner),
+  and `desktop-build` (Tauri Linux deps + `npm install` + Vite build +
+  `cargo check` on `src-tauri`). Concurrency groups cancel in-progress runs
+  when a new commit lands; the cargo registry + target dir are cached keyed
+  on `Cargo.lock`. Total wall-clock is around 3 minutes per push.
+- **Release workflow** (`.github/workflows/release.yml`) triggers on
+  `workflow_dispatch` or a `v*.*.*` tag push and builds: (1) a manylinux2014
+  x86_64 maturin wheel for `mcseedfinder` — `pyo3` is configured with
+  `abi3-py310` so one wheel covers Python 3.10..3.13 — and (2) a Linux
+  x86_64 Tauri AppImage + `.deb` of the desktop app. Tag pushes draft a
+  GitHub release with the artifacts attached for the maintainer to review
+  and publish. macOS (x86_64 + arm64) and Windows matrix entries are
+  present but commented out — they need signing/notarization config that
+  isn't yet wired in.
+- **Toolchain pin** via `rust-toolchain.toml` (stable + rustfmt, clippy,
+  rust-src) so CI and local dev agree on the Rust version.
+- **Workspace clippy policy** (`[workspace.lints.clippy]`) allowing
+  `too_many_arguments` (FFI shim signatures naturally exceed 7 args),
+  `doc_lazy_continuation`, and `doc_overindented_list_items` (aligned-column
+  doc bullet lists are more readable than 4-space wrapped). All other lints
+  stay at clippy's default severity, enforced as errors by CI.
+- **Performance numbers in README refreshed** against the current code: 82k
+  seeds/s (Python), 2.4M seeds/s (Rust extension via PyO3), 14.8M seeds/s
+  (Rust standalone release-mode benchmark) — ~180× speedup at the upper
+  bound. GPU prefilter and GPU biome rendering are validated by parity
+  tests rather than seeds/s.
+
+### Changed
+
+- **Phase 7 lint cleanup, made to land cleanly on day one of CI.**
+  - Ruff config gained `extend-exclude = ["crates/.../vendor"]` (don't
+    lint upstream cubiomes Python scripts) and `per-file-ignores`
+    allowing `E501` for `biomes.py` (single-line biome catalog rows are
+    more readable than wrapped).
+  - 180/194 ruff issues auto-fixed (PEP-585 type annotations, `Optional[X]`
+    → `X | None`, import sort, `.format` → f-strings). 3 hand fixes:
+    SQL line-wrap in `app_contract.py`; `dict(...)` call → literal in
+    `cli.py`; unused stronghold-ring loop var `k` → `_k`.
+  - 180/195 clippy issues auto-fixed (`manually_reimplementing_div_ceil`,
+    etc.). Surgical fixes: `BiomeTree` gained `is_empty()`
+    (`len_without_is_empty`); `pack_perm()` uses `iter_mut().enumerate()`
+    (`needless_range_loop`); `SPAWN_BIOME_SAMPLES_PER_AXIS` now
+    `#[cfg(feature = "biomes")]`-gated so `--no-default-features` doesn't
+    dead-code-warn; PI/E-approximate test coords replaced with neutral
+    non-magic values (`3.15`, `2.72`) — the test only needed messy
+    coords, not transcendental constants.
+
+### Added
+
 - **Bit-exact GPU biome generation matching cubiomes (Phase 6c).** Ports the
   full Minecraft 1.21 Overworld biome pipeline to WebGPU compute shaders, one
   primitive at a time, each validated against cubiomes' f64 reference via
