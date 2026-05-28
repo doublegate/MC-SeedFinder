@@ -141,6 +141,72 @@ export function nodeToWire(n: TreeNode): Record<string, unknown> {
   }
 }
 
+/**
+ * Reverse of `nodeToWire`: rebuild a UI tree from the JSON shape the backend
+ * accepts. Generates fresh UI ids for every node so a shared/imported spec
+ * doesn't collide with what's already in the editor.
+ */
+export function wireToNode(wire: any): TreeNode {
+  if (!wire || typeof wire !== "object") throw new Error("condition node must be an object");
+  const t = wire.type as NodeKind;
+  switch (t) {
+    case "all_of":
+    case "any_of":
+    case "none_of": {
+      const of = Array.isArray(wire.of) ? wire.of : [];
+      return { id: newId(), type: t, of: of.map(wireToNode) };
+    }
+    case "nearby_structure":
+      return {
+        id: newId(),
+        type: "nearby_structure",
+        structure: String(wire.structure ?? "village"),
+        max_distance: Number(wire.max_distance ?? 1500),
+        centre_x: Number(wire.centre_x ?? 0),
+        centre_z: Number(wire.centre_z ?? 0),
+      };
+    case "cluster":
+      return {
+        id: newId(),
+        type: "cluster",
+        structures: Array.isArray(wire.structures) ? wire.structures.map(String) : [],
+        max_distance: Number(wire.max_distance ?? 1500),
+        min_count: Number(wire.min_count ?? 4),
+        centre_x: Number(wire.centre_x ?? 0),
+        centre_z: Number(wire.centre_z ?? 0),
+      };
+    case "spawn_biome":
+      return {
+        id: newId(),
+        type: "spawn_biome",
+        biomes: Array.isArray(wire.biomes) ? wire.biomes.map(Number) : [],
+        spawn_radius: Number(wire.spawn_radius ?? 64),
+      };
+    case "nearby_biomes":
+      return {
+        id: newId(),
+        type: "nearby_biomes",
+        biomes: Array.isArray(wire.biomes) ? wire.biomes.map(Number) : [],
+        radius: Number(wire.radius ?? 2000),
+        all: Boolean(wire.all),
+        samples_per_axis: Number(wire.samples_per_axis ?? 16),
+      };
+    case "biome_area":
+      return {
+        id: newId(),
+        type: "biome_area",
+        biomes: Array.isArray(wire.biomes) ? wire.biomes.map(Number) : [],
+        radius: Number(wire.radius ?? 1000),
+        samples_per_axis: Number(wire.samples_per_axis ?? 16),
+        min_samples: Number(wire.min_samples ?? 8),
+        centre_x: Number(wire.centre_x ?? 0),
+        centre_z: Number(wire.centre_z ?? 0),
+      };
+    default:
+      throw new Error(`unknown condition type ${String(t)}`);
+  }
+}
+
 /** Walk the tree and return a copy with `node.id` replaced by the patched version. */
 function updateById(node: TreeNode, id: string, updater: (n: TreeNode) => TreeNode): TreeNode {
   if (node.id === id) return updater(node);

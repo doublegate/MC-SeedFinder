@@ -9,6 +9,18 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Share links + tile screenshot export (Phase 4b-6).** New "Share" panel
+  in the inspector with three actions:
+  - *Copy share link* — encodes the full current setup (edition, version,
+    count, max_matches, the entire conditions tree, plus the selected
+    seed + map view if any) as a base64 JSON blob and copies it to the
+    clipboard. Paste it back later (the "Paste a share link" textarea
+    auto-imports on blur) to recreate the exact session.
+  - *Download tile PNG* — saves the currently-rendered biome tile to disk,
+    named after seed/center/scale.
+- `wireToNode` reverse-serializer in `conditions.tsx` rebuilds the UI tree
+  from the JSON shape with fresh IDs (no collisions on import).
+
 - **Visual condition builder (Phase 4b-5).** The sidebar's hardcoded
   structure+distance form is replaced by a recursive tree editor that builds
   the `conditions` spec without hand-editing JSON. Every node has a type

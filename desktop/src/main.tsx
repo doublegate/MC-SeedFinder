@@ -2,7 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { ConditionBuilder, defaultRoot, nodeToWire, type TreeNode } from "./conditions";
+import {
+  ConditionBuilder,
+  defaultRoot,
+  nodeToWire,
+  wireToNode,
+  type TreeNode,
+} from "./conditions";
 import "./styles.css";
 
 // ---------------------------------------------------------------------------
@@ -202,6 +208,78 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  // Build / consume a share blob: base64-encoded JSON with the current spec
+  // and (if a seed is selected) the map view. Lets users copy a setup and
+  // recreate it later — the desktop equivalent of a deep link.
+  function buildShareBlob(): string {
+    const payload = {
+      v: 1,
+      spec: {
+        edition,
+        version,
+        count,
+        max_matches: maxMatches,
+        criteria: { conditions: nodeToWire(conditionTree) },
+      },
+      view:
+        selectedSeed != null
+          ? { seed: selectedSeed, x: viewCenter.x, z: viewCenter.z, scale }
+          : null,
+    };
+    // btoa-safe UTF-8 round-trip.
+    return btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+  }
+
+  async function copyShareBlob() {
+    try {
+      await navigator.clipboard.writeText(buildShareBlob());
+    } catch (e) {
+      setError(`Copy failed: ${e}`);
+    }
+  }
+
+  function applyShareBlob(blob: string) {
+    setError(null);
+    try {
+      const payload = JSON.parse(decodeURIComponent(escape(atob(blob.trim()))));
+      if (payload.v !== 1 || !payload.spec) {
+        throw new Error("not a mc-seed-finder share blob");
+      }
+      const s = payload.spec;
+      if (typeof s.edition === "string") setEdition(s.edition);
+      if (typeof s.version === "string") setVersion(s.version);
+      if (typeof s.count === "number") setCount(s.count);
+      if (typeof s.max_matches === "number") setMaxMatches(s.max_matches);
+      if (s.criteria?.conditions) {
+        setConditionTree(wireToNode(s.criteria.conditions));
+      }
+      const v = payload.view;
+      if (v && typeof v.seed === "number") {
+        setSelectedSeed(v.seed);
+        if (typeof v.x === "number" && typeof v.z === "number") {
+          // Defer view-center update so the seed-change reset effect doesn't
+          // immediately clobber it.
+          setTimeout(() => {
+            setViewCenter({ x: v.x, z: v.z });
+            if (typeof v.scale === "number") setScale(v.scale);
+          }, 0);
+        }
+      }
+    } catch (e) {
+      setError(`Import share failed: ${e}`);
+    }
+  }
+
+  function downloadTile() {
+    if (!tile) return;
+    const a = document.createElement("a");
+    a.href = `data:image/png;base64,${tile.png_base64}`;
+    a.download = `seed-${tile.seed}-x${viewCenter.x}-z${viewCenter.z}-scale${scale}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   // Import seed from a Minecraft world's level.dat. The browser file input
@@ -517,6 +595,27 @@ function App() {
               <div className="hint">Press Run to start a search. Matches stream in live.</div>
             )}
           </div>
+        </section>
+        <section className="panel">
+          <h2>Share</h2>
+          <div className="shareActions">
+            <button className="secondary" onClick={copyShareBlob}>Copy share link</button>
+            <button className="secondary" onClick={downloadTile} disabled={!tile}>Download tile PNG</button>
+          </div>
+          <details className="shareImport">
+            <summary>Paste a share link to import…</summary>
+            <textarea
+              rows={3}
+              placeholder="Paste the base64 blob copied by another session"
+              onBlur={(e) => {
+                if (e.target.value.trim()) {
+                  applyShareBlob(e.target.value);
+                  e.target.value = "";
+                }
+              }}
+            />
+            <small>Auto-imports on blur (click outside the textarea).</small>
+          </details>
         </section>
         <section className="panel analyzer">
           <h2>Analyzer</h2>
