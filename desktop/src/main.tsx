@@ -63,7 +63,26 @@ type StructurePin = {
 // Map constants
 // ---------------------------------------------------------------------------
 
-const TILE_PX = 256;
+// Tiles used to be a fixed 256x256. They now adapt to the map pane's actual
+// pixel size (cap below) so the biome map fills the available area without
+// letterboxing and reflows on window resize. The cap bounds cubiomes work +
+// PNG encoding per tile; the CSS then upscales to fill larger panes.
+const TILE_MAX_PX = 1024;
+const TILE_MIN_PX = 64;
+
+/** Pick tile dimensions that match the pane's aspect ratio, capped at TILE_MAX_PX
+ *  along the longer axis. Caller multiplies by `scale` to get block coverage. */
+function tileSizeForPane(w: number, h: number): { sx: number; sz: number } {
+  const safeW = Math.max(TILE_MIN_PX, Math.round(w));
+  const safeH = Math.max(TILE_MIN_PX, Math.round(h));
+  const aspect = safeW / safeH;
+  if (aspect >= 1) {
+    const sx = Math.min(TILE_MAX_PX, safeW);
+    return { sx, sz: Math.max(TILE_MIN_PX, Math.round(sx / aspect)) };
+  }
+  const sz = Math.min(TILE_MAX_PX, safeH);
+  return { sx: Math.max(TILE_MIN_PX, Math.round(sz * aspect)), sz };
+}
 // cubiomes' supported scales: 1, 4, 16, 64, 256. Lower index = closer zoom.
 const SCALE_LEVELS = [1, 4, 16, 64, 256] as const;
 const DEFAULT_SCALE = 4;
@@ -100,6 +119,10 @@ function App() {
   // Map view state (block coordinates of the view centre + cubiomes scale).
   const [viewCenter, setViewCenter] = useState({ x: 0, z: 0 });
   const [scale, setScale] = useState<number>(DEFAULT_SCALE);
+
+  // Pane dimensions in CSS pixels — drives the tile request size so the
+  // rendered biome map fills the available area and reflows on resize.
+  const [paneSize, setPaneSize] = useState({ w: 800, h: 600 });
 
   // Active-drag pixel offset (CSS translate). Committed to viewCenter on
   // pointer-up, then the tile/pin fetch effect re-fires.
@@ -349,6 +372,29 @@ function App() {
     setScale(DEFAULT_SCALE);
   }, [selectedSeed]);
 
+  // Observe the map pane's CSS size and republish on resize (debounced so a
+  // window-resize drag doesn't fire dozens of tile fetches).
+  useEffect(() => {
+    const el = mapPaneRef.current;
+    if (!el) return;
+    let timer: number | null = null;
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      const w = Math.round(entry.contentRect.width);
+      const h = Math.round(entry.contentRect.height);
+      if (timer != null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        setPaneSize((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
+      }, 150);
+    });
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (timer != null) window.clearTimeout(timer);
+    };
+  }, []);
+
   // Fetch the biome tile AND structure pins whenever the view changes.
   useEffect(() => {
     if (selectedSeed == null) {
@@ -356,9 +402,11 @@ function App() {
       setPins([]);
       return;
     }
-    const tileWorldSpan = TILE_PX * scale;
-    const tileX = viewCenter.x - tileWorldSpan / 2;
-    const tileZ = viewCenter.z - tileWorldSpan / 2;
+    const { sx, sz } = tileSizeForPane(paneSize.w, paneSize.h);
+    const tileSpanX = sx * scale;
+    const tileSpanZ = sz * scale;
+    const tileX = viewCenter.x - Math.round(tileSpanX / 2);
+    const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
     let cancelled = false;
     (async () => {
       try {
@@ -371,8 +419,8 @@ function App() {
               x: tileX,
               z: tileZ,
               scale,
-              sx: TILE_PX,
-              sz: TILE_PX,
+              sx,
+              sz,
             },
           }),
           invoke<StructurePin[]>("list_structures_in_view", {
@@ -381,8 +429,8 @@ function App() {
               structures: PIN_STRUCTURES,
               x: tileX,
               z: tileZ,
-              sx: tileWorldSpan,
-              sz: tileWorldSpan,
+              sx: tileSpanX,
+              sz: tileSpanZ,
             },
           }),
         ]);
@@ -396,7 +444,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedSeed, version, viewCenter.x, viewCenter.z, scale]);
+  }, [selectedSeed, version, viewCenter.x, viewCenter.z, scale, paneSize.w, paneSize.h]);
 
   // ---- Map pan handlers ----
   const onPanStart = useCallback(
@@ -425,11 +473,15 @@ function App() {
         return;
       }
       const pane = mapPaneRef.current;
-      if (pane && (drag.dx !== 0 || drag.dz !== 0)) {
+      if (pane && tile && (drag.dx !== 0 || drag.dz !== 0)) {
         const rect = pane.getBoundingClientRect();
         // Drag right → reveal LEFT of world → centre.x decreases.
-        const blockDx = (-drag.dx / rect.width) * TILE_PX * scale;
-        const blockDz = (-drag.dz / rect.height) * TILE_PX * scale;
+        // Use the actual tile's block coverage per axis (sx/sz can differ now
+        // that tiles match the pane's aspect ratio).
+        const blockSpanX = tile.sx * tile.scale;
+        const blockSpanZ = tile.sz * tile.scale;
+        const blockDx = (-drag.dx / rect.width) * blockSpanX;
+        const blockDz = (-drag.dz / rect.height) * blockSpanZ;
         setViewCenter((c) => ({
           x: Math.round(c.x + blockDx),
           z: Math.round(c.z + blockDz),
@@ -439,7 +491,7 @@ function App() {
       setDrag(null);
       (e.target as Element).releasePointerCapture?.(e.pointerId);
     },
-    [drag, scale],
+    [drag, tile],
   );
 
   function zoomIn() {
@@ -460,11 +512,14 @@ function App() {
   }
 
   // Helper: world (block) coord → percentage within the rendered tile.
+  // Uses per-axis spans because the tile is no longer guaranteed square
+  // (it now adapts to the pane's aspect ratio).
   function worldToTilePct(blockX: number, blockZ: number) {
     if (!tile) return null;
-    const span = tile.sx * tile.scale;
-    const left = ((blockX - tile.x) / span) * 100;
-    const top = ((blockZ - tile.z) / span) * 100;
+    const spanX = tile.sx * tile.scale;
+    const spanZ = tile.sz * tile.scale;
+    const left = ((blockX - tile.x) / spanX) * 100;
+    const top = ((blockZ - tile.z) / spanZ) * 100;
     if (left < 0 || left > 100 || top < 0 || top > 100) return null;
     return { left, top };
   }

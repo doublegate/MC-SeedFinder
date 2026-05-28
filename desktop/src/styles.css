@@ -537,7 +537,12 @@ textarea {
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: contain;
+  /* Tile is now aspect-matched to the pane by render_tile (see tileSizeForPane
+     in main.tsx); no need to letterbox. `fill` stretches if the pane briefly
+     differs from the cached tile during a resize debounce, but the next
+     render_tile call (post-debounce) realigns to a fresh aspect. */
+  object-fit: fill;
+  image-rendering: pixelated;
 }
 
 .spawn {
