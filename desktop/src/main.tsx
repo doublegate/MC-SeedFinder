@@ -9,6 +9,7 @@ import {
   wireToNode,
   type TreeNode,
 } from "./conditions";
+import { Map3D } from "./Map3D";
 import "./styles.css";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,25 @@ type Analysis = {
 // saved per tile vs the legacy PNG path).
 type TileResponse = {
   bytes: number[];
+  seed: number;
+  scale: number;
+  x: number;
+  z: number;
+  sx: number;
+  sz: number;
+  /** Minecraft block Y at which the biomes were sampled. Optional for
+   *  back-compat with older backends that don't echo it. */
+  y?: number;
+};
+
+/** Response from `surface_height_tile_cmd` — per-pixel approximate surface
+ *  block Y (cubiomes `mapApproxHeight`, NOT bit-exact Java terrain) plus
+ *  the biome IDs at those surface points. Always carries
+ *  `exactness: "approximate"` so the UI can label the heightmap. */
+type HeightTileResponse = {
+  heights: number[];
+  biome_ids: number[];
+  exactness: string;
   seed: number;
   scale: number;
   x: number;
@@ -186,8 +206,44 @@ function tileKey(
   sx: number,
   sz: number,
   scale: number,
+  y: number,
 ): string {
-  return `${seed}|${version}|${x},${z}|${sx}x${sz}@${scale}`;
+  return `${seed}|${version}|${x},${z}|${sx}x${sz}@${scale}|y${y}`;
+}
+
+function heightKey(
+  seed: number,
+  version: string,
+  x: number,
+  z: number,
+  sx: number,
+  sz: number,
+): string {
+  // Heightmaps are seed/dimension-dependent but NOT y-dependent — there's
+  // one surface per (seed, x, z). Separate key from biome tiles so they
+  // share the cache cleanly.
+  return `h:${seed}|${version}|${x},${z}|${sx}x${sz}`;
+}
+
+/** Minecraft 1.18+ build range. The wheel-driven Y scrubber in the 3D
+ *  isometric view is clamped to this; default starting Y is sea level. */
+const Y_MIN = -64;
+const Y_MAX = 319;
+const Y_DEFAULT = 63;
+
+function clampY(y: number): number {
+  return Math.max(Y_MIN, Math.min(Y_MAX, y | 0));
+}
+
+/** Cosmetic depth-band label next to the Y readout. The biome at the Y
+ *  is the source of truth — these names are just visual orientation. */
+function yBandLabel(y: number): string {
+  if (y >= 192) return "(mountain)";
+  if (y >= 96) return "(highlands)";
+  if (y === 63) return "(sea level)";
+  if (y >= 0) return "(surface)";
+  if (y >= -32) return "(caves)";
+  return "(deepslate)";
 }
 
 function getCachedTile(cache: Map<string, TileResponse>, key: string): TileResponse | undefined {
@@ -242,6 +298,7 @@ function App() {
   const [selectedSeed, setSelectedSeed] = useState<number | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [tile, setTile] = useState<TileResponse | null>(null);
+  const [heightTile, setHeightTile] = useState<HeightTileResponse | null>(null);
   const [pins, setPins] = useState<StructurePin[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -266,7 +323,19 @@ function App() {
   // state. CSS transforms already run on the GPU compositor; the missing
   // piece for fluid pan was tile *availability*, which this fixes.
   const tileCacheRef = useRef<Map<string, TileResponse>>(new Map());
-  const TILE_CACHE_MAX = 32;
+  // Bumped from 32 → 96 in PR 2 (3D view) — the working set grows from
+  // (zoom × pan) to (zoom × pan × Y slice) once the wheel scrubs Y.
+  const TILE_CACHE_MAX = 96;
+  // Heightmaps are smaller per-tile (single f32 + i32 vs RGBA) and don't
+  // multiply with Y, so a tighter cache is fine.
+  const heightCacheRef = useRef<Map<string, HeightTileResponse>>(new Map());
+  const HEIGHT_CACHE_MAX = 32;
+
+  // 3D isometric map view + the Y the wheel scrubs to. Behind a toggle
+  // during PR 2 (default 2D); flipped to 3D-default in PR 3 once the
+  // 3D path proves out across Tauri WebView backends.
+  const [mapView, setMapView] = useState<"2D" | "3D">("2D");
+  const [yLevel, setYLevel] = useState<number>(Y_DEFAULT);
 
   // Ref to the on-screen canvas so `downloadTile` can pull the rendered PNG
   // from it (the canvas owns the rendered pixels; we don't ship a separate
@@ -576,14 +645,27 @@ function App() {
 
     let cancelled = false;
 
-    const key = tileKey(selectedSeed, version, tileX, tileZ, sx, sz, cubScale);
+    // 2D mode samples biomes at sea level (legacy behaviour, byte-for-byte
+    // unchanged); 3D mode samples at the wheel-driven Y. Cache key includes
+    // Y in both modes so an A/B toggle never serves a wrong-Y tile.
+    const fetchY = mapView === "3D" ? yLevel : Y_DEFAULT;
+    const key = tileKey(selectedSeed, version, tileX, tileZ, sx, sz, cubScale, fetchY);
     const cached = getCachedTile(tileCacheRef.current, key);
+
+    // The 3D view also needs the approximate surface heightmap to extrude
+    // the ground plane. Heightmap is Y-independent — one per (seed, x, z, sx,
+    // sz) — and only fetched in 3D mode.
+    const hKey = heightKey(selectedSeed, version, tileX, tileZ, sx, sz);
+    const cachedHeight = mapView === "3D" ? heightCacheRef.current.get(hKey) : undefined;
 
     (async () => {
       // Show any cached tile immediately, then refresh pins (which we never
       // cache) alongside a re-confirmation fetch only if the cache missed.
       if (cached) {
         setTile(cached);
+      }
+      if (cachedHeight) {
+        setHeightTile(cachedHeight);
       }
 
       try {
@@ -599,6 +681,7 @@ function App() {
                 scale: cubScale,
                 sx,
                 sz,
+                y: fetchY,
               },
             });
         const pinsPromise = invoke<StructurePin[]>("list_structures_in_view", {
@@ -611,11 +694,42 @@ function App() {
             sz: tileSpanZ,
           },
         });
-        const [t, ps] = await Promise.all([tilePromise, pinsPromise]);
+        // Only the 3D path needs the heightmap. cubScale === 4 is the GPU/
+        // heightmap-friendly scale; at coarser scales we'd need the bigger
+        // surface_height_map (still scale-4 internally) sampled wider, so
+        // for now restrict to scale 4 and fall back to a flat plane otherwise.
+        const heightPromise: Promise<HeightTileResponse | null> =
+          mapView === "3D" && cubScale === 4 && !cachedHeight
+            ? invoke<HeightTileResponse>("surface_height_tile_cmd", {
+                request: {
+                  seed: selectedSeed,
+                  version,
+                  dimension: "overworld",
+                  x: tileX,
+                  z: tileZ,
+                  sx,
+                  sz,
+                },
+              })
+            : Promise.resolve(cachedHeight ?? null);
+        const [t, ps, h] = await Promise.all([tilePromise, pinsPromise, heightPromise]);
         if (cancelled) return;
         setTile(t);
         setPins(ps);
         putCachedTile(tileCacheRef.current, key, t, TILE_CACHE_MAX);
+        if (h) {
+          setHeightTile(h);
+          // LRU put for heightmap
+          heightCacheRef.current.delete(hKey);
+          heightCacheRef.current.set(hKey, h);
+          while (heightCacheRef.current.size > HEIGHT_CACHE_MAX) {
+            const oldest = heightCacheRef.current.keys().next().value;
+            if (oldest === undefined) break;
+            heightCacheRef.current.delete(oldest);
+          }
+        } else if (mapView !== "3D") {
+          setHeightTile(null);
+        }
       } catch (e) {
         if (cancelled) return;
         // Rust "superseded" rejection means a newer request invalidated this
@@ -628,7 +742,17 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
+  }, [
+    selectedSeed,
+    version,
+    viewCenter.x,
+    viewCenter.z,
+    cubScale,
+    paneSize.w,
+    paneSize.h,
+    mapView,
+    yLevel,
+  ]);
 
   // Background prefetch was disabled in Phase 6b. It compounded with rapid
   // pan/click into a Tauri command-pool storm (5× tile fetches per view
@@ -818,86 +942,137 @@ function App() {
       </aside>
 
       <section className="mapPane" ref={mapPaneRef}>
-        <div
-          className="mapGrid"
-          onPointerDown={onPanStart}
-          onPointerMove={onPanMove}
-          onPointerUp={onPanEnd}
-          onPointerCancel={onPanEnd}
-          onWheel={onWheel}
-          style={{ cursor: drag ? "grabbing" : selectedSeed != null ? "grab" : "default" }}
-        >
-          {tile ? (
-            <>
-              <div
-                className="mapContent"
-                style={{
-                  // Over-rendered tile: 150% of the pane, inset by -25% on
-                  // each side so its centre aligns with the pane centre.
-                  // Transform combines: continuous zoom (CSS scale) + pan
-                  // drag (CSS translate during a drag, identity otherwise).
-                  top: `${OVERSCAN_INSET_PCT}%`,
-                  left: `${OVERSCAN_INSET_PCT}%`,
-                  width: `${OVERSCAN * 100}%`,
-                  height: `${OVERSCAN * 100}%`,
-                  transformOrigin: "center center",
-                  transform: drag
-                    ? `translate(${drag.dx}px, ${drag.dz}px) scale(${cssScale})`
-                    : `scale(${cssScale})`,
-                }}
+        {mapView === "3D" && tile ? (
+          <div className="mapGrid">
+            <Map3D
+              tile={tile}
+              heights={heightTile?.heights ?? null}
+              pins={pins}
+              cameraZoom={zoomLevel}
+              yLevel={yLevel}
+              onYDelta={(d) => setYLevel((y) => clampY(y + d))}
+            />
+            <div className="mapControls">
+              <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
+              <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
+              <button onClick={resetView} title="Recenter on origin">⌂</button>
+              <button
+                onClick={() => setMapView("2D")}
+                title="Switch to flat 2D map"
+                className="viewToggle"
               >
-                <TileCanvas tile={tile} canvasRef={tileCanvasRef} />
-                {(() => {
-                  const origin = worldToTilePct(0, 0);
-                  return origin ? (
-                    <div
-                      className="spawn"
-                      style={{ left: `${origin.left}%`, top: `${origin.top}%` }}
-                    >
-                      0,0
-                    </div>
-                  ) : null;
-                })()}
-                {pins.map((p) => {
-                  const pos = worldToTilePct(p.block_x, p.block_z);
-                  if (!pos) return null;
-                  return (
-                    <button
-                      key={`${p.structure}-${p.block_x}-${p.block_z}`}
-                      className={`pin pin-${p.structure}`}
-                      style={{ left: `${pos.left}%`, top: `${pos.top}%` }}
-                      title={`${p.structure.replace(/_/g, " ")} @ (${p.block_x}, ${p.block_z})`}
-                    />
-                  );
-                })}
-              </div>
-              <div className="mapControls">
-                <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
-                <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
-                <button onClick={resetView} title="Recenter on origin">⌂</button>
-              </div>
-              <div className="mapLegend">
-                <span className="legendItem"><span className="legendDot pin-village" />Village</span>
-                <span className="legendItem"><span className="legendDot pin-pillager_outpost" />Outpost</span>
-                <span className="legendItem"><span className="legendDot pin-ocean_monument" />Monument</span>
-                <span className="legendItem"><span className="legendDot pin-woodland_mansion" />Mansion</span>
-                <span className="legendItem"><span className="legendDot pin-stronghold" />Stronghold</span>
-                <span className="legendItem"><span className="legendDot legendSpawn" />Spawn (0,0)</span>
-              </div>
-              <div className="tileLabel">
-                seed {tile.seed} · zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
-                {" "}centre ({viewCenter.x}, {viewCenter.z}) ·
-                {" "}{pins.length} structure{pins.length === 1 ? "" : "s"} in view
-              </div>
-            </>
-          ) : (
-            <div className="mapEmpty">
-              {selectedSeed == null
-                ? "Pick a seed from the results list to render its biome map."
-                : "Rendering biome tile…"}
+                2D
+              </button>
             </div>
-          )}
-        </div>
+            <div className="mapLegend">
+              <span className="legendItem"><span className="legendDot pin-village" />Village</span>
+              <span className="legendItem"><span className="legendDot pin-pillager_outpost" />Outpost</span>
+              <span className="legendItem"><span className="legendDot pin-ocean_monument" />Monument</span>
+              <span className="legendItem"><span className="legendDot pin-woodland_mansion" />Mansion</span>
+              <span className="legendItem"><span className="legendDot pin-stronghold" />Stronghold</span>
+              <span className="legendItem"><span className="legendDot legendSpawn" />Spawn (0,0)</span>
+            </div>
+            {heightTile && (
+              <div className="terrainBadge" title="Surface heights come from cubiomes' mapApproxHeight — depth-spline-based, not bit-exact Java terrain.">
+                approximate terrain
+              </div>
+            )}
+            <div className="tileLabel">
+              seed {tile.seed} · Y = {yLevel} {yBandLabel(yLevel)} ·
+              {" "}zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
+              {" "}centre ({viewCenter.x}, {viewCenter.z}) ·
+              {" "}{pins.length} structure{pins.length === 1 ? "" : "s"} in view
+            </div>
+          </div>
+        ) : (
+          <div
+            className="mapGrid"
+            onPointerDown={onPanStart}
+            onPointerMove={onPanMove}
+            onPointerUp={onPanEnd}
+            onPointerCancel={onPanEnd}
+            onWheel={onWheel}
+            style={{ cursor: drag ? "grabbing" : selectedSeed != null ? "grab" : "default" }}
+          >
+            {tile ? (
+              <>
+                <div
+                  className="mapContent"
+                  style={{
+                    // Over-rendered tile: 150% of the pane, inset by -25% on
+                    // each side so its centre aligns with the pane centre.
+                    // Transform combines: continuous zoom (CSS scale) + pan
+                    // drag (CSS translate during a drag, identity otherwise).
+                    top: `${OVERSCAN_INSET_PCT}%`,
+                    left: `${OVERSCAN_INSET_PCT}%`,
+                    width: `${OVERSCAN * 100}%`,
+                    height: `${OVERSCAN * 100}%`,
+                    transformOrigin: "center center",
+                    transform: drag
+                      ? `translate(${drag.dx}px, ${drag.dz}px) scale(${cssScale})`
+                      : `scale(${cssScale})`,
+                  }}
+                >
+                  <TileCanvas tile={tile} canvasRef={tileCanvasRef} />
+                  {(() => {
+                    const origin = worldToTilePct(0, 0);
+                    return origin ? (
+                      <div
+                        className="spawn"
+                        style={{ left: `${origin.left}%`, top: `${origin.top}%` }}
+                      >
+                        0,0
+                      </div>
+                    ) : null;
+                  })()}
+                  {pins.map((p) => {
+                    const pos = worldToTilePct(p.block_x, p.block_z);
+                    if (!pos) return null;
+                    return (
+                      <button
+                        key={`${p.structure}-${p.block_x}-${p.block_z}`}
+                        className={`pin pin-${p.structure}`}
+                        style={{ left: `${pos.left}%`, top: `${pos.top}%` }}
+                        title={`${p.structure.replace(/_/g, " ")} @ (${p.block_x}, ${p.block_z})`}
+                      />
+                    );
+                  })}
+                </div>
+                <div className="mapControls">
+                  <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
+                  <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
+                  <button onClick={resetView} title="Recenter on origin">⌂</button>
+                  <button
+                    onClick={() => setMapView("3D")}
+                    title="Switch to 3D isometric map (wheel scrubs Y)"
+                    className="viewToggle"
+                  >
+                    3D
+                  </button>
+                </div>
+                <div className="mapLegend">
+                  <span className="legendItem"><span className="legendDot pin-village" />Village</span>
+                  <span className="legendItem"><span className="legendDot pin-pillager_outpost" />Outpost</span>
+                  <span className="legendItem"><span className="legendDot pin-ocean_monument" />Monument</span>
+                  <span className="legendItem"><span className="legendDot pin-woodland_mansion" />Mansion</span>
+                  <span className="legendItem"><span className="legendDot pin-stronghold" />Stronghold</span>
+                  <span className="legendItem"><span className="legendDot legendSpawn" />Spawn (0,0)</span>
+                </div>
+                <div className="tileLabel">
+                  seed {tile.seed} · zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
+                  {" "}centre ({viewCenter.x}, {viewCenter.z}) ·
+                  {" "}{pins.length} structure{pins.length === 1 ? "" : "s"} in view
+                </div>
+              </>
+            ) : (
+              <div className="mapEmpty">
+                {selectedSeed == null
+                  ? "Pick a seed from the results list to render its biome map."
+                  : "Rendering biome tile…"}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       <aside className="inspector">

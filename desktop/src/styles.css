@@ -633,6 +633,45 @@ textarea {
   color: var(--accent);
 }
 
+/* The 2D/3D toggle button is wider than the icon buttons so the label fits. */
+.mapControls .viewToggle {
+  width: 36px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* 3D canvas fills the entire mapGrid pane. Pointer events flow to the
+ * R3F Canvas inside; the wrapper div only handles the wheel (Y scrub). */
+.map3dCanvas {
+  position: absolute;
+  inset: 0;
+  /* WebGL canvases have a transparent background by default; keep the
+   * pane dark even before the first frame paints. */
+  background: #0e1410;
+}
+
+/* "approximate terrain" pill, top-left of the 3D map pane. Keep it small
+ * but always-visible so the heightmap's accuracy caveat travels with the
+ * view. */
+.terrainBadge {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  z-index: 4;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(110, 75, 0, 0.75);
+  color: #fcdc8b;
+  border: 1px solid rgba(255, 200, 80, 0.4);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  backdrop-filter: blur(6px);
+  cursor: help;
+}
+
 .tileLabel {
   position: absolute;
   left: 14px;
