@@ -170,6 +170,57 @@ input {
   cursor: pointer;
 }
 
+.tileImage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #1a221c;
+}
+
+.tileLabel {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(24, 32, 27, 0.78);
+  color: #f0f5ea;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.mapEmpty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #3f493e;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: center;
+  padding: 24px;
+}
+
+.hint {
+  color: #627064;
+  font-size: 12.5px;
+  padding: 8px 6px;
+}
+
+.error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fde6e0;
+  color: #7a1d12;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: pre-wrap;
+}
+
 .tabs {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

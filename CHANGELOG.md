@@ -9,6 +9,18 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Desktop biome tile rendering (Phase 4b-1).** The Tauri `render_tile`
+  command now returns a real base64-encoded PNG of the cubiomes biome map for
+  a given seed. Implemented as `BiomeBackend::render_tile_png` /
+  `render_tile_base64` in the core, using cubiomes `genBiomes` (batched) and
+  the cubiomes RGB colormap, encoded with the `png` crate. The React side
+  fetches the tile when a result seed is selected and displays the actual
+  biome map in the centre pane (pixelated rendering for crispness).
+- C shim helpers `mcsf_gen_biomes` (batched biome fill) and
+  `mcsf_init_biome_colors` (256-entry RGB colormap).
+- Root proxy `package.json` so `npm run dev` / `npm run build` work from the
+  repo root.
+
 - **Desktop app: real engine wiring with streamed events (Phase 4a).** The
   Tauri Rust process now depends on `mcseedfinder-core` (path dep, `biomes`
   feature, no PyO3) and runs an actual search in a worker thread instead of

@@ -32,6 +32,16 @@ type Analysis = {
   strongholds: { block_x: number; block_z: number }[];
 };
 
+type TileResponse = {
+  png_base64: string;
+  seed: number;
+  scale: number;
+  x: number;
+  z: number;
+  sx: number;
+  sz: number;
+};
+
 function App() {
   const [edition, setEdition] = useState("java");
   const [version, setVersion] = useState("1.21");
@@ -47,6 +57,7 @@ function App() {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [selectedSeed, setSelectedSeed] = useState<number | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [tile, setTile] = useState<TileResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // The backend emits events with a `job_id` payload; we ignore anything not
@@ -126,6 +137,7 @@ function App() {
     setResults([]);
     setSelectedSeed(null);
     setAnalysis(null);
+    setTile(null);
     setJob({ jobId: "", status: "running", scanned: 0, matches: 0 });
     try {
       const jobId = await invoke<string>("start_search", { spec });
@@ -159,6 +171,41 @@ function App() {
       setError(String(e));
     }
   }
+
+  // When a seed is selected, fetch its biome tile centred on origin at 1:4 —
+  // a 256-pixel tile covers a 1024x1024-block region around (0, 0).
+  useEffect(() => {
+    if (selectedSeed == null) {
+      setTile(null);
+      return;
+    }
+    const TILE_PX = 256;
+    const SCALE = 4;
+    const half_blocks = (TILE_PX * SCALE) / 2;
+    let cancelled = false;
+    (async () => {
+      try {
+        const t = await invoke<TileResponse>("render_tile", {
+          request: {
+            seed: selectedSeed,
+            version,
+            dimension: "overworld",
+            x: -half_blocks,
+            z: -half_blocks,
+            scale: SCALE,
+            sx: TILE_PX,
+            sz: TILE_PX,
+          },
+        });
+        if (!cancelled) setTile(t);
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSeed, version]);
 
   return (
     <main className="shell">
@@ -211,17 +258,26 @@ function App() {
 
       <section className="mapPane">
         <div className="mapGrid">
-          <div className="spawn">0,0</div>
-          <div className="ring" />
-          {results.slice(0, 8).map((result, index) => (
-            <button
-              key={`${result.seed}-${index}`}
-              className="pin"
-              style={{ left: `${18 + index * 9}%`, top: `${35 + (index % 3) * 12}%` }}
-              onClick={() => setSelectedSeed(result.seed)}
-              title={`Seed ${result.seed}`}
-            />
-          ))}
+          {tile ? (
+            <>
+              <img
+                className="tileImage"
+                src={`data:image/png;base64,${tile.png_base64}`}
+                alt={`Biome tile for seed ${tile.seed}`}
+                style={{ imageRendering: "pixelated" }}
+              />
+              <div className="spawn">0,0</div>
+              <div className="tileLabel">
+                seed {tile.seed} · 1:{tile.scale} · {tile.sx * tile.scale}×{tile.sz * tile.scale} blocks
+              </div>
+            </>
+          ) : (
+            <div className="mapEmpty">
+              {selectedSeed == null
+                ? "Pick a seed from the results list to render its biome map."
+                : "Rendering biome tile…"}
+            </div>
+          )}
         </div>
       </section>
 

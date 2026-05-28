@@ -96,14 +96,14 @@ struct JobInner {
 /// Build a structure-only [`CompiledNode`] from a Python-style criteria spec,
 /// or return an error string if anything biome-related is present.
 fn compile_criteria_tree(criteria: &serde_json::Value) -> Result<CompiledNode, String> {
-    let obj = criteria.as_object().ok_or("criteria must be a JSON object")?;
+    let obj = criteria
+        .as_object()
+        .ok_or("criteria must be a JSON object")?;
 
     if obj.contains_key("spawn_biome") || obj.contains_key("nearby_biomes") {
-        return Err(
-            "biome criteria are not yet supported in desktop search — \
+        return Err("biome criteria are not yet supported in desktop search — \
              use only structure conditions for now"
-                .to_string(),
-        );
+            .to_string());
     }
 
     let mut children: Vec<Node> = Vec::new();
@@ -120,14 +120,8 @@ fn compile_criteria_tree(criteria: &serde_json::Value) -> Result<CompiledNode, S
                 .get("max_distance")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(1500) as i32;
-            let centre_x = entry
-                .get("centre_x")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            let centre_z = entry
-                .get("centre_z")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
+            let centre_x = entry.get("centre_x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let centre_z = entry.get("centre_z").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             children.push(Node::NearbyStructure {
                 structure,
                 max_distance,
@@ -338,17 +332,21 @@ fn analyze_seed(
             let dz = pos.block_z() as i64;
             dx * dx + dz * dz
         })
-        .map(|pos| serde_json::json!({
-            "block_x": pos.block_x(),
-            "block_z": pos.block_z(),
-        }));
+        .map(|pos| {
+            serde_json::json!({
+                "block_x": pos.block_x(),
+                "block_z": pos.block_z(),
+            })
+        });
 
     // First-ring stronghold positions (always 3 placements in ring 1).
     let strongholds: Vec<_> = iter_strongholds(seed, 1)
-        .map(|pos| serde_json::json!({
-            "block_x": pos.block_x(),
-            "block_z": pos.block_z(),
-        }))
+        .map(|pos| {
+            serde_json::json!({
+                "block_x": pos.block_x(),
+                "block_z": pos.block_z(),
+            })
+        })
         .collect();
 
     Ok(serde_json::json!({
@@ -362,13 +360,63 @@ fn analyze_seed(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct TileRequest {
+    seed: i64,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default = "default_dimension")]
+    dimension: String,
+    /// Top-left block coordinate of the tile.
+    x: i32,
+    z: i32,
+    /// cubiomes scale (1, 4, 16, 64, 256). Defaults to 1:4 (the standard
+    /// overworld biome-map scale).
+    #[serde(default = "default_scale")]
+    scale: i32,
+    /// Tile size in *scaled* pixels (so a 256-pixel tile at scale=4 covers
+    /// 1024 blocks across).
+    #[serde(default = "default_size")]
+    sx: u32,
+    #[serde(default = "default_size")]
+    sz: u32,
+}
+
+fn default_version() -> String {
+    "1.21".to_string()
+}
+fn default_dimension() -> String {
+    "overworld".to_string()
+}
+fn default_scale() -> i32 {
+    4
+}
+fn default_size() -> u32 {
+    256
+}
+
 #[tauri::command]
-fn render_tile(request: serde_json::Value) -> serde_json::Value {
-    // Phase 4a-2 — biome tile rendering with a base64 PNG payload.
-    serde_json::json!({
-        "tile": request,
-        "status": "not_yet_implemented",
-    })
+fn render_tile(request: TileRequest) -> Result<serde_json::Value, String> {
+    let mut backend = BiomeBackend::from_strs(&request.version, &request.dimension, DEFAULT_Y)?;
+    let png_b64 = backend.render_tile_base64(
+        request.seed,
+        request.scale,
+        request.x,
+        request.z,
+        request.sx,
+        request.sz,
+    )?;
+    Ok(serde_json::json!({
+        "png_base64": png_b64,
+        "seed": request.seed,
+        "version": request.version,
+        "dimension": request.dimension,
+        "scale": request.scale,
+        "x": request.x,
+        "z": request.z,
+        "sx": request.sx,
+        "sz": request.sz,
+    }))
 }
 
 #[tauri::command]

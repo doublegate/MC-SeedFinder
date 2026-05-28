@@ -11,6 +11,7 @@
 #include <stdlib.h>
 
 #include "generator.h"
+#include "layers.h"
 #include "util.h"
 
 /* Allocate/free the (large, version-dependent) cubiomes Generator on the C side
@@ -45,4 +46,25 @@ int mcsf_biome_at(const Generator *g, int scale, int x, int y, int z) {
  * Returns 0 when the string is not a recognized version. */
 int mcsf_str2mc(const char *s) {
     return str2mc(s);
+}
+
+/* Batch biome generation for a rectangular area. Mirrors cubiomes' genBiomes
+ * — far faster than per-pixel getBiomeAt for tile rendering. `out` must hold
+ * at least sx*sz int32s. Returns 0 on success. y/sy = 0 → 2D plane. */
+int mcsf_gen_biomes(
+    Generator *g,
+    int *out,
+    int scale,
+    int x, int z,
+    int sx, int sz,
+    int y
+) {
+    Range r = { scale, x, z, sx, sz, y, 0 };
+    return genBiomes(g, out, r);
+}
+
+/* Fill `out` (must be 256*3 bytes) with the cubiomes biome RGB colormap. */
+void mcsf_init_biome_colors(unsigned char *out) {
+    /* cubiomes initBiomeColors expects unsigned char[256][3]. */
+    initBiomeColors((unsigned char (*)[3]) out);
 }

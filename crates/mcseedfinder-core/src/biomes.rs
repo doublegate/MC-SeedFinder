@@ -46,6 +46,30 @@ extern "C" {
     fn mcsf_apply_seed(g: *mut CubGenerator, dim: c_int, seed: u64);
     fn mcsf_biome_at(g: *const CubGenerator, scale: c_int, x: c_int, y: c_int, z: c_int) -> c_int;
     fn mcsf_str2mc(s: *const c_char) -> c_int;
+    fn mcsf_gen_biomes(
+        g: *mut CubGenerator,
+        out: *mut c_int,
+        scale: c_int,
+        x: c_int,
+        z: c_int,
+        sx: c_int,
+        sz: c_int,
+        y: c_int,
+    ) -> c_int;
+    fn mcsf_init_biome_colors(out: *mut u8);
+}
+
+/// 256-entry cubiomes biome RGB colormap, fetched once.
+fn biome_colormap() -> [[u8; 3]; 256] {
+    let mut buf = [0u8; 256 * 3];
+    // SAFETY: cubiomes writes exactly 256*3 bytes; we hand it a matching buffer.
+    unsafe { mcsf_init_biome_colors(buf.as_mut_ptr()) };
+    let mut out = [[0u8; 3]; 256];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let off = i * 3;
+        *slot = [buf[off], buf[off + 1], buf[off + 2]];
+    }
+    out
 }
 
 /// A reusable exact-biome backend bound to a version + dimension.
@@ -105,6 +129,13 @@ impl BiomeBackend {
 
     /// Numeric cubiomes biome ID at `(x, z)` for `world_seed`, or [`NO_BIOME`].
     pub fn get_biome(&mut self, world_seed: i64, x: i32, z: i32) -> i32 {
+        self.ensure_seed(world_seed);
+        // SAFETY: generator is initialized and seeded above.
+        unsafe { mcsf_biome_at(self.generator, SCALE_BLOCK, x, self.y, z) }
+    }
+
+    /// (Re)apply a world seed if it differs from the cached one.
+    fn ensure_seed(&mut self, world_seed: i64) {
         if !self.seeded || world_seed != self.current_seed {
             // SAFETY: generator is initialized (setup in `new`); reapplying a
             // seed is the documented way to reuse a generator.
@@ -112,8 +143,94 @@ impl BiomeBackend {
             self.current_seed = world_seed;
             self.seeded = true;
         }
-        // SAFETY: generator is initialized and seeded above.
-        unsafe { mcsf_biome_at(self.generator, SCALE_BLOCK, x, self.y, z) }
+    }
+
+    /// Render a biome tile as PNG bytes. `(x, z)` is the top-left **block**
+    /// coordinate; `(sx, sz)` is the tile size in *scaled* units (so the tile
+    /// covers `sx*scale` × `sz*scale` blocks). `scale` must be a cubiomes scale
+    /// (1, 4, 16, 64, or 256); 4 is the standard biome-map scale.
+    pub fn render_tile_png(
+        &mut self,
+        world_seed: i64,
+        scale: i32,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+    ) -> Result<Vec<u8>, String> {
+        if !matches!(scale, 1 | 4 | 16 | 64 | 256) {
+            return Err(format!(
+                "invalid scale {scale}; expected 1, 4, 16, 64, or 256"
+            ));
+        }
+        if sx == 0 || sz == 0 {
+            return Err("tile size must be positive".into());
+        }
+        self.ensure_seed(world_seed);
+
+        // Batched biome fill via cubiomes' genBiomes. `(sx*sz)` ints.
+        let total = (sx as usize) * (sz as usize);
+        let mut ids = vec![0i32; total];
+        // SAFETY: generator is initialized + seeded; the buffer has exactly
+        // sx*sz entries; cubiomes y=0 means a 2D plane at the scaled height.
+        let rc = unsafe {
+            mcsf_gen_biomes(
+                self.generator,
+                ids.as_mut_ptr(),
+                scale,
+                x / scale, // cubiomes Range takes scaled coords
+                z / scale,
+                sx as c_int,
+                sz as c_int,
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("cubiomes genBiomes failed with rc={rc}"));
+        }
+
+        // Map biome IDs → cubiomes RGB colormap → RGBA pixel buffer.
+        let colors = biome_colormap();
+        let mut rgba = Vec::with_capacity(total * 4);
+        for &bid in &ids {
+            let [r, g, b] = if (0..256).contains(&bid) {
+                colors[bid as usize]
+            } else {
+                // Unknown / failure → magenta sentinel so it's visually obvious.
+                [255, 0, 255]
+            };
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+
+        // PNG-encode in-memory.
+        let mut png_bytes: Vec<u8> = Vec::with_capacity(total + 1024);
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, sx, sz);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|e| format!("png header: {e}"))?;
+            writer
+                .write_image_data(&rgba)
+                .map_err(|e| format!("png write: {e}"))?;
+        }
+        Ok(png_bytes)
+    }
+
+    /// Convenience: render a tile and return a base64 string (no data: prefix).
+    pub fn render_tile_base64(
+        &mut self,
+        world_seed: i64,
+        scale: i32,
+        x: i32,
+        z: i32,
+        sx: u32,
+        sz: u32,
+    ) -> Result<String, String> {
+        use base64::Engine;
+        let png_bytes = self.render_tile_png(world_seed, scale, x, z, sx, sz)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(png_bytes))
     }
 }
 
@@ -146,6 +263,29 @@ mod tests {
     }
 
     #[test]
+    fn render_tile_produces_valid_png_bytes() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        // 32x32 tile at 1:4 around origin → 128x128 blocks; small but real.
+        let bytes = g
+            .render_tile_png(1, 4, -64, -64, 32, 32)
+            .expect("render_tile_png");
+        // PNG magic: 0x89 P N G \r \n 0x1a \n
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "render_tile_png didn't produce PNG magic"
+        );
+        assert!(bytes.len() > 64, "PNG suspiciously small: {}", bytes.len());
+    }
+
+    #[test]
+    fn render_tile_rejects_invalid_scale() {
+        let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
+        assert!(g.render_tile_png(1, 3, 0, 0, 32, 32).is_err());
+        assert!(g.render_tile_png(1, 4, 0, 0, 0, 32).is_err());
+    }
+
+    #[test]
     fn biome_query_is_valid_and_deterministic() {
         let mut g = BiomeBackend::from_strs("1.21", "overworld", DEFAULT_Y).expect("backend");
         // Repeated queries for the same (seed, x, z) are stable.
@@ -158,7 +298,11 @@ mod tests {
         // seed-change path) and remains stable.
         let other = g.get_biome(-123, 0, 0);
         assert_ne!(other, NO_BIOME);
-        assert_eq!(g.get_biome(1, 0, 0), a, "switching seeds back is consistent");
+        assert_eq!(
+            g.get_biome(1, 0, 0),
+            a,
+            "switching seeds back is consistent"
+        );
 
         // Generation is not constant across a wide region (sanity: real worldgen).
         let mut seen = std::collections::HashSet::new();
