@@ -9,6 +9,14 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Import seed from `level.dat` (Phase 4b-3).** The Tauri `import_level_dat`
+  command parses a Minecraft world's gzipped NBT save header (via `fastnbt` +
+  `flate2`) and returns its seed, version name, and level name. Handles both
+  modern (`Data.WorldGenSettings.seed`) and legacy (`Data.RandomSeed`)
+  locations. The sidebar gains an "Import world" file picker that ships the
+  bytes through with no file-dialog plugin needed; the imported seed appears
+  in the results list and the biome map renders immediately.
+
 - **Pan/zoom map + structure pins (Phase 4b-2).** The biome tile is now an
   interactive map: drag-to-pan (pointer events with capture, CSS transform
   during drag, refetch on release), zoom in/out across all five cubiomes

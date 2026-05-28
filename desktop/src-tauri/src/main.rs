@@ -487,13 +487,68 @@ fn list_structures_in_view(
     Ok(out)
 }
 
+/// Read the world seed (and a few labels) out of a Minecraft `level.dat`.
+/// Accepts the raw gzipped NBT bytes — the frontend reads the file with an
+/// HTML `<input type="file">` and passes the bytes through, so we don't need a
+/// file-dialog plugin and don't care where on disk the file lives.
 #[tauri::command]
-fn import_level_dat(path: String) -> serde_json::Value {
-    // Phase 4a-2 — NBT parsing via fastnbt.
-    serde_json::json!({
-        "path": path,
-        "status": "not_yet_implemented",
-    })
+fn import_level_dat(bytes: Vec<u8>) -> Result<serde_json::Value, String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    // level.dat is gzipped NBT.
+    let mut decoder = GzDecoder::new(&bytes[..]);
+    let mut nbt_buf = Vec::new();
+    decoder
+        .read_to_end(&mut nbt_buf)
+        .map_err(|e| format!("gunzip level.dat: {e}"))?;
+
+    let val: fastnbt::Value =
+        fastnbt::from_bytes(&nbt_buf).map_err(|e| format!("parse NBT: {e}"))?;
+
+    let top = match &val {
+        fastnbt::Value::Compound(m) => m,
+        _ => return Err("level.dat root is not a Compound tag".into()),
+    };
+    let data = match top.get("Data") {
+        Some(fastnbt::Value::Compound(m)) => m,
+        _ => return Err("level.dat has no Data compound".into()),
+    };
+
+    // Modern (1.16+): Data.WorldGenSettings.seed (Long).
+    // Legacy (pre-1.16): Data.RandomSeed (Long).
+    let seed: i64 = match data.get("WorldGenSettings") {
+        Some(fastnbt::Value::Compound(ws)) => match ws.get("seed") {
+            Some(fastnbt::Value::Long(s)) => *s,
+            _ => match data.get("RandomSeed") {
+                Some(fastnbt::Value::Long(s)) => *s,
+                _ => return Err("no seed found (WorldGenSettings.seed or RandomSeed)".into()),
+            },
+        },
+        _ => match data.get("RandomSeed") {
+            Some(fastnbt::Value::Long(s)) => *s,
+            _ => return Err("no seed found (WorldGenSettings.seed or RandomSeed)".into()),
+        },
+    };
+
+    // Optional: friendly labels — version name and world level name.
+    let version_name = match data.get("Version") {
+        Some(fastnbt::Value::Compound(v)) => match v.get("Name") {
+            Some(fastnbt::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let level_name = match data.get("LevelName") {
+        Some(fastnbt::Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+
+    Ok(serde_json::json!({
+        "seed": seed,
+        "version_name": version_name,
+        "level_name": level_name,
+    }))
 }
 
 #[tauri::command]

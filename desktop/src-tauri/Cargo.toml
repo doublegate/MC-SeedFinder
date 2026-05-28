@@ -13,6 +13,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 uuid = { version = "1", features = ["v4"] }
+# level.dat is gzipped NBT; these read its seed without depending on a Tauri
+# dialog plugin (the frontend just sends file bytes from an <input type="file">).
+fastnbt = "2"
+flate2 = "1"
 # Reuse the project's accuracy-critical core: structures, RNG, conditions
 # evaluator, and the cubiomes biome backend. PyO3 is off; this is a pure Rust
 # consumer of the rlib.

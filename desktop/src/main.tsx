@@ -205,6 +205,47 @@ function App() {
     }
   }
 
+  // Import seed from a Minecraft world's level.dat. The browser file input
+  // gives us a File whose bytes we ship to Rust (gzipped NBT) — Rust returns
+  // the seed (and friendly labels), and we treat it like any other selected
+  // result so the map renders immediately.
+  async function importLevelDat(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = Array.from(new Uint8Array(buf));
+      const res = await invoke<{
+        seed: number;
+        version_name: string | null;
+        level_name: string | null;
+      }>("import_level_dat", { bytes });
+      // Pre-populate as if the user picked it from results.
+      const importedResult: SearchResult = {
+        seed: res.seed,
+        edition: "java",
+        version: res.version_name ?? version,
+        dimension: "overworld",
+        score: 0,
+        matched_features: ["imported_from_level_dat"],
+        exactness: { structures: "exact" },
+        warnings: res.level_name ? [`level.dat "${res.level_name}"`] : [],
+      };
+      setResults((prev) => {
+        // Avoid duplicating the same seed if re-imported.
+        if (prev.some((r) => r.seed === res.seed)) return prev;
+        return [importedResult, ...prev];
+      });
+      setSelectedSeed(res.seed);
+    } catch (err) {
+      setError(`Import failed: ${err}`);
+    } finally {
+      // Reset the input so re-selecting the same file fires onChange again.
+      e.target.value = "";
+    }
+  }
+
   // Re-centre on origin when a new seed is selected (don't carry pan/zoom).
   useEffect(() => {
     setViewCenter({ x: 0, z: 0 });
@@ -376,6 +417,15 @@ function App() {
         <div className="actions">
           <button onClick={startSearch} disabled={job.status === "running"}>Run</button>
           <button className="secondary" onClick={cancelSearch} disabled={job.status !== "running"}>Cancel</button>
+        </div>
+        <div className="control importControl">
+          <label htmlFor="levelDatInput">Import world (level.dat)</label>
+          <input
+            id="levelDatInput"
+            type="file"
+            accept=".dat,application/octet-stream"
+            onChange={importLevelDat}
+          />
         </div>
         {error && <div className="error">{error}</div>}
       </aside>

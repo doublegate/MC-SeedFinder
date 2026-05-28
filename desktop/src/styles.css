@@ -112,6 +112,29 @@ input {
   color: #243026;
 }
 
+.importControl {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid #d2d9cb;
+}
+
+.importControl input[type="file"] {
+  font-size: 12px;
+  padding: 6px;
+  background: #f0f3ec;
+}
+
+.importControl input[type="file"]::file-selector-button {
+  margin-right: 8px;
+  border: 0;
+  border-radius: 4px;
+  padding: 6px 10px;
+  background: #214d3b;
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 .mapPane {
   min-width: 0;
   overflow: hidden;
