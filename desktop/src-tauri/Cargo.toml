@@ -13,3 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 uuid = { version = "1", features = ["v4"] }
+# Reuse the project's accuracy-critical core: structures, RNG, conditions
+# evaluator, and the cubiomes biome backend. PyO3 is off; this is a pure Rust
+# consumer of the rlib.
+mcseedfinder-core = { path = "../../crates/mcseedfinder-core", default-features = false, features = ["biomes"] }

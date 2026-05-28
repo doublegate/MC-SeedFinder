@@ -6,6 +6,11 @@ license = "MIT"
 description = "Accuracy-critical Minecraft seed search core."
 
 [lib]
+# Crate name is `_native` so the pyo3 pymodule macro produces a matching
+# `PyInit__native` symbol for the Python extension (which Python loads from a
+# file named `_native.abi3.so`). Rust consumers (e.g. the Tauri desktop) import
+# it as `_native::...`; it's the same compiled rlib, just an unusual-looking
+# `use` path. Don't rename this without updating the pyo3 pymodule attribute.
 name = "_native"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]

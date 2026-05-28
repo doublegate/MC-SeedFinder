@@ -234,6 +234,38 @@ fn floor_div(a: i32, b: i32) -> i32 {
     a.div_euclid(b)
 }
 
+/// Iterate every placement of `structure` within `max_distance` of
+/// `(centre_x, centre_z)`. Uses the same canonical region walk as
+/// [`has_structure_in_radius`]. Non-stronghold structures only.
+pub fn iter_structures_in_radius(
+    structure: StructureType,
+    seed: i64,
+    centre_x: i32,
+    centre_z: i32,
+    max_distance: i32,
+) -> impl Iterator<Item = StructurePos> {
+    let cfg = structure_config(structure);
+    let chunk_radius = max_distance / 16 + 1;
+    let cx_min = centre_x.div_euclid(16) - chunk_radius;
+    let cx_max = centre_x.div_euclid(16) + chunk_radius;
+    let cz_min = centre_z.div_euclid(16) - chunk_radius;
+    let cz_max = centre_z.div_euclid(16) + chunk_radius;
+    let rx_min = floor_div(cx_min, cfg.spacing);
+    let rx_max = floor_div(cx_max, cfg.spacing);
+    let rz_min = floor_div(cz_min, cfg.spacing);
+    let rz_max = floor_div(cz_max, cfg.spacing);
+    let max_dist_sq = (max_distance as i64) * (max_distance as i64);
+
+    (rx_min..=rx_max).flat_map(move |rx| {
+        (rz_min..=rz_max).filter_map(move |rz| {
+            let pos = get_structure_pos(structure, seed, rx as i64, rz as i64);
+            let dx = (pos.block_x() - centre_x) as i64;
+            let dz = (pos.block_z() - centre_z) as i64;
+            (dx * dx + dz * dz <= max_dist_sq).then_some(pos)
+        })
+    })
+}
+
 /// Count every placement of `req.structure` within `req.max_distance` of the
 /// reference centre. Uses the same region walk as [`has_structure_in_radius`]
 /// so a cluster predicate (count >= N) cannot disagree with a "in radius"

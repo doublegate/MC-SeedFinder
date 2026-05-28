@@ -9,6 +9,34 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Desktop app: real engine wiring with streamed events (Phase 4a).** The
+  Tauri Rust process now depends on `mcseedfinder-core` (path dep, `biomes`
+  feature, no PyO3) and runs an actual search in a worker thread instead of
+  fabricating dummy results. Matches stream to the React UI via Tauri events
+  (`search-started` / `search-match` / `search-progress` / `search-completed`),
+  resolving the documented sync-vs-event-stream mismatch.
+- Cooperative cancellation via per-job `AtomicBool` shared with the worker
+  thread; `cancel_search` flips it and the next chunk boundary emits a
+  `cancelled` completion event.
+- `analyze_seed` returns a real report: exact origin biome (cubiomes), the
+  nearest village's block coords, and the ring-1 stronghold positions.
+- New `structures::iter_structures_in_radius` (matches the canonical region
+  walk used elsewhere) so structure iteration in Rust mirrors Python.
+- Frontend (`main.tsx`) consumes the new event stream — results stream in,
+  the run/cancel buttons reflect live state, and "Analyze" calls into Rust
+  for the exact origin biome of the selected seed.
+
+### Deferred (Phase 4a-2 / 4b)
+
+- Biome criteria in desktop *search* specs are rejected with a clear typed
+  error for now; the Python engine retains full biome support. Biome
+  evaluation in Rust is a separate piece of work.
+- `render_tile` (cubiomes colormap → base64 PNG) and `import_level_dat`
+  (NBT seed reader via fastnbt) remain "not_yet_implemented" responses.
+- `pause`/`resume` are no-ops; cancellation works.
+
+### Added
+
 - **Native structure-only conditions-tree fast-path.** The Rust core gains a
   `conditions` module that evaluates the structure-only subset of the Python
   `conditions` tree (NearbyStructure + StructureCluster + all_of/any_of/none_of)
