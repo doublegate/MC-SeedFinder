@@ -282,6 +282,118 @@ function putCachedTile(
     cache.delete(oldest);
   }
 }
+// Cache type for the result-list thumbnails. Keyed on
+// `${seed}|${version}|${dimension}`. Values are the full TileResponse
+// so we can re-blit if the canvas re-mounts (e.g. result list scrolls).
+type ThumbCache = Map<string, TileResponse>;
+const THUMB_CACHE_MAX = 96;
+
+const THUMB_SX = 36;
+const THUMB_SZ = 36;
+// scale=16 → each thumbnail covers 36*16 = 576 blocks across, centred
+// near origin. Fast cubiomes scale that gives a recognisable terrain
+// silhouette without burning backend budget.
+const THUMB_SCALE = 16;
+const THUMB_X = -(THUMB_SX * THUMB_SCALE) / 2;
+const THUMB_Z = -(THUMB_SZ * THUMB_SCALE) / 2;
+
+/**
+ * Small biome preview canvas rendered inline with each search result —
+ * the side-by-side seed compare feature (brainstorm #6) at MVP scope.
+ * Lets the user scan the result list visually and notice that "seed
+ * 12345 has a mountain near origin" vs "seed 67890 is mostly ocean"
+ * without having to click each one to load the full map.
+ *
+ * Implementation notes:
+ *  - Cache is shared across all thumbnails via a ref-passed Map so a
+ *    re-render of the list (selectedSeed change, scroll) doesn't refetch.
+ *  - Fetches on mount; aborts via the cancelled flag if unmounted before
+ *    the response arrives. Errors silently noop — the canvas just stays
+ *    empty.
+ *  - 36×36 at scale 1:16 is the sweet spot: enough resolution to see
+ *    biome patches, fast enough that 25 thumbnails finish in <100ms with
+ *    the warm BiomePool.
+ */
+function ResultThumbnail({
+  seed,
+  version,
+  dimension,
+  cacheRef,
+}: {
+  seed: number;
+  version: string;
+  dimension: string;
+  cacheRef: React.MutableRefObject<ThumbCache>;
+}) {
+  const [bytes, setBytes] = useState<number[] | null>(() => {
+    const cached = cacheRef.current.get(`${seed}|${version}|${dimension}`);
+    return cached ? cached.bytes : null;
+  });
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const key = `${seed}|${version}|${dimension}`;
+    const cached = cacheRef.current.get(key);
+    if (cached) {
+      setBytes(cached.bytes);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const t = await invoke<TileResponse>("render_tile_rgba_cmd", {
+          request: {
+            seed,
+            version,
+            dimension,
+            x: THUMB_X,
+            z: THUMB_Z,
+            scale: THUMB_SCALE,
+            sx: THUMB_SX,
+            sz: THUMB_SZ,
+          },
+        });
+        if (cancelled) return;
+        cacheRef.current.set(key, t);
+        // LRU cap — drop oldest entries first (Map preserves insertion order).
+        while (cacheRef.current.size > THUMB_CACHE_MAX) {
+          const oldest = cacheRef.current.keys().next().value;
+          if (oldest === undefined) break;
+          cacheRef.current.delete(oldest);
+        }
+        setBytes(t.bytes);
+      } catch {
+        /* superseded or backend error — leave the canvas empty */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [seed, version, dimension, cacheRef]);
+
+  useEffect(() => {
+    if (!bytes) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d", { willReadFrequently: false });
+    if (!ctx) return;
+    const clamped = new Uint8ClampedArray(bytes);
+    const img = new ImageData(clamped, THUMB_SX, THUMB_SZ);
+    ctx.putImageData(img, 0, 0);
+  }, [bytes]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={THUMB_SX}
+      height={THUMB_SZ}
+      className={`resultThumb ${bytes ? "" : "loading"}`}
+      title={`Biome preview at 1:${THUMB_SCALE} around origin for seed ${seed}`}
+      aria-hidden
+    />
+  );
+}
+
 // Structures shown as pins on the map (and queried in batch from the backend).
 const PIN_STRUCTURES = [
   "village",
@@ -337,6 +449,9 @@ function App() {
   // Bumped from 32 → 96 in PR 2 (3D view) — the working set grows from
   // (zoom × pan) to (zoom × pan × Y slice) once the wheel scrubs Y.
   const TILE_CACHE_MAX = 96;
+  // Separate cache for the inline result-list thumbnails (#6). Keeps the
+  // 36×36 previews from churning the main-map LRU.
+  const thumbCacheRef = useRef<ThumbCache>(new Map());
   // Heightmaps are smaller per-tile (single f32 + i32 vs RGBA) and don't
   // multiply with Y, so a tighter cache is fine.
   const heightCacheRef = useRef<Map<string, HeightTileResponse>>(new Map());
@@ -1652,8 +1767,16 @@ function App() {
                 className={selectedSeed === result.seed ? "result active" : "result"}
                 onClick={() => setSelectedSeed(result.seed)}
               >
-                <span>{result.seed}</span>
-                <small>{result.edition} {result.version}</small>
+                <ResultThumbnail
+                  seed={result.seed}
+                  version={result.version}
+                  dimension={result.dimension}
+                  cacheRef={thumbCacheRef}
+                />
+                <div className="resultText">
+                  <span>{result.seed}</span>
+                  <small>{result.edition} {result.version}</small>
+                </div>
               </button>
             ))}
             {results.length === 0 && job.status === "idle" && (
