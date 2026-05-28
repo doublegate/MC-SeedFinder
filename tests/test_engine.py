@@ -67,11 +67,22 @@ class TestProductEngine(unittest.TestCase):
         self.assertEqual(summaries[0].payload["rejected_by_stage"], {1: 1})
         self.assertEqual(events[-1].payload["matches"], 0)
 
-    def test_provider_for_rejects_unsupported_bedrock_backend(self) -> None:
+    def test_provider_for_returns_bedrock_provider(self) -> None:
+        # `provider_for("bedrock")` returns the real Phase-5 BedrockProvider.
+        # The empty-criteria validation now succeeds (the provider only
+        # rejects worldgen-dependent criteria); structure/biome criteria
+        # rejection is covered exhaustively in tests/test_bedrock.py.
         provider = provider_for("bedrock")
         self.assertIsInstance(provider, BedrockProvider)
-        with self.assertRaisesRegex(ValueError, "Bedrock search is not implemented"):
-            provider.validate_spec(SearchSpec(criteria={}, edition="bedrock"))
+        provider.validate_spec(SearchSpec(criteria={}, edition="bedrock"))
+        # And it still refuses structure criteria with an enumerated message.
+        with self.assertRaisesRegex(ValueError, "nearby_structures"):
+            provider.validate_spec(
+                SearchSpec(
+                    criteria={"nearby_structures": [{"structure": "village"}]},
+                    edition="bedrock",
+                )
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

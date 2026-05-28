@@ -374,8 +374,12 @@ extension was built in release mode.
 
 ## Limitations
 
-- Java Edition 1.18+ is the only implemented edition/version target.
-- Bedrock is represented in the API but not implemented.
+- Java Edition 1.18+ is the only edition with a full worldgen backend
+  (exact biomes via cubiomes; exact structures/strongholds in pure Rust).
+- Bedrock Edition: foundation only. Text-seed → i32 hashing works
+  (`--seed-string`); worldgen-dependent criteria (biomes, structures,
+  strongholds) are rejected with a clear edition-aware error. See
+  `docs/BEDROCK.md` for the roadmap.
 - Biome filtering is exact via cubiomes when the native extension is built; the
   approximate climate-noise generator is used only as a no-cubiomes fallback.
 - Structure candidate placement does not prove in-world structure validity.

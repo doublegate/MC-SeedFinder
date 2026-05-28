@@ -156,11 +156,22 @@ class JavaPythonProvider:
 
 
 class BedrockProvider:
-    """Placeholder provider with explicit unsupported status.
+    """Bedrock Edition provider — Phase 5 foundation.
 
-    The product contract supports Bedrock, but this Python package does not yet
-    contain Bedrock worldgen. Keeping a concrete provider that fails clearly is
-    preferable to silently treating Bedrock as Java.
+    Bedrock differs from Java at the worldgen level (different PRNG, biome
+    layers, structure salts and spacing). Phase 5 plumbs Bedrock as a
+    first-class edition through the engine, but the worldgen backend is
+    deliberately not implemented yet — see ``docs/BEDROCK.md``. This
+    provider:
+
+    * validates the rest of the spec (edition, seed range — Bedrock uses
+      signed i32, not Java's i64);
+    * rejects worldgen-dependent criteria with a clear edition-aware
+      error naming exactly what's missing (no silent fall-back to Java
+      math, which would invalidate every match).
+
+    Bedrock text-seed → numeric-seed hashing is supported and works
+    independently of any search — see :func:`mcseedfinder.bedrock.seed_from_string`.
     """
 
     edition = "bedrock"
@@ -168,7 +179,44 @@ class BedrockProvider:
     def validate_spec(self, spec: SearchSpec) -> None:
         if spec.edition != self.edition:
             raise ValueError(f"Bedrock provider cannot run edition {spec.edition!r}")
-        raise ValueError("Bedrock search is not implemented in this backend yet")
+        # Bedrock seeds are signed i32. Reject explicit Java-range starts.
+        from .bedrock import is_valid_bedrock_seed
+
+        if not is_valid_bedrock_seed(spec.start_seed):
+            raise ValueError(
+                f"Bedrock seeds are signed i32; start_seed {spec.start_seed} "
+                f"is outside [-2**31, 2**31). For text seeds, hash them with "
+                f"`mcseedfinder.bedrock.seed_from_string` first."
+            )
+        # Refuse criteria the Bedrock backend can't faithfully evaluate yet.
+        unsupported = self._unsupported_criteria(spec.criteria)
+        if unsupported:
+            joined = ", ".join(sorted(unsupported))
+            raise ValueError(
+                f"Bedrock search does not yet support these criteria: {joined}. "
+                f"Bedrock worldgen (biomes, structures, strongholds) is on the "
+                f"roadmap (docs/BEDROCK.md). Text-seed hashing works today via "
+                f"`mcseedfinder.bedrock.seed_from_string`."
+            )
+
+    @staticmethod
+    def _unsupported_criteria(criteria_spec: Mapping[str, Any]) -> set[str]:
+        """Set of criterion type names the Bedrock backend cannot evaluate.
+
+        Today this is *everything* worldgen-dependent. Returning a set makes
+        the error message enumerable rather than vague.
+        """
+        unsupported: set[str] = set()
+        if criteria_spec.get("nearby_structures"):
+            unsupported.add("nearby_structures")
+        if criteria_spec.get("spawn_biome") is not None:
+            unsupported.add("spawn_biome")
+        if criteria_spec.get("nearby_biomes") is not None:
+            unsupported.add("nearby_biomes")
+        tree = criteria_spec.get("conditions")
+        if tree is not None:
+            unsupported.update(_collect_tree_leaf_types(tree))
+        return unsupported
 
     def evaluate_seed(
         self,
@@ -176,7 +224,29 @@ class BedrockProvider:
         criteria: CriteriaSet,
         spec: SearchSpec,
     ) -> SeedReport | None:
-        raise NotImplementedError("Bedrock search is not implemented")
+        # validate_spec already rejected any spec that gets here with non-empty
+        # criteria, so reaching evaluate_seed implies the criteria set was
+        # empty — which compile_criteria would have already refused. Belt and
+        # braces: never silently return a Java-evaluated report for a Bedrock
+        # spec.
+        raise NotImplementedError(
+            "Bedrock worldgen backend not yet implemented (docs/BEDROCK.md)"
+        )
+
+
+def _collect_tree_leaf_types(node: Any, out: set[str] | None = None) -> set[str]:
+    """Walk a conditions tree dict and gather every leaf type name."""
+    if out is None:
+        out = set()
+    if not isinstance(node, Mapping):
+        return out
+    t = node.get("type")
+    if t in {"all_of", "any_of", "none_of"}:
+        for child in node.get("of") or []:
+            _collect_tree_leaf_types(child, out)
+    elif isinstance(t, str):
+        out.add(t)
+    return out
 
 
 def provider_for(edition: str) -> Provider:

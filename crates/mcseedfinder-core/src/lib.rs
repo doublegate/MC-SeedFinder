@@ -4,6 +4,7 @@
 //! structure-placement math ported from the Python implementation. It is kept
 //! dependency-free while the public API settles.
 
+pub mod bedrock;
 #[cfg(feature = "biomes")]
 pub mod biomes;
 pub mod conditions;
@@ -155,11 +156,7 @@ fn find_structure_matches_range(
 /// callers must keep those on the Python evaluation path.
 #[cfg(feature = "pyo3")]
 #[pyfunction]
-fn find_tree_matches_range(
-    start_seed: i64,
-    count: u64,
-    tree_json: &str,
-) -> PyResult<Vec<i64>> {
+fn find_tree_matches_range(start_seed: i64, count: u64, tree_json: &str) -> PyResult<Vec<i64>> {
     let parsed: conditions::Node = serde_json::from_str(tree_json)
         .map_err(|e| PyValueError::new_err(format!("invalid tree JSON: {e}")))?;
     let compiled = conditions::compile(&parsed).map_err(|e| match e {
@@ -171,6 +168,15 @@ fn find_tree_matches_range(
     Ok(conditions::find_matches_range(start_seed, count, &compiled))
 }
 
+/// Convert a Bedrock text seed to its canonical i32 game-seed via Java's
+/// `String.hashCode()`. Same algorithm Java and Bedrock both use when a
+/// player types a non-numeric seed into the world creation screen.
+#[cfg(feature = "pyo3")]
+#[pyfunction]
+fn bedrock_seed_from_string(text: &str) -> i32 {
+    bedrock::seed_from_string(text)
+}
+
 #[cfg(feature = "pyo3")]
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -179,6 +185,7 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(iter_strongholds_py, m)?)?;
     m.add_function(wrap_pyfunction!(find_structure_matches_range, m)?)?;
     m.add_function(wrap_pyfunction!(find_tree_matches_range, m)?)?;
+    m.add_function(wrap_pyfunction!(bedrock_seed_from_string, m)?)?;
     // Whether this build links cubiomes for exact biomes. Lets the Python side
     // decide between the exact backend and the approximate fallback.
     #[cfg(feature = "biomes")]

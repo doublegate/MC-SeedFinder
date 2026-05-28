@@ -186,6 +186,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the search; print a structure/biome report for the given "
              "seed instead. Useful for verifying a candidate.",
     )
+    info.add_argument(
+        "--seed-string", default=None,
+        metavar="TEXT",
+        help="Convert a Bedrock-style text seed into the i32 game seed Bedrock "
+             "(and Java) stores. Same algorithm as Java's String.hashCode(). "
+             "Prints the signed value to stdout and exits.",
+    )
 
     return p
 
@@ -329,10 +336,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.show_seed is not None:
         report_seed(args.show_seed, version=args.version, dimension=args.dimension)
         return 0
+    if args.seed_string is not None:
+        # Bedrock + Java both hash text seeds via Java's String.hashCode().
+        from .bedrock import seed_from_string
 
-    if args.edition != "java":
-        print("error: Bedrock search is not implemented in this backend yet",
-              file=sys.stderr)
+        print(seed_from_string(args.seed_string))
+        return 0
+
+    if args.edition == "bedrock":
+        # Bedrock worldgen backend is on the roadmap (docs/BEDROCK.md). The
+        # provider can already validate / reject — surface its error here so
+        # the user sees exactly what's missing, rather than a generic refusal.
+        from .engine import BedrockProvider, SearchSpec
+
+        try:
+            criteria_spec = _criteria_set_to_spec_via_args(args)
+            BedrockProvider().validate_spec(
+                SearchSpec(
+                    criteria=criteria_spec,
+                    edition="bedrock",
+                    version=args.version,
+                    dimension=args.dimension,
+                    count=args.count,
+                    start_seed=args.start,
+                    max_matches=args.max_matches,
+                )
+            )
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        # Shouldn't be reachable today (every criterion is unsupported), but
+        # leave the door open for a future Phase 5b that wires Bedrock for
+        # specific criteria types.
+        print("error: Bedrock search backend not yet implemented", file=sys.stderr)
         return 2
 
     # ---- Compile criteria ----

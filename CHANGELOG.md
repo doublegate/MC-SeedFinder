@@ -7,6 +7,28 @@ and uses semantic versioning while the public API settles.
 
 ## [Unreleased]
 
+### Added
+
+- **Bedrock Edition foundation (Phase 5).** First-class `BedrockProvider`
+  replaces the Java-era stub: validates seeds against Bedrock's signed i32
+  range, enumerates which criterion types the Bedrock backend can't yet
+  evaluate (every worldgen-dependent criterion today), and never silently
+  falls back to Java math.
+- **Bedrock text-seed hashing.** `bedrock::seed_from_string` (Rust) /
+  `_native.bedrock_seed_from_string` (PyO3) / `mcseedfinder.bedrock.seed_from_string`
+  (Python, with a pure-Python fallback identical to the native version)
+  implement Java's `String.hashCode()` over UTF-16 code units, which is
+  exactly what Bedrock (and Java) use when a player types a text seed.
+  CLI: `python -m mcseedfinder --seed-string "your text"` prints the i32.
+- Roadmap doc at `docs/BEDROCK.md` enumerating what a full Bedrock
+  backend needs (biome generation, structure placement, stronghold rings)
+  and the three credible architectural paths (symbol-prefixed dual
+  cubiomes, pure-Rust port, subprocess sidecar) with a recommendation.
+- 10 new Python tests (`tests/test_bedrock.py`) including a parity test
+  that exercises the pure-Python fallback against the native binding on
+  9 inputs spanning empty strings, ASCII, non-ASCII BMP, supplementary-
+  plane surrogate pairs, and i32-overflow-inducing long strings.
+
 ### Changed
 
 - **Design polish pass (Phase 4b-7).** Complete styles refresh moving the
