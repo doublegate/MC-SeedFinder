@@ -1,0 +1,11 @@
+{
+  "_comment": "Quad-hut style cluster: at least 4 swamp huts within 128 blocks of origin.",
+  "conditions": {
+    "type": "cluster",
+    "structures": ["swamp_hut"],
+    "max_distance": 128,
+    "min_count": 4,
+    "centre_x": 0,
+    "centre_z": 0
+  }
+}

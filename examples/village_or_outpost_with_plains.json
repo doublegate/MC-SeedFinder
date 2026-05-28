@@ -1,0 +1,24 @@
+{
+  "_comment": "Hierarchical tree: (village OR outpost nearby) AND a real plains patch.",
+  "conditions": {
+    "type": "all_of",
+    "of": [
+      {
+        "type": "any_of",
+        "of": [
+          {"type": "nearby_structure", "structure": "village", "max_distance": 1500},
+          {"type": "nearby_structure", "structure": "pillager_outpost", "max_distance": 1500}
+        ]
+      },
+      {
+        "type": "biome_area",
+        "biomes": ["plains", "sunflower_plains"],
+        "centre_x": 0,
+        "centre_z": 0,
+        "radius": 1000,
+        "samples_per_axis": 16,
+        "min_samples": 32
+      }
+    ]
+  }
+}

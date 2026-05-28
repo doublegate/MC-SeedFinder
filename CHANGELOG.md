@@ -9,6 +9,16 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **Advanced condition system.** New recursive ``conditions`` tree in the JSON
+  schema with three combinators (``all_of`` / ``any_of`` / ``none_of``) and new
+  leaf criteria: ``cluster`` (multi-structure / quad-hut style, generalized from
+  Cubiomes Viewer's specialized quad-hut generator), ``biome_area`` (minimum
+  sample count of a biome set within a region — meaningful now that biomes are
+  exact). Backward compatible: flat keys (``spawn_biome``, ``nearby_structures``,
+  ``nearby_biomes``) continue to work and AND with the tree.
+- ``StructureCluster``, ``BiomeArea``, and ``GroupCriterion`` classes in
+  ``criteria.py`` with cost-ordered short-circuit evaluation inside groups.
+- ``examples/quad_hut.json`` and ``examples/village_or_outpost_with_plains.json``.
 - **Exact biome generation via cubiomes.** Cubitect's `cubiomes` C library is
   vendored as a git submodule (`crates/mcseedfinder-core/vendor/cubiomes`) and
   compiled with the `cc` crate plus a small hand-written FFI shim (`csrc/shim.c`)

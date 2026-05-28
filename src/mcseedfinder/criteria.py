@@ -9,7 +9,12 @@ each of which can answer ``matches(world_seed)`` in isolation. The finder
 runs them in *cost order* (cheapest first) and short-circuits as soon as one
 fails — important when sweeping millions of seeds.
 
-The JSON schema (also accepted as a dict from Python code) looks like::
+The JSON schema (also accepted as a dict from Python code) supports a flat
+form for common searches and a recursive ``conditions`` tree for advanced ones
+(logic gates, structure clusters, biome-area). The two compose — flat keys and
+the tree are all AND'd at the top level.
+
+Flat keys::
 
     {
       "spawn_biome": "plains" | ["plains", "savanna"] | "temperate",
@@ -17,7 +22,7 @@ The JSON schema (also accepted as a dict from Python code) looks like::
 
       "nearby_structures": [
         {"structure": "village",        "max_distance": 1500},
-        {"structure": "ocean_monument", "max_distance": 3000, "required": true}
+        {"structure": "ocean_monument", "max_distance": 3000}
       ],
 
       "nearby_biomes": {
@@ -28,12 +33,39 @@ The JSON schema (also accepted as a dict from Python code) looks like::
       }
     }
 
+Advanced ``conditions`` tree::
+
+    {
+      "conditions": {
+        "type": "all_of",                     // any_of | all_of | none_of
+        "of": [
+          {"type": "cluster",                 // quad-hut / multi-structure
+           "structures": ["swamp_hut"],
+           "min_count": 4, "max_distance": 128,
+           "centre_x": 0, "centre_z": 0},
+
+          {"type": "any_of",                  // nested logic gates
+           "of": [
+             {"type": "nearby_structure",
+              "structure": "village", "max_distance": 1500},
+             {"type": "nearby_structure",
+              "structure": "pillager_outpost", "max_distance": 1500}
+           ]},
+
+          {"type": "biome_area",              // exact biome area (cubiomes)
+           "biomes": ["plains", "savanna"],
+           "centre_x": 0, "centre_z": 0,
+           "radius": 1000, "samples_per_axis": 16, "min_samples": 32}
+        ]
+      }
+    }
+
 Each entry compiles to a Criterion subclass; the resolver below performs the
 compilation. New criterion types can be added in three steps:
 
 1. Subclass :class:`Criterion` and implement :meth:`evaluate`.
 2. Set a sensible :attr:`cost` (1 = trivial, 10 = heavyweight grid sample).
-3. Register a handler in :func:`_compile_one`.
+3. Register a handler in :func:`_compile_one` and :func:`_node_compile`.
 """
 
 from __future__ import annotations
@@ -199,6 +231,175 @@ class NearbyBiomes(Criterion):
 
 
 # --------------------------------------------------------------------------- #
+# Structure-cluster criterion — generalizes quad-hut / quad-monument
+# --------------------------------------------------------------------------- #
+@dataclass
+class StructureCluster(Criterion):
+    """Require at least ``min_count`` structure placements (counted across the
+    given structure list) within ``max_distance`` of a reference centre.
+
+    Setting ``structures=["swamp_hut"]`` with ``min_count=4`` and a tight radius
+    is the classic quad-hut search. Mixed lists let users look for dense
+    multi-structure neighbourhoods (e.g. a village + outpost + pyramid cluster).
+    Each structure type is validated up-front.
+    """
+
+    structures: Tuple[str, ...] = ()
+    max_distance: int = 1500
+    min_count: int = 4
+    centre_x: int = 0
+    centre_z: int = 0
+    cost: int = 3  # cheaper than a biome grid; more work than a single structure
+    stage: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.structures:
+            raise ValueError("StructureCluster requires a non-empty `structures` list")
+        if self.min_count < 1:
+            raise ValueError("StructureCluster.min_count must be >= 1")
+        for name in self.structures:
+            if name not in SUPPORTED_STRUCTURES:
+                raise ValueError(
+                    f"Unknown structure {name!r}. Supported: "
+                    f"{sorted(SUPPORTED_STRUCTURES)}"
+                )
+
+    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+        hits = 0
+        for name in self.structures:
+            if name == "stronghold":
+                # Strongholds use a different generator; only ring 1 is near origin.
+                for sh in iter_strongholds(world_seed, max_rings=1):
+                    if sh.distance_to(self.centre_x, self.centre_z) <= self.max_distance:
+                        hits += 1
+                        if hits >= self.min_count:
+                            return True
+                continue
+            for _ in iter_structures_in_radius(
+                name, world_seed, self.centre_x, self.centre_z, self.max_distance
+            ):
+                hits += 1
+                if hits >= self.min_count:
+                    return True
+        return False
+
+    def describe(self) -> str:
+        return (
+            f"≥{self.min_count} of {list(self.structures)} within "
+            f"{self.max_distance} blocks of ({self.centre_x}, {self.centre_z})"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Biome-area criterion — minimum area of a biome (set) within a region
+# --------------------------------------------------------------------------- #
+@dataclass
+class BiomeArea(Criterion):
+    """Require at least ``min_samples`` grid samples whose biome is in the set,
+    within a square of side ``2 * radius`` centred on ``(centre_x, centre_z)``.
+
+    This is meaningful only with the exact cubiomes backend — the approximate
+    fallback will under/over-count by definition. With biomes exact, it answers
+    "is there a sizeable patch of <biome> near <point>?" which Cubiomes Viewer
+    handles via its biome analysis tab.
+    """
+
+    biomes: FrozenSet[int] = field(default_factory=frozenset)
+    radius: int = 1000
+    samples_per_axis: int = 16
+    min_samples: int = 8
+    centre_x: int = 0
+    centre_z: int = 0
+    cost: int = 9  # comparable to NearbyBiomes; depends on grid resolution
+    stage: int = 3
+
+    def __post_init__(self) -> None:
+        if not self.biomes:
+            raise ValueError("BiomeArea requires a non-empty `biomes` set")
+        total = self.samples_per_axis * self.samples_per_axis
+        if not (1 <= self.min_samples <= total):
+            raise ValueError(
+                f"BiomeArea.min_samples must be in [1, {total}], got {self.min_samples}"
+            )
+
+    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+        assert lookup is not None, "BiomeArea needs a BiomeLookup"
+        target = set(self.biomes)
+        step = max(1, (2 * self.radius) // max(1, self.samples_per_axis - 1))
+        hits = 0
+        # Early-exit threshold: as soon as we have min_samples hits we can stop.
+        for ix in range(self.samples_per_axis):
+            x = self.centre_x - self.radius + ix * step
+            for iz in range(self.samples_per_axis):
+                z = self.centre_z - self.radius + iz * step
+                if lookup.biome_at(x, z) in target:
+                    hits += 1
+                    if hits >= self.min_samples:
+                        return True
+        return False
+
+    def describe(self) -> str:
+        return (
+            f"≥{self.min_samples}/{self.samples_per_axis ** 2} samples of "
+            f"{sorted(self.biomes)} within {self.radius} blocks of "
+            f"({self.centre_x}, {self.centre_z})"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Logic-gate group — hierarchical any_of / all_of / none_of
+# --------------------------------------------------------------------------- #
+@dataclass
+class GroupCriterion(Criterion):
+    """Compose child criteria with a boolean combinator.
+
+    Combinators:
+      * ``"all_of"`` — every child must hold (logical AND).
+      * ``"any_of"`` — at least one child must hold (logical OR).
+      * ``"none_of"`` — no child may hold (logical NOR / NOT-any).
+
+    Children are cost-sorted within the group so the cheapest fail-fast.
+    """
+
+    combinator: str = "all_of"
+    children: List[Criterion] = field(default_factory=list)
+    stage: int = 2
+
+    def __post_init__(self) -> None:
+        if self.combinator not in ("all_of", "any_of", "none_of"):
+            raise ValueError(f"unknown combinator {self.combinator!r}")
+        if not self.children:
+            raise ValueError(f"{self.combinator} group needs at least one child")
+        # Cost-sort children so cheap predicates fail-fast inside the group.
+        self.children.sort(key=lambda c: c.cost)
+        # Effective cost: sum of children. all_of short-circuits on first false,
+        # any_of on first true; sum is a reasonable upper-bound used purely for
+        # ordering this group against its siblings.
+        self.cost = sum(c.cost for c in self.children)
+
+    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+        if self.combinator == "all_of":
+            for child in self.children:
+                if not child.evaluate(world_seed, lookup):
+                    return False
+            return True
+        if self.combinator == "any_of":
+            for child in self.children:
+                if child.evaluate(world_seed, lookup):
+                    return True
+            return False
+        # none_of
+        for child in self.children:
+            if child.evaluate(world_seed, lookup):
+                return False
+        return True
+
+    def describe(self) -> str:
+        joiner = {"all_of": " AND ", "any_of": " OR ", "none_of": " NOR "}[self.combinator]
+        return "(" + joiner.join(c.describe() for c in self.children) + ")"
+
+
+# --------------------------------------------------------------------------- #
 # Criteria set
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -330,6 +531,13 @@ def compile_criteria(
         ))
         needs_biome = True
 
+    # ---- conditions tree (logic gates, clusters, biome-area) ----
+    tree = spec.get("conditions")
+    if tree is not None:
+        node, tree_needs_biome = _node_compile(tree)
+        criteria.append(node)
+        needs_biome = needs_biome or tree_needs_biome
+
     if not criteria:
         raise ValueError("criteria spec is empty — nothing to search for")
 
@@ -340,6 +548,90 @@ def compile_criteria(
         biome_dimension=biome_dimension,
         biome_y=biome_y,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Recursive condition-tree compiler
+# --------------------------------------------------------------------------- #
+_GROUP_TYPES: FrozenSet[str] = frozenset({"all_of", "any_of", "none_of"})
+
+_MAX_TREE_DEPTH = 16  # hard cap to keep pathological specs from blowing the stack
+
+
+def _node_compile(node: Mapping[str, Any], *, depth: int = 0) -> Tuple[Criterion, bool]:
+    """Compile one condition-tree node. Returns ``(criterion, needs_biome)``."""
+    if not isinstance(node, Mapping):
+        raise ValueError(
+            f"condition node must be a JSON object, got {type(node).__name__}"
+        )
+    if depth > _MAX_TREE_DEPTH:
+        raise ValueError(
+            f"condition tree nested too deep (>{_MAX_TREE_DEPTH} levels)"
+        )
+    t = node.get("type")
+    if t in _GROUP_TYPES:
+        of = node.get("of") or []
+        if not of:
+            raise ValueError(f"{t!r} group has empty 'of' list")
+        children: List[Criterion] = []
+        any_biome = False
+        for child in of:
+            crit, child_biome = _node_compile(child, depth=depth + 1)
+            children.append(crit)
+            any_biome = any_biome or child_biome
+        return GroupCriterion(combinator=t, children=children), any_biome
+    if t == "nearby_structure":
+        return (
+            NearbyStructure(
+                structure=str(node["structure"]),
+                max_distance=int(node.get("max_distance", 1500)),
+                centre_x=int(node.get("centre_x", 0)),
+                centre_z=int(node.get("centre_z", 0)),
+            ),
+            False,
+        )
+    if t == "cluster":
+        return (
+            StructureCluster(
+                structures=tuple(node["structures"]),
+                max_distance=int(node.get("max_distance", 1500)),
+                min_count=int(node.get("min_count", 4)),
+                centre_x=int(node.get("centre_x", 0)),
+                centre_z=int(node.get("centre_z", 0)),
+            ),
+            False,
+        )
+    if t == "spawn_biome":
+        return (
+            SpawnBiome(
+                biomes=numeric_ids_for(node["biomes"]),
+                spawn_radius=int(node.get("spawn_radius", 64)),
+            ),
+            True,
+        )
+    if t == "nearby_biomes":
+        return (
+            NearbyBiomes(
+                biomes=numeric_ids_for(node["biomes"]),
+                radius=int(node.get("radius", 2000)),
+                all_required=bool(node.get("all", False)),
+                samples_per_axis=int(node.get("samples", 16)),
+            ),
+            True,
+        )
+    if t == "biome_area":
+        return (
+            BiomeArea(
+                biomes=numeric_ids_for(node["biomes"]),
+                radius=int(node.get("radius", 1000)),
+                samples_per_axis=int(node.get("samples", 16)),
+                min_samples=int(node.get("min_samples", 8)),
+                centre_x=int(node.get("centre_x", 0)),
+                centre_z=int(node.get("centre_z", 0)),
+            ),
+            True,
+        )
+    raise ValueError(f"unknown condition type {t!r}")
 
 
 def _compile_structure_entry(entry: Mapping[str, Any]) -> NearbyStructure:
