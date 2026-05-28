@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "biomenoise.h"
+#include "finders.h"
 #include "generator.h"
 #include "layers.h"
 #include "noise.h"
@@ -291,6 +292,29 @@ void mcsf_btree21wd_nodes_copy(uint64_t *out) {
  * version. Used by the parity test as the ground truth. */
 int mcsf_climate_to_biome(int mc, const uint64_t *np6) {
     return climateToBiome(mc, np6, NULL);
+}
+
+/* --- World spawn point (cubiomes getSpawn) ----------------------------- */
+/* Computes the canonical (x, z) of the world spawn for the seed applied
+ * to `g`. Only meaningful in the Overworld; cubiomes' Nether/End paths
+ * have their own spawn semantics. */
+void mcsf_get_spawn(const Generator *g, int *out_x, int *out_z) {
+    Pos p = getSpawn(g);
+    *out_x = p.x;
+    *out_z = p.z;
+}
+
+/* --- Climate np[6] at a single coord (for the debug overlay) ----------- */
+/* Returns the six raw climate values cubiomes computes at (x, y, z) — the
+ * same values fed to the b-tree to pick a biome. Useful for power-user
+ * debugging. Values are i64 (cubiomes' internal canonical form: the i64
+ * truncation of `10000 * f32_climate`). */
+int mcsf_climate_np(
+    Generator *g,
+    int x, int y, int z,
+    int64_t *out_np6
+) {
+    return sampleBiomeNoise(&g->bn, out_np6, x, y, z, NULL, 0);
 }
 
 /* Full biome sample at (x, z) — runs cubiomes' setBiomeSeed +

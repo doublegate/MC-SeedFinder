@@ -83,7 +83,105 @@ export type Map3DProps = {
   /** Whether to render the world-border wireframe (the canonical
    *  ±29 999 984 block rectangle). */
   showBorder?: boolean;
+  /** Whether to render the 8 concentric stronghold ring constraint
+   *  annuli (Java Edition canonical radii in blocks). */
+  showStrongholdRings?: boolean;
+  /** Cubiomes-computed world spawn (x, z) in block coords. Rendered
+   *  as a star marker via drei `<Html>` when present and in tile span. */
+  spawnPos?: { x: number; z: number } | null;
 };
+
+/** Java Edition stronghold ring (inner, outer) block radii. cubiomes'
+ *  internal STRUCTURE_RING_DISTANCES; replicated here so the overlay is
+ *  pure frontend (no extra Tauri command). The 8 rings each contain a
+ *  fixed number of strongholds at random angles inside the annulus. */
+const STRONGHOLD_RING_RADII: [number, number][] = [
+  [1280, 2816],
+  [4352, 5888],
+  [7424, 8960],
+  [10496, 12032],
+  [13568, 15104],
+  [16640, 18176],
+  [19712, 21248],
+  [22784, 24320],
+];
+
+/** Eight transparent ring annuli centred at world (0, 0). Each annulus
+ *  is a `RingGeometry` (flat disk with a hole) rotated to lie on the
+ *  ground plane. Rendered at the heightmap's ground level (y ≈ 0). */
+function StrongholdRingsOverlay({ tile }: { tile: Map3DProps["tile"] }) {
+  // Map world block coords → tile-grid units. The mesh is centred at
+  // origin in grid units; world origin (0, 0) is at
+  // (-tile.x / scale + sx/2, -tile.z / scale + sz/2). To draw rings
+  // centred on world (0, 0), translate the ring meshes accordingly.
+  const halfX = (tile.sx * tile.scale) / 2;
+  const halfZ = (tile.sz * tile.scale) / 2;
+  const cx = (0 - (tile.x + halfX)) / tile.scale;
+  const cz = (0 - (tile.z + halfZ)) / tile.scale;
+  return (
+    <group position={[cx, 0.05, cz]} rotation={[-Math.PI / 2, 0, 0]}>
+      {STRONGHOLD_RING_RADII.map(([inner, outer], i) => {
+        const ri = inner / tile.scale;
+        const ro = outer / tile.scale;
+        return (
+          <mesh key={i}>
+            <ringGeometry args={[ri, ro, 64]} />
+            <meshBasicMaterial
+              color="#88ccff"
+              transparent
+              opacity={0.18}
+              side={THREE.DoubleSide}
+              depthWrite={false}
+              toneMapped={false}
+            />
+          </mesh>
+        );
+      })}
+    </group>
+  );
+}
+
+/** Spawn marker — golden star at the cubiomes-computed world spawn,
+ *  rendered via drei `<Html>` so the star tracks the world point. */
+function SpawnMarker({
+  tile,
+  spawnPos,
+}: {
+  tile: Map3DProps["tile"];
+  spawnPos: { x: number; z: number };
+}) {
+  const halfX = (tile.sx * tile.scale) / 2;
+  const halfZ = (tile.sz * tile.scale) / 2;
+  const centreX = tile.x + halfX;
+  const centreZ = tile.z + halfZ;
+  // Skip if the spawn point is well outside the tile span.
+  if (
+    spawnPos.x < tile.x - halfX ||
+    spawnPos.x > tile.x + tile.sx * tile.scale + halfX ||
+    spawnPos.z < tile.z - halfZ ||
+    spawnPos.z > tile.z + tile.sz * tile.scale + halfZ
+  ) {
+    return null;
+  }
+  return (
+    <Html
+      transform={false}
+      center
+      position={[
+        (spawnPos.x - centreX) / tile.scale,
+        1.2,
+        (spawnPos.z - centreZ) / tile.scale,
+      ]}
+    >
+      <div
+        className="spawnStar"
+        title={`World spawn @ (${spawnPos.x}, ${spawnPos.z}) — cubiomes getSpawn`}
+      >
+        ★
+      </div>
+    </Html>
+  );
+}
 
 /** Imperative camera-zoom sync — the +/- buttons drive a prop, and the
  *  orthographic camera's `zoom` field is updated here in response. */
@@ -510,6 +608,8 @@ export function Map3D(props: Map3DProps) {
     onHover,
     slimeChunks,
     showBorder,
+    showStrongholdRings,
+    spawnPos,
   } = props;
 
   // Wheel handler — bypasses MapControls (which has wheel-zoom off). Step
@@ -567,6 +667,8 @@ export function Map3D(props: Map3DProps) {
           <SlimeChunksOverlay tile={tile} chunks={slimeChunks} />
         )}
         {showBorder && <WorldBorderWireframe tile={tile} height={Math.max(tile.sx, tile.sz) * 0.1} />}
+        {showStrongholdRings && <StrongholdRingsOverlay tile={tile} />}
+        {spawnPos && <SpawnMarker tile={tile} spawnPos={spawnPos} />}
         <PinOverlay tile={tile} pins={pins} />
       </Canvas>
       <YSlider y={yLevel} yMin={yMin} yMax={yMax} onChange={onYSet} />

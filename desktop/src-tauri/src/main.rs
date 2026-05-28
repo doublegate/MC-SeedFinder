@@ -1048,6 +1048,56 @@ fn list_slime_chunks_cmd(request: SlimeChunksRequest) -> Vec<[i32; 2]> {
     out
 }
 
+/// World spawn (x, z) at block coords for the given seed. Cheap — one
+/// cubiomes call per request. Overworld only (Nether/End return seed-
+/// dependent values that aren't physically meaningful).
+#[derive(Debug, Deserialize)]
+struct WorldSpawnRequest {
+    seed: i64,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default = "default_dimension")]
+    dimension: String,
+}
+
+#[tauri::command]
+fn world_spawn_cmd(
+    request: WorldSpawnRequest,
+    state: State<'_, AppState>,
+) -> Result<(i32, i32), String> {
+    let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
+    let (x, z) = backend.world_spawn(request.seed);
+    release_biome_backend(&state, &request.version, &request.dimension, backend);
+    Ok((x, z))
+}
+
+/// Raw cubiomes np[6] at a single block coord — the climate-debug overlay.
+/// Returns 6 i64s in cubiomes' canonical order: temperature, humidity,
+/// continentalness, erosion, depth, weirdness. Values are `10000 * climate`
+/// (i64-truncated), matching what the b-tree walker compares against.
+#[derive(Debug, Deserialize)]
+struct ClimateNpRequest {
+    seed: i64,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default = "default_dimension")]
+    dimension: String,
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+#[tauri::command]
+fn climate_np_cmd(
+    request: ClimateNpRequest,
+    state: State<'_, AppState>,
+) -> Result<[i64; 6], String> {
+    let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
+    let np = backend.climate_np(request.seed, request.x, request.y, request.z);
+    release_biome_backend(&state, &request.version, &request.dimension, backend);
+    Ok(np)
+}
+
 /// Read the world seed (and a few labels) out of a Minecraft `level.dat`.
 /// Accepts the raw gzipped NBT bytes — the frontend reads the file with an
 /// HTML `<input type="file">` and passes the bytes through, so we don't need a
@@ -1163,6 +1213,8 @@ fn main() {
             render_tile_rgba_cmd,
             surface_height_tile_cmd,
             list_slime_chunks_cmd,
+            world_spawn_cmd,
+            climate_np_cmd,
             list_structures_in_view,
             import_level_dat,
             export_results

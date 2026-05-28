@@ -358,8 +358,12 @@ function App() {
   // Overlay toggles (slime chunks, world border). Slime chunks are
   // computed via the new list_slime_chunks_cmd Tauri command. World
   // border is the static ±29,999,984 block rectangle.
-  const [overlays, setOverlays] = useState({ slime: false, border: false });
+  const [overlays, setOverlays] = useState({ slime: false, border: false, rings: false });
   const [slimeChunks, setSlimeChunks] = useState<number[][]>([]);
+  // World spawn (x, z) for the selected seed. Fetched lazily on seed/
+  // dimension change via world_spawn_cmd. Rendered as a star pin in
+  // 3D mode (and as a label-anchored marker in 2D — already shows 0,0).
+  const [worldSpawn, setWorldSpawn] = useState<{ x: number; z: number } | null>(null);
 
   // Ref to the on-screen canvas so `downloadTile` can pull the rendered PNG
   // from it (the canvas owns the rendered pixels; we don't ship a separate
@@ -460,6 +464,23 @@ function App() {
     setTile(null);
     setPins([]);
     setJob({ jobId: "", status: "running", scanned: 0, matches: 0 });
+    // Request notification permission on first search (user-initiated, per
+    // the spec's "user gesture" requirement). Stash the result so the
+    // search-match listener can decide whether to fire toasts.
+    if (
+      typeof window.Notification !== "undefined" &&
+      notifyPermissionRef.current === "unknown"
+    ) {
+      try {
+        const perm =
+          Notification.permission === "default"
+            ? await Notification.requestPermission()
+            : Notification.permission;
+        notifyPermissionRef.current = perm;
+      } catch {
+        notifyPermissionRef.current = "denied";
+      }
+    }
     // CRITICAL: set the wildcard BEFORE invoke so events that fire during
     // the IPC round-trip (instant for tiny structure-only searches) aren't
     // dropped by the activeJobIdRef filter.
@@ -501,7 +522,7 @@ function App() {
   // recreate it later — the desktop equivalent of a deep link.
   function buildShareBlob(): string {
     const payload = {
-      v: 1,
+      v: 2,
       spec: {
         edition,
         version,
@@ -511,7 +532,19 @@ function App() {
       },
       view:
         selectedSeed != null
-          ? { seed: selectedSeed, x: viewCenter.x, z: viewCenter.z, zoom: zoomLevel }
+          ? {
+              seed: selectedSeed,
+              x: viewCenter.x,
+              z: viewCenter.z,
+              zoom: zoomLevel,
+              // v2 additions — share-link now restores the full 3D view
+              // state, including Y level, dimension, mapView, and
+              // overlay toggles.
+              y: yLevel,
+              mapView,
+              dimension,
+              overlays,
+            }
           : null,
     };
     // btoa-safe UTF-8 round-trip.
@@ -530,7 +563,7 @@ function App() {
     setError(null);
     try {
       const payload = JSON.parse(decodeURIComponent(escape(atob(blob.trim()))));
-      if (payload.v !== 1 || !payload.spec) {
+      if (![1, 2].includes(payload.v) || !payload.spec) {
         throw new Error("not a mc-seed-finder share blob");
       }
       const s = payload.spec;
@@ -550,6 +583,23 @@ function App() {
           setTimeout(() => {
             setViewCenter({ x: v.x, z: v.z });
             if (typeof v.zoom === "number") setZoomLevel(clampZoom(v.zoom));
+            // v2: restore the 3D view state if present.
+            if (typeof v.y === "number") setYLevel(clampY(v.y));
+            if (v.mapView === "2D" || v.mapView === "3D") setMapView(v.mapView);
+            if (
+              v.dimension === "overworld" ||
+              v.dimension === "nether" ||
+              v.dimension === "end"
+            ) {
+              setDimension(v.dimension);
+            }
+            if (v.overlays && typeof v.overlays === "object") {
+              setOverlays({
+                slime: !!v.overlays.slime,
+                border: !!v.overlays.border,
+                rings: !!v.overlays.rings,
+              });
+            }
           }, 0);
         }
       }
@@ -893,6 +943,82 @@ function App() {
     };
   }, [overlays.slime, selectedSeed, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
 
+  // World-spawn fetch (#10). Lazy; only when a seed is selected. Backed
+  // by cubiomes getSpawn which is fast (single call, no batch).
+  useEffect(() => {
+    if (selectedSeed == null) {
+      setWorldSpawn(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [x, z] = await invoke<[number, number]>("world_spawn_cmd", {
+          request: { seed: selectedSeed, version, dimension },
+        });
+        if (!cancelled) setWorldSpawn({ x, z });
+      } catch (_e) {
+        if (!cancelled) setWorldSpawn(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSeed, version, dimension]);
+
+  // Match notification (#19). Show a desktop toast whenever a search match
+  // arrives while the window is backgrounded. Permission asked on first
+  // user-initiated search (start_search button click) — never autorequested.
+  const notifyPermissionRef = useRef<NotificationPermission | "unknown">("unknown");
+  useEffect(() => {
+    const unlistens: UnlistenFn[] = [];
+    (async () => {
+      unlistens.push(
+        await listen<SearchResult>("search-match", (event) => {
+          if (
+            typeof window.Notification === "undefined" ||
+            notifyPermissionRef.current !== "granted" ||
+            !document.hidden
+          ) {
+            return;
+          }
+          try {
+            new window.Notification(`mc-seed-finder: seed ${event.payload.seed}`, {
+              body: `${event.payload.matched_features.length} feature${
+                event.payload.matched_features.length === 1 ? "" : "s"
+              } matched`,
+              silent: false,
+            });
+          } catch {
+            /* notification API quirks; ignore */
+          }
+        }),
+      );
+    })();
+    return () => {
+      unlistens.forEach((u) => u());
+    };
+  }, []);
+
+  // First-run onboarding (#15). One-time modal explaining the major UI
+  // surfaces. Dismissal is persisted to localStorage so it never returns
+  // unless the user explicitly clears their data.
+  const [showOnboarding, setShowOnboarding] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("mcsf.onboarded.v1") !== "1";
+    } catch {
+      return false;
+    }
+  });
+  function dismissOnboarding() {
+    try {
+      localStorage.setItem("mcsf.onboarded.v1", "1");
+    } catch {
+      /* localStorage disabled — accept the dismissal in memory only */
+    }
+    setShowOnboarding(false);
+  }
+
   // Keyboard shortcuts (#18). Vim-like. j/k = Y -4/+4 (Shift = ×4 = 16);
   // h/l = zoom out/in (one notch); 2/3 = mapView toggle; arrows = pan;
   // r = recenter. Ignored while typing in an input/textarea/contentEditable.
@@ -1187,6 +1313,13 @@ function App() {
             >
               ▢ border
             </button>
+            <button
+              className={`overlayToggle ${overlays.rings ? "active" : ""}`}
+              onClick={() => setOverlays((o) => ({ ...o, rings: !o.rings }))}
+              title="Toggle 8 concentric stronghold ring constraint annuli"
+            >
+              ◯ rings
+            </button>
           </div>
         </div>
         {mapView === "3D" && tile ? (
@@ -1212,6 +1345,8 @@ function App() {
               onHover={setHover}
               slimeChunks={overlays.slime ? slimeChunks : []}
               showBorder={overlays.border}
+              showStrongholdRings={overlays.rings}
+              spawnPos={worldSpawn}
             />
             <div className="mapControls">
               <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
@@ -1446,6 +1581,51 @@ function App() {
         <span>scanned {job.scanned.toLocaleString()}</span>
         <span>matches {job.matches}</span>
       </footer>
+      {showOnboarding && (
+        <div className="onboardingScrim" role="dialog" aria-modal>
+          <div className="onboardingCard">
+            <h2>Welcome to mc-seed-finder</h2>
+            <p className="onboardingLead">
+              A bit-exact Minecraft Java seed search toolkit. Here's the lay of the land.
+            </p>
+            <ul className="onboardingList">
+              <li>
+                <strong>Left sidebar</strong> — build a condition tree (gates +
+                structure / biome leaves) and start a search. Match seeds stream
+                into the results panel on the right.
+              </li>
+              <li>
+                <strong>Centre map</strong> — pick a result to render its biome
+                map. Switch to <kbd>3D</kbd> in the top-right for voxel columns
+                with a wheel-driven Y scrubber. Hover any cell for the bit-exact
+                cubiomes biome name.
+              </li>
+              <li>
+                <strong>Top bar</strong> — flip dimension (Overworld / Nether / End)
+                or toggle overlays (slime chunks, world border, stronghold rings).
+              </li>
+              <li>
+                <strong>Right sidebar</strong> — live results, share-blob import /
+                export, level.dat import, results export.
+              </li>
+              <li>
+                <strong>Keyboard</strong>: <kbd>j</kbd>/<kbd>k</kbd> Y scrub,
+                {" "}<kbd>h</kbd>/<kbd>l</kbd> zoom, <kbd>2</kbd>/<kbd>3</kbd>{" "}
+                2D/3D, arrows pan, <kbd>r</kbd> recenter. Hold <kbd>Shift</kbd>{" "}
+                for bigger steps.
+              </li>
+              <li>
+                Biomes are <strong>bit-exact</strong> via vendored cubiomes; the
+                heightmap is <strong>approximate</strong> (cubiomes spline) and
+                labelled as such in the HUD.
+              </li>
+            </ul>
+            <button className="onboardingDismiss" onClick={dismissOnboarding}>
+              Get started
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

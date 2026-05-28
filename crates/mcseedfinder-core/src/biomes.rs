@@ -80,6 +80,14 @@ extern "C" {
         out_y: *mut f32,
         out_ids: *mut c_int,
     ) -> c_int;
+    fn mcsf_get_spawn(g: *const CubGenerator, out_x: *mut c_int, out_z: *mut c_int);
+    fn mcsf_climate_np(
+        g: *mut CubGenerator,
+        x: c_int,
+        y: c_int,
+        z: c_int,
+        out_np6: *mut i64,
+    ) -> c_int;
 }
 
 /// 256-entry cubiomes biome RGB colormap, fetched once.
@@ -301,6 +309,32 @@ impl BiomeBackend {
             bid_bytes.push(id_u8);
         }
         Ok((rgba, bid_bytes))
+    }
+
+    /// World spawn point (block-coord `(x, z)`) for the given seed. Only
+    /// meaningful in the Overworld; the value returned for Nether/End is
+    /// cubiomes-defined and may not match in-game spawn semantics there.
+    pub fn world_spawn(&mut self, world_seed: i64) -> (i32, i32) {
+        self.ensure_seed(world_seed);
+        let mut x: c_int = 0;
+        let mut z: c_int = 0;
+        // SAFETY: generator is initialized + seeded above; the shim writes
+        // exactly two int32s into the provided pointers.
+        unsafe { mcsf_get_spawn(self.generator, &mut x, &mut z) };
+        (x as i32, z as i32)
+    }
+
+    /// Raw `np[6]` climate values at `(x, y, z)` — the six i64 values
+    /// cubiomes feeds into its biome b-tree. Returns
+    /// `[temperature, humidity, continentalness, erosion, depth, weirdness]`.
+    /// Power-user debug surface; the climate-overlay HUD uses this to
+    /// show the exact cubiomes math under the cursor.
+    pub fn climate_np(&mut self, world_seed: i64, x: i32, y: i32, z: i32) -> [i64; 6] {
+        self.ensure_seed(world_seed);
+        let mut np = [0i64; 6];
+        // SAFETY: generator is initialized + seeded; np is a fixed 6-element buffer.
+        unsafe { mcsf_climate_np(self.generator, x, y, z, np.as_mut_ptr()) };
+        np
     }
 
     /// **Approximate** surface block height at `(x, z)` for `world_seed`,

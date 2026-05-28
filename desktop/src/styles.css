@@ -674,6 +674,77 @@ textarea {
   margin-left: 6px;
 }
 
+/* First-run onboarding modal (#15). Backdrop scrim + centered card with
+ * a tight bulleted intro. Dismissal persists to localStorage so users
+ * never see it again unless they explicitly clear their data. */
+.onboardingScrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.65);
+  display: grid;
+  place-items: center;
+  backdrop-filter: blur(4px);
+}
+.onboardingCard {
+  max-width: 520px;
+  padding: 28px 32px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  color: var(--text);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.onboardingCard h2 {
+  margin: 0 0 8px 0;
+  font-size: 22px;
+  color: var(--accent);
+}
+.onboardingLead {
+  margin: 0 0 16px 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.onboardingList {
+  margin: 0 0 20px 0;
+  padding: 0 0 0 18px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+}
+.onboardingList li { margin-bottom: 8px; }
+.onboardingList kbd {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+.onboardingDismiss {
+  background: var(--accent);
+  color: #0a120c;
+  border: none;
+  padding: 10px 22px;
+  border-radius: 5px;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+
+/* Spawn marker (#10): a small golden star anchored at the cubiomes
+ * world-spawn block coord in the 3D map. */
+.spawnStar {
+  color: #ffcf3a;
+  font-size: 22px;
+  text-shadow: 0 0 6px rgba(255, 207, 58, 0.7), 0 2px 4px rgba(0, 0, 0, 0.8);
+  pointer-events: auto;
+  cursor: help;
+  user-select: none;
+}
+
 /* Top bar above the map: dimension tabs (left) + overlay toggles (right). */
 .mapTopBar {
   position: absolute;
