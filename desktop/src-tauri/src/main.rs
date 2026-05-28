@@ -88,6 +88,51 @@ struct AppState {
     /// no biomes) attempts to init wgpu; subsequent searches reuse the result.
     /// `Outer = "init has been attempted"`, `inner = "did it succeed"`.
     gpu: OnceLock<Option<GpuSearcher>>,
+    /// Pool of warm `BiomeBackend` instances keyed by (version, dimension).
+    /// Building one calls cubiomes' `setupGenerator`, which is heavyweight —
+    /// re-running it per tile / per analyze caused multi-second freezes when
+    /// rapidly panning or clicking between matches. The pool amortises that
+    /// cost to one-time-per-(version,dimension).
+    biome_pool: Mutex<HashMap<(String, String), Vec<BiomeBackend>>>,
+}
+
+/// Maximum cached BiomeBackends per (version, dimension). Concurrent tile
+/// requests grab from this pool in parallel; if more than this number are
+/// in-flight at once, extras are allocated and dropped on release rather
+/// than retained. 4 covers foreground + 3 prefetches comfortably.
+const BIOME_POOL_MAX: usize = 4;
+
+fn acquire_biome_backend(
+    state: &AppState,
+    version: &str,
+    dimension: &str,
+) -> Result<BiomeBackend, String> {
+    let key = (version.to_string(), dimension.to_string());
+    {
+        let mut guard = state
+            .biome_pool
+            .lock()
+            .map_err(|_| "biome pool lock poisoned".to_string())?;
+        if let Some(vec) = guard.get_mut(&key) {
+            if let Some(b) = vec.pop() {
+                return Ok(b);
+            }
+        }
+        // Drop the lock before the slow setupGenerator call so concurrent
+        // requests can keep grabbing pre-warmed instances.
+    }
+    BiomeBackend::from_strs(version, dimension, DEFAULT_Y)
+}
+
+fn release_biome_backend(state: &AppState, version: &str, dimension: &str, backend: BiomeBackend) {
+    let key = (version.to_string(), dimension.to_string());
+    if let Ok(mut guard) = state.biome_pool.lock() {
+        let vec = guard.entry(key).or_default();
+        if vec.len() < BIOME_POOL_MAX {
+            vec.push(backend);
+        }
+        // Else: drop. Excess backends release their cubiomes allocation.
+    }
 }
 
 #[derive(Default)]
@@ -359,12 +404,16 @@ fn run_search(
     compiled: CompiledNode,
     cancel: Arc<AtomicBool>,
 ) {
-    // GPU fast-path: when the criteria boil down to a single NearbyStructure
-    // predicate (the default React-tree shape, or any single-child group of
-    // one), dispatch the search on wgpu. Falls through to the CPU evaluator
-    // for clusters, multi-leaf groups, biome conditions, or any GPU init
-    // failure. Init is attempted exactly once per process and cached.
-    if !conditions::has_biome_leaves(&compiled) {
+    // GPU fast-path: route to wgpu ONLY when the dispatch is large enough to
+    // amortise the per-dispatch overhead (buffer-create + queue-submit +
+    // map_async + poll, ~5-10 ms each) and the one-time init (~200-500 ms on
+    // first use). Below this threshold the CPU evaluator wins comfortably —
+    // it's a tight branch-predicted Rust loop with no IPC / GPU sync cost.
+    // Empirically GPU starts paying off around half a million seeds; the
+    // threshold below leaves headroom and keeps interactive UI searches on
+    // the fast CPU path.
+    const GPU_MIN_COUNT: u64 = 500_000;
+    if spec.count >= GPU_MIN_COUNT && !conditions::has_biome_leaves(&compiled) {
         if let Some(req) = try_extract_single_nearby(&compiled) {
             let state = app.try_state::<AppState>();
             let searcher = state
@@ -500,11 +549,14 @@ fn analyze_seed(
     seed: i64,
     version: Option<String>,
     dimension: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let version = version.unwrap_or_else(|| "1.21".to_string());
     let dimension = dimension.unwrap_or_else(|| "overworld".to_string());
 
-    let mut backend = BiomeBackend::from_strs(&version, &dimension, DEFAULT_Y).map_err(|e| e)?;
+    // Pool-acquired backend — avoids the heavy setupGenerator call per analyze
+    // when the user clicks through many results in a row.
+    let mut backend = acquire_biome_backend(&state, &version, &dimension)?;
     let origin_biome = backend.get_biome(seed, 0, 0);
 
     // Nearest village (block coords + distance), iter exact placements within 8000.
@@ -531,7 +583,7 @@ fn analyze_seed(
         })
         .collect();
 
-    Ok(serde_json::json!({
+    let result = serde_json::json!({
         "seed": seed,
         "version": version,
         "dimension": dimension,
@@ -539,7 +591,9 @@ fn analyze_seed(
         "origin_biome_exact": true,
         "nearest_village": nearest_village,
         "strongholds": strongholds,
-    }))
+    });
+    release_biome_backend(&state, &version, &dimension, backend);
+    Ok(result)
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,8 +632,15 @@ fn default_size() -> u32 {
 }
 
 #[tauri::command]
-fn render_tile(request: TileRequest) -> Result<serde_json::Value, String> {
-    let mut backend = BiomeBackend::from_strs(&request.version, &request.dimension, DEFAULT_Y)?;
+fn render_tile(
+    request: TileRequest,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Pool-acquired backend — avoids re-running cubiomes' setupGenerator on
+    // every tile (which was the main source of the multi-second pauses when
+    // panning rapidly or clicking through matches). Each request typically
+    // hits the pool and runs in tens of ms instead of hundreds.
+    let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
     let png_b64 = backend.render_tile_base64(
         request.seed,
         request.scale,
@@ -587,18 +648,24 @@ fn render_tile(request: TileRequest) -> Result<serde_json::Value, String> {
         request.z,
         request.sx,
         request.sz,
-    )?;
-    Ok(serde_json::json!({
-        "png_base64": png_b64,
-        "seed": request.seed,
-        "version": request.version,
-        "dimension": request.dimension,
-        "scale": request.scale,
-        "x": request.x,
-        "z": request.z,
-        "sx": request.sx,
-        "sz": request.sz,
-    }))
+    );
+    let version = request.version.clone();
+    let dimension = request.dimension.clone();
+    let result = png_b64.map(|png| {
+        serde_json::json!({
+            "png_base64": png,
+            "seed": request.seed,
+            "version": request.version,
+            "dimension": request.dimension,
+            "scale": request.scale,
+            "x": request.x,
+            "z": request.z,
+            "sx": request.sx,
+            "sz": request.sz,
+        })
+    });
+    release_biome_backend(&state, &version, &dimension, backend);
+    result
 }
 
 #[derive(Debug, Deserialize)]

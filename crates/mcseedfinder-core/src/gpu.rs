@@ -16,7 +16,6 @@
 #![cfg(feature = "gpu")]
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 use crate::structures::{structure_config, SpreadType, StructureType};
 
@@ -66,11 +65,22 @@ struct SearchParamsUniform {
 const MAX_SEEDS_PER_DISPATCH: u32 = 1_000_000;
 
 /// Persistent GPU resources. Initialise once per process and reuse.
+///
+/// In v1 every dispatch allocated fresh params/output/staging buffers and a
+/// fresh bind group. That per-dispatch churn was a large fraction of the
+/// total GPU time (wgpu's docs explicitly call this out as the most common
+/// performance mistake in compute pipelines). v2 pre-allocates a single set
+/// of buffers sized for the max chunk and reuses them across dispatches;
+/// per-dispatch we only `queue.write_buffer` the small (88-byte) uniform.
 pub struct GpuSearcher {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    /// Persistent buffers + bind group reused across dispatches.
+    params_buffer: wgpu::Buffer,
+    out_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 impl std::fmt::Debug for GpuSearcher {
@@ -159,11 +169,53 @@ impl GpuSearcher {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
+        // Persistent buffers sized for the maximum chunk. Per-dispatch we only
+        // queue.write_buffer the small uniform; the output + staging buffers
+        // are reused. Bind group is built once because all bindings point at
+        // these stable buffers.
+        let params_size = std::mem::size_of::<SearchParamsUniform>() as wgpu::BufferAddress;
+        let out_size = (MAX_SEEDS_PER_DISPATCH as wgpu::BufferAddress) * 4;
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-gpu-params"),
+            size: params_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-gpu-out"),
+            size: out_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-gpu-staging"),
+            size: out_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mcsf-gpu-bg"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         Ok(Self {
             device,
             queue,
             pipeline,
-            bind_group_layout,
+            params_buffer,
+            out_buffer,
+            staging_buffer,
+            bind_group,
         })
     }
 
@@ -254,46 +306,17 @@ impl GpuSearcher {
         Ok(matches)
     }
 
-    /// Drive one dispatch end-to-end: write uniform, allocate output, dispatch,
-    /// copy to staging, map, read u32s, collect indices where the result is 1.
+    /// Drive one dispatch end-to-end using the persistent buffers + bind
+    /// group. Only the small uniform is uploaded per call; output/staging
+    /// are reused across dispatches.
     fn dispatch_one(&self, params: &SearchParamsUniform) -> Result<Vec<u32>, &'static str> {
         let count = params.count as u64;
         let out_byte_size = count * 4; // u32 per seed
 
-        let params_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mcsf-gpu-params"),
-                contents: bytemuck::bytes_of(params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mcsf-gpu-out"),
-            size: out_byte_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mcsf-gpu-staging"),
-            size: out_byte_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mcsf-gpu-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: out_buf.as_entire_binding(),
-                },
-            ],
-        });
+        // Upload the per-dispatch uniform. (wgpu's queue.write_buffer is the
+        // standard path for small/frequent uploads.)
+        self.queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
 
         let mut encoder = self
             .device
@@ -306,16 +329,18 @@ impl GpuSearcher {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &self.bind_group, &[]);
             // workgroup_size in WGSL is 64; dispatch ceil(count/64) workgroups.
             let groups = ((count as u32) + 63) / 64;
             pass.dispatch_workgroups(groups, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_byte_size);
+        // Copy only the live portion (count u32s) — staging is sized for max
+        // chunk but the trailing slots aren't meaningful for this dispatch.
+        encoder.copy_buffer_to_buffer(&self.out_buffer, 0, &self.staging_buffer, 0, out_byte_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Read back. wgpu's map API is async; pollster blocks the calling thread.
-        let slice = staging.slice(..);
+        let slice = self.staging_buffer.slice(..out_byte_size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -336,7 +361,8 @@ impl GpuSearcher {
             .filter_map(|(i, &v)| if v != 0 { Some(i as u32) } else { None })
             .collect();
         drop(data);
-        staging.unmap();
+        // Unmap so the staging buffer can be re-bound for the next dispatch.
+        self.staging_buffer.unmap();
         Ok(matches)
     }
 }

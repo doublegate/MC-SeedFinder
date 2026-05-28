@@ -72,9 +72,13 @@ const TILE_MIN_PX = 64;
 
 // Over-render the tile slightly past the visible pane on each side. Lets a
 // drag-pan reveal already-rendered map content instead of black margins;
-// refetches with a new centre only on pointer-up. 1.5 means 25% over-render
-// per side — the user can drag ~25% of the pane before exposing black.
-const OVERSCAN = 1.5;
+// refetches with a new centre only on pointer-up. 1.3 = 15% over-render per
+// side, tile area = 1.69× visible pane. Dropped from 1.5 (which made each
+// tile 2.25× — noticeably slower to render on a per-tile basis) once the
+// per-call cubiomes setupGenerator cost was amortised via the BiomePool on
+// the Tauri side; the smaller overscan is now sufficient because tiles
+// render in ~50 ms on warm cache instead of 200+ ms.
+const OVERSCAN = 1.3;
 // Inset of the over-rendered tile so its centre sits at the pane centre.
 const OVERSCAN_INSET_PCT = (1 - OVERSCAN) * 50;
 
@@ -554,39 +558,55 @@ function App() {
       }
     })();
 
-    // Background prefetch: ask render_tile for the 4 neighboring views so the
-    // next pan in any direction can serve from cache. Fire-and-forget; even if
-    // the user pans elsewhere these go into the LRU and may help later.
-    const neighborOffsets: Array<[number, number]> = [
-      [tileSpanX, 0],
-      [-tileSpanX, 0],
-      [0, tileSpanZ],
-      [0, -tileSpanZ],
-    ];
-    for (const [ox, oz] of neighborOffsets) {
-      const nx = tileX + ox;
-      const nz = tileZ + oz;
-      const nkey = tileKey(selectedSeed, version, nx, nz, sx, sz, cubScale);
-      if (tileCacheRef.current.has(nkey)) continue;
-      invoke<TileResponse>("render_tile", {
-        request: {
-          seed: selectedSeed,
-          version,
-          dimension: "overworld",
-          x: nx,
-          z: nz,
-          scale: cubScale,
-          sx,
-          sz,
-        },
-      })
-        .then((t) => putCachedTile(tileCacheRef.current, nkey, t, TILE_CACHE_MAX))
-        .catch(() => undefined); // silent — stale prefetch failures don't matter
-    }
-
     return () => {
       cancelled = true;
     };
+  }, [selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
+
+  // Background prefetch — DEBOUNCED. Firing 4 neighbor fetches on every
+  // micro-pan or rapid result click overloaded the Tauri command pool and
+  // serialised through the cubiomes backend, causing multi-second freezes.
+  // Now we wait until the view has been stable for 250 ms before queuing
+  // neighbors. If the user pans/clicks again before the timeout fires, the
+  // previous prefetch is cancelled. With the biome pool + smaller overscan,
+  // the foreground tile arrives in ~50 ms and the prefetches arrive shortly
+  // after for the next pan to serve from cache.
+  useEffect(() => {
+    if (selectedSeed == null) return;
+    const { sx, sz } = tileSizeForPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN);
+    const tileSpanX = sx * cubScale;
+    const tileSpanZ = sz * cubScale;
+    const tileX = viewCenter.x - Math.round(tileSpanX / 2);
+    const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
+    const handle = window.setTimeout(() => {
+      const neighborOffsets: Array<[number, number]> = [
+        [tileSpanX, 0],
+        [-tileSpanX, 0],
+        [0, tileSpanZ],
+        [0, -tileSpanZ],
+      ];
+      for (const [ox, oz] of neighborOffsets) {
+        const nx = tileX + ox;
+        const nz = tileZ + oz;
+        const nkey = tileKey(selectedSeed, version, nx, nz, sx, sz, cubScale);
+        if (tileCacheRef.current.has(nkey)) continue;
+        invoke<TileResponse>("render_tile", {
+          request: {
+            seed: selectedSeed,
+            version,
+            dimension: "overworld",
+            x: nx,
+            z: nz,
+            scale: cubScale,
+            sx,
+            sz,
+          },
+        })
+          .then((t) => putCachedTile(tileCacheRef.current, nkey, t, TILE_CACHE_MAX))
+          .catch(() => undefined);
+      }
+    }, 250);
+    return () => window.clearTimeout(handle);
   }, [selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
 
   // ---- Map pan handlers ----
