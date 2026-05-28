@@ -47,7 +47,7 @@ a valid backend.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol
+from typing import Protocol
 
 from .biomes import BIOMES, BiomeInfo, Climate
 from .noise import OctaveNoise
@@ -230,7 +230,7 @@ class BiomeLookup:
     def __init__(
         self,
         world_seed: int,
-        backend: Optional[BiomeGenerator] = None,
+        backend: BiomeGenerator | None = None,
     ) -> None:
         self.world_seed: int = world_seed
         if backend is not None:

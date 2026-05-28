@@ -1,0 +1,6 @@
+# Pin the Rust toolchain so CI and local dev use the same version. Stable is
+# fine — there are no nightly-only features in the workspace. `rustfmt` and
+# `clippy` are required components for the lint job; `rust-src` lets RA work.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]

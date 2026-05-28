@@ -143,15 +143,15 @@ struct SampleParams {
 
 fn pack_perm(perm: &[u8; 256]) -> [[u32; 4]; 16] {
     let mut out = [[0u32; 4]; 16];
-    for vec_idx in 0..16 {
-        for sub_idx in 0..4 {
+    for (vec_idx, vec_out) in out.iter_mut().enumerate() {
+        for (sub_idx, word_out) in vec_out.iter_mut().enumerate() {
             let word_idx = vec_idx * 4 + sub_idx;
             let mut word: u32 = 0;
             for byte_off in 0..4 {
                 let byte_idx = word_idx * 4 + byte_off;
                 word |= (perm[byte_idx] as u32) << (byte_off * 8);
             }
-            out[vec_idx][sub_idx] = word;
+            *word_out = word;
         }
     }
     out
@@ -389,7 +389,7 @@ impl GpuPerlin {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            let groups = ((coords.len() as u32) + 63) / 64;
+            let groups = (coords.len() as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
@@ -450,7 +450,7 @@ mod tests {
             [255.99, 0.0, 255.99],
             [256.0, 0.0, 256.0],
             [-1000.0, 0.0, 1000.0],
-            [3.14159, 0.0, 2.71828],
+            [3.15, 0.0, 2.72],
             [0.123, 0.0, 0.456],
             [-0.5, 0.0, -0.5],
         ];

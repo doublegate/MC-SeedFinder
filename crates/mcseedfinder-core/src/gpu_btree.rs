@@ -79,6 +79,10 @@ impl BiomeTree {
         self.nodes.len() as u32
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     /// cubiomes' `get_np_dist` — squared distance from `np` to the
     /// per-parameter `[min, max]` ranges referenced by node `idx`.
     ///
@@ -470,7 +474,7 @@ impl GpuBiomeTree {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            let groups = ((np_inputs.len() as u32) + 63) / 64;
+            let groups = (np_inputs.len() as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);

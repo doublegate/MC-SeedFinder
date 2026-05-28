@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Protocol
+from typing import Any, Protocol
 
 from .criteria import CriteriaSet, compile_criteria
 from .finder import SearchPlan, _iter_chunks
-
 
 Exactness = str
 
@@ -38,7 +38,7 @@ class SearchSpec:
     start_seed: int = 0
     count: int = 1_000_000
     chunk_size: int = 4096
-    random_seed: Optional[int] = None
+    random_seed: int | None = None
     max_matches: int = 10
     scoring: Mapping[str, Any] = field(default_factory=dict)
     spec_version: int = 1
@@ -72,13 +72,13 @@ class SeedReport:
     edition: str
     version: str
     dimension: str
-    matched_features: List[str]
+    matched_features: list[str]
     exactness: Mapping[str, Exactness]
     score: float = 0.0
-    map_preview: Optional[Mapping[str, Any]] = None
-    warnings: List[str] = field(default_factory=list)
+    map_preview: Mapping[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation."""
         return {
             "seed": self.seed,
@@ -138,7 +138,7 @@ class JavaPythonProvider:
         if not matched:
             return None
         exactness = _exactness_for_spec(spec.criteria, criteria.uses_exact_biomes)
-        warnings: List[str] = []
+        warnings: list[str] = []
         if "candidate" in exactness.values():
             warnings.append(
                 "biome filters use the approximate local fallback; the exact "
@@ -260,11 +260,11 @@ def provider_for(edition: str) -> Provider:
 
 def run_staged_search(
     spec: SearchSpec,
-    provider: Optional[Provider] = None,
-    job_id: Optional[str] = None,
+    provider: Provider | None = None,
+    job_id: str | None = None,
     progress_interval: float = 2.0,
-    cancel_callback: Optional[Callable[[], bool]] = None,
-    pause_callback: Optional[Callable[[], bool]] = None,
+    cancel_callback: Callable[[], bool] | None = None,
+    pause_callback: Callable[[], bool] | None = None,
 ) -> Iterator[SearchEvent]:
     """Run a local staged search and yield product events.
 
@@ -284,7 +284,7 @@ def run_staged_search(
     last_progress = start
     scanned = 0
     matches = 0
-    rejected_by_stage: Dict[int, int] = {}
+    rejected_by_stage: dict[int, int] = {}
 
     yield SearchEvent(
         type="started",
@@ -384,12 +384,12 @@ def run_staged_search(
 
 def _exactness_for_spec(
     criteria_spec: Mapping[str, Any], biome_exact: bool
-) -> Dict[str, Exactness]:
+) -> dict[str, Exactness]:
     # Structure placement is always exact (pure-Rust/Python golden-tested math).
     # Biome filters are exact only when the cubiomes backend was active for the
     # search; otherwise they are approximate candidates.
     biome_level: Exactness = "exact" if biome_exact else "candidate"
-    exactness: Dict[str, Exactness] = {}
+    exactness: dict[str, Exactness] = {}
     if criteria_spec.get("nearby_structures"):
         exactness["structures"] = "exact"
     if criteria_spec.get("spawn_biome") is not None:

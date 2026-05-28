@@ -31,8 +31,9 @@ import argparse
 import csv
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 from .biome_gen import BiomeLookup
 from .biomes import BIOMES
@@ -200,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Argument compilation
 # --------------------------------------------------------------------------- #
-def _parse_structure_spec(spec: str) -> Tuple[str, int]:
+def _parse_structure_spec(spec: str) -> tuple[str, int]:
     """Parse a ``"structure[:distance]"`` CLI argument."""
     if ":" in spec:
         name, dist_str = spec.split(":", 1)
@@ -229,7 +230,7 @@ def compile_args_to_criteria(args: argparse.Namespace) -> CriteriaSet:
         )
 
     # Otherwise, build from inline flags.
-    structures: List[Tuple[str, int]] = []
+    structures: list[tuple[str, int]] = []
     if args.nearby_structure:
         for spec in args.nearby_structure:
             structures.append(_parse_structure_spec(spec))
@@ -320,7 +321,7 @@ def report_seed(
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Parse args and run the search. Returns a UNIX-style exit code."""
     args = build_parser().parse_args(argv)
 
@@ -396,13 +397,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec = _criteria_set_to_spec_via_args(args)
     # If the user didn't pass --workers, let SearchConfig's default_factory
     # decide (CPU count - 1). Otherwise honour the explicit value.
-    cfg_kwargs: dict = dict(
-        criteria_spec=spec,
-        plan=plan,
-        max_matches=args.max_matches,
-        biome_version=args.version,
-        biome_dimension=args.dimension,
-    )
+    cfg_kwargs: dict = {
+        "criteria_spec": spec,
+        "plan": plan,
+        "max_matches": args.max_matches,
+        "biome_version": args.version,
+        "biome_dimension": args.dimension,
+    }
     if args.workers is not None:
         cfg_kwargs["workers"] = max(1, args.workers)
     cfg = SearchConfig(**cfg_kwargs)
@@ -417,7 +418,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               file=sys.stderr)
 
     # ---- Run ----
-    found: List[Match] = []
+    found: list[Match] = []
     for match in run_search(cfg, progress_callback=progress):
         print(match.seed)            # canonical machine-readable output
         sys.stdout.flush()

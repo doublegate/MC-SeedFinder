@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel an older run of the same branch / PR when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Disable sccache wrapping in CI — we don't run sccache here, so the wrapper
+  # would fail. (Matches the `RUSTC_WRAPPER=` prefix used in local dev.)
+  RUSTC_WRAPPER: ""
+  # Speeds up cubiomes compilation by skipping the cc crate's incremental tomb.
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust-lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (default features)
+        run: |
+          cargo clippy --features pyo3 \
+            --manifest-path crates/mcseedfinder-core/Cargo.toml \
+            --all-targets -- -D warnings
+      - name: cargo clippy (no default features)
+        # Make sure the pure-Rust structure/RNG core still compiles cleanly
+        # with --no-default-features (no cubiomes, no GPU). Some downstream
+        # contexts (wasm, minimal builds) need that path to stay green.
+        run: |
+          cargo clippy --no-default-features --features pyo3 \
+            --manifest-path crates/mcseedfinder-core/Cargo.toml \
+            --all-targets -- -D warnings
+
+  python-lint:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff>=0.4"
+      - name: ruff check
+        run: ruff check
+
+  test:
+    name: Tests (Rust + Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      - name: cargo test (default features)
+        # GPU tests check try_new() and gracefully return when no adapter is
+        # available, so this works on a headless CI runner.
+        run: |
+          cargo test --features pyo3 \
+            --manifest-path crates/mcseedfinder-core/Cargo.toml
+      - name: pip install (builds the native extension via maturin)
+        run: pip install -e ".[dev]"
+      - name: Python unit tests
+        run: PYTHONPATH=src python -m unittest
+
+  desktop-build:
+    name: Desktop build (Tauri + React)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-desktop-${{ hashFiles('**/Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-desktop-
+      - name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+      - name: npm install (desktop)
+        run: npm install --prefix desktop
+      - name: Vite + tsc build
+        run: npm run build --prefix desktop
+      - name: cargo check (Tauri crate)
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml

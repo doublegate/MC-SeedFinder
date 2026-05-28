@@ -5,3 +5,19 @@ resolver = "2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Workspace-level clippy policy. Most lints stay at clippy's default
+# severity. The allow-list is for genuinely noisy ones in this project:
+#
+# - `too_many_arguments`: FFI shim signatures and GPU dispatchers naturally
+#   take 8+ args (output arrays, capacities, params). Refactoring to
+#   struct-passing hurts readability for what's a one-call site.
+# - `doc_lazy_continuation`: fires on intentional multi-line bullet lists
+#   in module doc-comments where indentation conveys structure.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+doc_lazy_continuation = "allow"
+# Aligned-column doc comments (e.g. `- steps[depth]` / `- param[i][2]` with
+# matching continuation indents) keep tabular doc lists readable. clippy's
+# default 4-space-only policy would flatten them.
+doc_overindented_list_items = "allow"

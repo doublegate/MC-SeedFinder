@@ -72,14 +72,14 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, FrozenSet, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any
 
 from .biome_gen import BiomeLookup
 from .biomes import numeric_ids_for
 from .structures import (
-    STRUCTURE_CONFIGS,
     SUPPORTED_STRUCTURES,
     iter_strongholds,
     iter_structures_in_radius,
@@ -101,7 +101,7 @@ class Criterion(ABC):
     stage: int = 2
 
     @abstractmethod
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         """Return True if ``world_seed`` satisfies this criterion."""
         ...
 
@@ -133,7 +133,7 @@ class NearbyStructure(Criterion):
                 f"{sorted(SUPPORTED_STRUCTURES)}"
             )
 
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         if self.structure == "stronghold":
             # Strongholds use a different generator; ring 1 is what's near origin.
             for sh in iter_strongholds(world_seed, max_rings=1):
@@ -169,13 +169,13 @@ class SpawnBiome(Criterion):
     target set. Set ``spawn_radius`` to 0 for a strict single-point check.
     """
 
-    biomes: FrozenSet[int] = field(default_factory=frozenset)
+    biomes: frozenset[int] = field(default_factory=frozenset)
     spawn_radius: int = 64
     samples_per_axis: int = 5
     cost: int = 4  # one or a handful of biome samples
     stage: int = 2
 
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         assert lookup is not None, "SpawnBiome needs a BiomeLookup"
         if self.spawn_radius <= 0:
             return lookup.biome_at(0, 0) in self.biomes
@@ -200,14 +200,14 @@ class SpawnBiome(Criterion):
 class NearbyBiomes(Criterion):
     """Require certain biomes to exist anywhere within a radius."""
 
-    biomes: FrozenSet[int] = field(default_factory=frozenset)
+    biomes: frozenset[int] = field(default_factory=frozenset)
     radius: int = 2000
     all_required: bool = False
     samples_per_axis: int = 16
     cost: int = 10  # grid sample is the heaviest predicate we support
     stage: int = 3
 
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         assert lookup is not None, "NearbyBiomes needs a BiomeLookup"
         target = set(self.biomes)
         found: set[int] = set()
@@ -244,7 +244,7 @@ class StructureCluster(Criterion):
     Each structure type is validated up-front.
     """
 
-    structures: Tuple[str, ...] = ()
+    structures: tuple[str, ...] = ()
     max_distance: int = 1500
     min_count: int = 4
     centre_x: int = 0
@@ -264,7 +264,7 @@ class StructureCluster(Criterion):
                     f"{sorted(SUPPORTED_STRUCTURES)}"
                 )
 
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         hits = 0
         for name in self.structures:
             if name == "stronghold":
@@ -304,7 +304,7 @@ class BiomeArea(Criterion):
     handles via its biome analysis tab.
     """
 
-    biomes: FrozenSet[int] = field(default_factory=frozenset)
+    biomes: frozenset[int] = field(default_factory=frozenset)
     radius: int = 1000
     samples_per_axis: int = 16
     min_samples: int = 8
@@ -322,7 +322,7 @@ class BiomeArea(Criterion):
                 f"BiomeArea.min_samples must be in [1, {total}], got {self.min_samples}"
             )
 
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         assert lookup is not None, "BiomeArea needs a BiomeLookup"
         target = set(self.biomes)
         step = max(1, (2 * self.radius) // max(1, self.samples_per_axis - 1))
@@ -362,7 +362,7 @@ class GroupCriterion(Criterion):
     """
 
     combinator: str = "all_of"
-    children: List[Criterion] = field(default_factory=list)
+    children: list[Criterion] = field(default_factory=list)
     stage: int = 2
 
     def __post_init__(self) -> None:
@@ -377,7 +377,7 @@ class GroupCriterion(Criterion):
         # ordering this group against its siblings.
         self.cost = sum(c.cost for c in self.children)
 
-    def evaluate(self, world_seed: int, lookup: Optional[BiomeLookup]) -> bool:
+    def evaluate(self, world_seed: int, lookup: BiomeLookup | None) -> bool:
         if self.combinator == "all_of":
             for child in self.children:
                 if not child.evaluate(world_seed, lookup):
@@ -416,11 +416,11 @@ class CriteriaSet:
     multi-million-seed sweep allocates a single generator per process.
     """
 
-    criteria: List[Criterion]
+    criteria: list[Criterion]
     needs_biome_lookup: bool
-    biome_version: Optional[str] = None
+    biome_version: str | None = None
     biome_dimension: str = "overworld"
-    biome_y: Optional[int] = None
+    biome_y: int | None = None
 
     def __post_init__(self) -> None:
         # Sort by cost so cheap predicates fail-fast on bad seeds.
@@ -446,7 +446,7 @@ class CriteriaSet:
         matched, _, _ = self.evaluate_staged(world_seed)
         return matched
 
-    def evaluate_staged(self, world_seed: int) -> Tuple[bool, Optional[int], List[str]]:
+    def evaluate_staged(self, world_seed: int) -> tuple[bool, int | None, list[str]]:
         """Evaluate criteria and return match status, failed stage, and passes.
 
         The existing boolean :meth:`matches` API remains the simple path used
@@ -458,14 +458,14 @@ class CriteriaSet:
             if self.needs_biome_lookup
             else None
         )
-        passed: List[str] = []
+        passed: list[str] = []
         for crit in self.criteria:
             if not crit.evaluate(world_seed, lookup):
                 return False, crit.stage, passed
             passed.append(crit.describe())
         return True, None, passed
 
-    def describe(self) -> List[str]:
+    def describe(self) -> list[str]:
         """One human-readable line per criterion, in evaluation order."""
         return [c.describe() for c in self.criteria]
 
@@ -474,11 +474,11 @@ class CriteriaSet:
 # Compilation: spec dict / file → CriteriaSet
 # --------------------------------------------------------------------------- #
 def load_criteria_file(
-    path: Union[str, Path],
+    path: str | Path,
     *,
-    biome_version: Optional[str] = None,
+    biome_version: str | None = None,
     biome_dimension: str = "overworld",
-    biome_y: Optional[int] = None,
+    biome_y: int | None = None,
 ) -> CriteriaSet:
     """Load a JSON criteria file and compile it."""
     with open(path, encoding="utf-8") as f:
@@ -494,9 +494,9 @@ def load_criteria_file(
 def compile_criteria(
     spec: Mapping[str, Any],
     *,
-    biome_version: Optional[str] = None,
+    biome_version: str | None = None,
     biome_dimension: str = "overworld",
-    biome_y: Optional[int] = None,
+    biome_y: int | None = None,
 ) -> CriteriaSet:
     """Compile a spec dict (the JSON schema described at module top) to a set.
 
@@ -504,7 +504,7 @@ def compile_criteria(
     biome backend for biome criteria; without them, biome lookups use the
     approximate fallback.
     """
-    criteria: List[Criterion] = []
+    criteria: list[Criterion] = []
     needs_biome = False
 
     # ---- nearby_structures (cheapest first) ----
@@ -553,12 +553,12 @@ def compile_criteria(
 # --------------------------------------------------------------------------- #
 # Recursive condition-tree compiler
 # --------------------------------------------------------------------------- #
-_GROUP_TYPES: FrozenSet[str] = frozenset({"all_of", "any_of", "none_of"})
+_GROUP_TYPES: frozenset[str] = frozenset({"all_of", "any_of", "none_of"})
 
 _MAX_TREE_DEPTH = 16  # hard cap to keep pathological specs from blowing the stack
 
 
-def _node_compile(node: Mapping[str, Any], *, depth: int = 0) -> Tuple[Criterion, bool]:
+def _node_compile(node: Mapping[str, Any], *, depth: int = 0) -> tuple[Criterion, bool]:
     """Compile one condition-tree node. Returns ``(criterion, needs_biome)``."""
     if not isinstance(node, Mapping):
         raise ValueError(
@@ -573,7 +573,7 @@ def _node_compile(node: Mapping[str, Any], *, depth: int = 0) -> Tuple[Criterion
         of = node.get("of") or []
         if not of:
             raise ValueError(f"{t!r} group has empty 'of' list")
-        children: List[Criterion] = []
+        children: list[Criterion] = []
         any_biome = False
         for child in of:
             crit, child_biome = _node_compile(child, depth=depth + 1)
@@ -649,11 +649,11 @@ def _compile_structure_entry(entry: Mapping[str, Any]) -> NearbyStructure:
 # Convenience: build a CriteriaSet from CLI-style kwargs
 # --------------------------------------------------------------------------- #
 def compile_cli_criteria(
-    spawn_biome: Optional[Iterable[str]] = None,
+    spawn_biome: Iterable[str] | None = None,
     spawn_radius: int = 64,
-    structures: Optional[Iterable[str]] = None,
+    structures: Iterable[str] | None = None,
     structure_radius: int = 1500,
-    nearby_biomes: Optional[Iterable[str]] = None,
+    nearby_biomes: Iterable[str] | None = None,
     nearby_biomes_radius: int = 2000,
     nearby_biomes_all: bool = False,
 ) -> CriteriaSet:

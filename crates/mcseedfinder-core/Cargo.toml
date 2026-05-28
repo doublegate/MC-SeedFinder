@@ -53,3 +53,6 @@ pollster = { version = "0.4", optional = true }
 [build-dependencies]
 # Compiles the vendored cubiomes C sources + shim when the `biomes` feature is on.
 cc = "1.0"
+
+[lints]
+workspace = true

@@ -40,6 +40,8 @@ where = ["src"]
 target-version = "py310"
 line-length = 100
 src = ["src", "tests"]
+# Don't lint vendored upstream code (cubiomes submodule's own Python helpers).
+extend-exclude = ["crates/mcseedfinder-core/vendor"]
 
 [tool.ruff.lint]
 # pycodestyle, pyflakes, isort, pyupgrade, flake8-bugbear, comprehensions
@@ -47,6 +49,11 @@ select = ["E", "F", "I", "UP", "B", "C4"]
 # Accuracy-critical math modules use intentional bit patterns and magic
 # constants from reference vectors; keep the linter from second-guessing them.
 ignore = ["E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# Biome catalog tables — paired (id, namespace, climate, temp, humidity)
+# rows are more readable on one line than wrapped across many.
+"src/mcseedfinder/biomes.py" = ["E501"]
 
 [tool.maturin]
 manifest-path = "crates/mcseedfinder-core/Cargo.toml"

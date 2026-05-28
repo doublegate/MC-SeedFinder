@@ -4,9 +4,8 @@ Tests for the local app command contract and persistence.
 
 from __future__ import annotations
 
-import unittest
-
 import time
+import unittest
 
 from mcseedfinder.app_contract import AsyncCommandHost, JobStore, LocalCommandHost
 from mcseedfinder.engine import SearchSpec

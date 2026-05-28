@@ -38,7 +38,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, FrozenSet, List
 
 
 class Climate(IntEnum):
@@ -91,7 +90,7 @@ class BiomeInfo:
 # --------------------------------------------------------------------------- #
 # Only the subset that users actually filter on. Add to this freely if you
 # need finer granularity; just keep ``numeric_id`` in sync with cubiomes.
-BIOMES: Dict[str, BiomeInfo] = {
+BIOMES: dict[str, BiomeInfo] = {
     # ---- Warm / dry ----
     "desert": BiomeInfo(2, "minecraft:desert", Climate.WARM, 2.0, 0.0),
     "savanna": BiomeInfo(35, "minecraft:savanna", Climate.WARM, 1.2, 0.0),
@@ -156,7 +155,7 @@ BIOMES: Dict[str, BiomeInfo] = {
 #: Maps a "group name" to the set of biome keys (the ``BIOMES`` dict keys)
 #: that belong to it. Users can write ``"warm_dry"`` in their criteria file
 #: and the resolver will expand it.
-BIOME_GROUPS: Dict[str, FrozenSet[str]] = {
+BIOME_GROUPS: dict[str, frozenset[str]] = {
     "warm_dry": frozenset({"desert", "savanna", "savanna_plateau", "badlands",
                            "eroded_badlands", "wooded_badlands"}),
     "warm_humid": frozenset({"jungle", "sparse_jungle", "bamboo_jungle",
@@ -180,7 +179,7 @@ BIOME_GROUPS: Dict[str, FrozenSet[str]] = {
 # --------------------------------------------------------------------------- #
 # Resolver utilities
 # --------------------------------------------------------------------------- #
-def resolve_biome_selector(selector: str | List[str]) -> FrozenSet[str]:
+def resolve_biome_selector(selector: str | list[str]) -> frozenset[str]:
     """Expand a user-supplied biome selector to a concrete set of biome keys.
 
     A selector is either:
@@ -210,7 +209,7 @@ def resolve_biome_selector(selector: str | List[str]) -> FrozenSet[str]:
     return frozenset(resolved)
 
 
-def numeric_ids_for(selector: str | List[str]) -> FrozenSet[int]:
+def numeric_ids_for(selector: str | list[str]) -> frozenset[int]:
     """Same as :func:`resolve_biome_selector` but returns numeric IDs.
 
     Used by the criteria checker, which works against numeric biome IDs for

@@ -24,6 +24,7 @@ use crate::structures::{
 
 /// Sampling grid count used by the spawn-biome predicate (matches the Python
 /// `SpawnBiome.samples_per_axis` default).
+#[cfg(feature = "biomes")]
 const SPAWN_BIOME_SAMPLES_PER_AXIS: i32 = 5;
 
 /// Wire-format tree node. Tagged by `type` so it mirrors the Python schema 1:1.

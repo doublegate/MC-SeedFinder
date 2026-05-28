@@ -35,8 +35,8 @@ import unittest
 from mcseedfinder.structures import (
     STRUCTURE_CONFIGS,
     get_structure_pos,
-    iter_structures_in_radius,
     iter_strongholds,
+    iter_structures_in_radius,
 )
 
 

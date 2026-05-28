@@ -46,8 +46,9 @@ import multiprocessing as mp
 import os
 import random
 import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Iterator, List, Mapping, Optional
+from typing import Any
 
 from .criteria import CriteriaSet, compile_criteria
 from .rust_backend import (
@@ -56,6 +57,8 @@ from .rust_backend import (
     compile_structure_only_tree,
     find_structure_matches_range,
     find_tree_matches_range,
+)
+from .rust_backend import (
     is_available as rust_backend_available,
 )
 
@@ -70,9 +73,9 @@ class SearchPlan:
     mode: str = "sequential"            # "sequential" | "random" | "explicit"
     start_seed: int = 0
     count: int = 1_000_000
-    explicit_seeds: Optional[Iterable[int]] = None
+    explicit_seeds: Iterable[int] | None = None
     chunk_size: int = 4096              # seeds per work unit
-    random_seed: Optional[int] = None   # for reproducible random sampling
+    random_seed: int | None = None   # for reproducible random sampling
 
 
 @dataclass
@@ -86,7 +89,7 @@ class SearchConfig:
     progress_interval: float = 2.0      # seconds between progress callbacks
     # Enable the exact cubiomes biome backend in each worker. None keeps the
     # approximate fallback (e.g. for pure-structure searches or no-cubiomes builds).
-    biome_version: Optional[str] = None
+    biome_version: str | None = None
     biome_dimension: str = "overworld"
 
 
@@ -103,14 +106,14 @@ class Match:
 # --------------------------------------------------------------------------- #
 # These globals live *inside the worker process* and are populated once at
 # pool startup so we don't recompile the criteria on every chunk.
-_WORKER_CRITERIA: Optional[CriteriaSet] = None
-_WORKER_RUST_STRUCTURE_REQUIREMENTS: Optional[List[RustStructureRequirement]] = None
-_WORKER_NATIVE_TREE: Optional[Mapping[str, Any]] = None
+_WORKER_CRITERIA: CriteriaSet | None = None
+_WORKER_RUST_STRUCTURE_REQUIREMENTS: list[RustStructureRequirement] | None = None
+_WORKER_NATIVE_TREE: Mapping[str, Any] | None = None
 
 
 def _worker_init(
     criteria_spec: Mapping[str, Any],
-    biome_version: Optional[str] = None,
+    biome_version: str | None = None,
     biome_dimension: str = "overworld",
 ) -> None:
     """Pool initialiser — compile the criteria once per worker.
@@ -133,7 +136,7 @@ def _worker_init(
     _WORKER_NATIVE_TREE = compile_structure_only_tree(criteria_spec)
 
 
-def _check_chunk(seeds: List[int]) -> List[int]:
+def _check_chunk(seeds: list[int]) -> list[int]:
     """Test every seed in ``seeds`` and return those that match.
 
     Kept as a free function (not a method) so it pickles cleanly across
@@ -154,7 +157,7 @@ def _check_chunk(seeds: List[int]) -> List[int]:
     return [s for s in seeds if _WORKER_CRITERIA.matches(s)]
 
 
-def _is_contiguous(seeds: List[int]) -> bool:
+def _is_contiguous(seeds: list[int]) -> bool:
     """True when ``seeds`` is a simple sequential range."""
     return bool(seeds) and seeds[-1] - seeds[0] == len(seeds) - 1
 
@@ -164,7 +167,7 @@ def _is_contiguous(seeds: List[int]) -> bool:
 # --------------------------------------------------------------------------- #
 def run_search(
     config: SearchConfig,
-    progress_callback: Optional[Callable[[int, int, float], None]] = None,
+    progress_callback: Callable[[int, int, float], None] | None = None,
 ) -> Iterator[Match]:
     """Run the search and yield matches as they're found.
 
@@ -233,7 +236,7 @@ def run_search(
 # --------------------------------------------------------------------------- #
 # Chunk iterator — produces lists of seeds per the plan
 # --------------------------------------------------------------------------- #
-def _iter_chunks(plan: SearchPlan) -> Iterator[List[int]]:
+def _iter_chunks(plan: SearchPlan) -> Iterator[list[int]]:
     """Yield seed-chunks (lists of ints) according to the plan."""
     if plan.mode == "sequential":
         yield from _seq_chunks(plan.start_seed, plan.count, plan.chunk_size)
@@ -246,7 +249,7 @@ def _iter_chunks(plan: SearchPlan) -> Iterator[List[int]]:
         raise ValueError(f"unknown search mode {plan.mode!r}")
 
 
-def _seq_chunks(start: int, count: int, chunk_size: int) -> Iterator[List[int]]:
+def _seq_chunks(start: int, count: int, chunk_size: int) -> Iterator[list[int]]:
     """Walk ``[start, start+count)`` in chunks."""
     end = start + count
     cur = start
@@ -257,8 +260,8 @@ def _seq_chunks(start: int, count: int, chunk_size: int) -> Iterator[List[int]]:
 
 
 def _random_chunks(
-    count: int, chunk_size: int, rng_seed: Optional[int]
-) -> Iterator[List[int]]:
+    count: int, chunk_size: int, rng_seed: int | None
+) -> Iterator[list[int]]:
     """Draw ``count`` random seeds uniformly from the signed 64-bit range."""
     rng = random.Random(rng_seed)
     # Use the full signed 64-bit range — same domain Minecraft itself uses.
@@ -270,9 +273,9 @@ def _random_chunks(
         remaining -= this_chunk
 
 
-def _explicit_chunks(seeds: Iterable[int], chunk_size: int) -> Iterator[List[int]]:
+def _explicit_chunks(seeds: Iterable[int], chunk_size: int) -> Iterator[list[int]]:
     """Re-chunk an arbitrary iterable of seeds."""
-    buffer: List[int] = []
+    buffer: list[int] = []
     for s in seeds:
         buffer.append(s)
         if len(buffer) >= chunk_size:

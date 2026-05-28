@@ -13,10 +13,11 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any
 
 from .engine import SearchEvent, SearchSpec, run_staged_search
 
@@ -70,7 +71,7 @@ class JobStore:
             )
             self._conn.commit()
 
-    def create_job(self, spec: SearchSpec, job_id: Optional[str] = None) -> str:
+    def create_job(self, spec: SearchSpec, job_id: str | None = None) -> str:
         jid = job_id or str(uuid.uuid4())
         with self._lock:
             self._conn.execute(
@@ -113,10 +114,11 @@ class JobStore:
                 )
             self._conn.commit()
 
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT job_id, status, spec_json, created_at, updated_at FROM jobs WHERE job_id = ?",
+                "SELECT job_id, status, spec_json, created_at, updated_at FROM jobs "
+                "WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
         if row is None:
@@ -129,7 +131,7 @@ class JobStore:
             "updated_at": row["updated_at"],
         }
 
-    def list_events(self, job_id: str) -> List[Dict[str, Any]]:
+    def list_events(self, job_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 """
@@ -149,7 +151,7 @@ class JobStore:
             for row in rows
         ]
 
-    def list_results(self, job_id: str) -> List[Dict[str, Any]]:
+    def list_results(self, job_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT report_json FROM results WHERE job_id = ? ORDER BY id",
@@ -161,7 +163,7 @@ class JobStore:
 class LocalCommandHost:
     """Synchronous stand-in for the planned Tauri command surface."""
 
-    def __init__(self, store: Optional[JobStore] = None) -> None:
+    def __init__(self, store: JobStore | None = None) -> None:
         self.store = store or JobStore()
 
     def start_search(self, spec: SearchSpec | Mapping[str, Any]) -> str:
@@ -203,7 +205,7 @@ class LocalCommandHost:
             return "\n".join(lines)
         raise ValueError(f"unknown export format {fmt!r}")
 
-    def analyze_seed(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+    def analyze_seed(self, request: Mapping[str, Any]) -> dict[str, Any]:
         seed = int(request["seed"])
         return {
             "seed": seed,
@@ -211,14 +213,14 @@ class LocalCommandHost:
             "notes": ["full analyzer is reserved for the desktop/Rust phase"],
         }
 
-    def render_tile(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+    def render_tile(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "tile": dict(request),
             "status": "unsupported",
             "reason": "map tile rendering is not implemented in this backend yet",
         }
 
-    def import_level_dat(self, path: str | Path) -> Dict[str, Any]:
+    def import_level_dat(self, path: str | Path) -> dict[str, Any]:
         return {
             "path": str(path),
             "status": "unsupported",
@@ -231,14 +233,14 @@ class AsyncCommandHost(LocalCommandHost):
 
     def __init__(
         self,
-        store: Optional[JobStore] = None,
+        store: JobStore | None = None,
         max_workers: int = 2,
     ) -> None:
         super().__init__(store)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._futures: Dict[str, Future[None]] = {}
-        self._cancel_flags: Dict[str, threading.Event] = {}
-        self._pause_flags: Dict[str, threading.Event] = {}
+        self._futures: dict[str, Future[None]] = {}
+        self._cancel_flags: dict[str, threading.Event] = {}
+        self._pause_flags: dict[str, threading.Event] = {}
         self._jobs_lock = threading.RLock()
 
     def start_search(self, spec: SearchSpec | Mapping[str, Any]) -> str:
@@ -310,7 +312,7 @@ class AsyncCommandHost(LocalCommandHost):
         if should_mark:
             self.store.set_status(job_id, "cancelling")
 
-    def wait(self, job_id: str, timeout: Optional[float] = None) -> None:
+    def wait(self, job_id: str, timeout: float | None = None) -> None:
         with self._jobs_lock:
             future = self._futures[job_id]
         future.result(timeout=timeout)

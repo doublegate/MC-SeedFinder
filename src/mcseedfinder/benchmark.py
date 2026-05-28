@@ -7,15 +7,17 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from .criteria import compile_criteria
 from .rust_backend import (
     compile_structure_only_requirements,
     find_structure_matches_range,
+)
+from .rust_backend import (
     is_available as rust_backend_available,
 )
-
 
 DEFAULT_SPEC: Mapping[str, Any] = {
     "nearby_structures": [

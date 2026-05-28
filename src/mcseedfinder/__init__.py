@@ -20,16 +20,15 @@ See ``README.md`` in the project root for the full design discussion and
 accuracy disclaimers.
 """
 
-from .biome_gen import BiomeLookup
-from .biomes import BIOMES, BIOME_GROUPS, BiomeInfo
 from .app_contract import AsyncCommandHost, JobStore, LocalCommandHost
+from .biome_gen import BiomeLookup
+from .biomes import BIOME_GROUPS, BIOMES, BiomeInfo
 from .criteria import (
     CriteriaSet,
-    compile_criteria,
     compile_cli_criteria,
+    compile_criteria,
     load_criteria_file,
 )
-from .finder import Match, SearchConfig, SearchPlan, run_search
 from .engine import (
     BedrockProvider,
     JavaPythonProvider,
@@ -39,8 +38,9 @@ from .engine import (
     provider_for,
     run_staged_search,
 )
-from .rust_backend import is_available as rust_backend_available
+from .finder import Match, SearchConfig, SearchPlan, run_search
 from .java_random import JavaRandom
+from .rust_backend import is_available as rust_backend_available
 from .structures import (
     STRUCTURE_CONFIGS,
     SUPPORTED_STRUCTURES,

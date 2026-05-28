@@ -412,7 +412,7 @@ impl GpuSearcher {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            let groups = ((count as u32) + 63) / 64;
+            let groups = (count as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&self.out_buffer, 0, &self.staging_buffer, 0, out_byte_size);

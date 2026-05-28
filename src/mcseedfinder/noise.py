@@ -40,7 +40,6 @@ References
 from __future__ import annotations
 
 import math
-from typing import List
 
 from .java_random import JavaRandom
 
@@ -80,13 +79,13 @@ class PerlinNoise:
         # Classic Perlin 256-entry permutation, doubled for wrap-free lookup.
         # We Fisher–Yates shuffle [0..255] using the Java RNG so that the
         # permutation is fully determined by the seed.
-        base: List[int] = list(range(256))
+        base: list[int] = list(range(256))
         # Java-style Fisher–Yates: iterate top-down, swap with random earlier.
         for i in range(255, 0, -1):
             j = rng.next_int_bound(i + 1)
             base[i], base[j] = base[j], base[i]
         # Double for cheap modulo: perm[i + 256] == perm[i].
-        self.perm: List[int] = base + base
+        self.perm: list[int] = base + base
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -173,7 +172,7 @@ class OctaveNoise:
         # Derive a distinct sub-seed per octave so they don't collude.
         # next_long() gives 64 bits of entropy per octave, plenty.
         rng = JavaRandom(seed)
-        self.octaves: List[PerlinNoise] = [
+        self.octaves: list[PerlinNoise] = [
             PerlinNoise(rng.next_long()) for _ in range(octaves)
         ]
         self.persistence: float = persistence

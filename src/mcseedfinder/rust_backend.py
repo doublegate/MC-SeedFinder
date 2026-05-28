@@ -7,9 +7,9 @@ module is present, structure-only searches can use native batch filtering.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Tuple
-
+from typing import Any
 
 try:  # pragma: no cover - availability depends on build mode
     from . import _native
@@ -26,7 +26,7 @@ class RustStructureRequirement:
     centre_x: int = 0
     centre_z: int = 0
 
-    def as_tuple(self) -> Tuple[str, int, int, int]:
+    def as_tuple(self) -> tuple[str, int, int, int]:
         return (self.structure, self.max_distance, self.centre_x, self.centre_z)
 
 
@@ -50,8 +50,8 @@ def has_cubiomes() -> bool:
 def make_biome_backend(
     version: str,
     dimension: str = "overworld",
-    y: Optional[int] = None,
-) -> Optional[Any]:
+    y: int | None = None,
+) -> Any | None:
     """Construct an exact cubiomes biome backend, or ``None`` if unavailable.
 
     The returned object implements ``get_biome(world_seed, x, z) -> int`` (the
@@ -75,14 +75,14 @@ def get_structure_pos(
     world_seed: int,
     region_x: int,
     region_z: int,
-) -> Tuple[str, int, int]:
+) -> tuple[str, int, int]:
     """Return ``(structure, chunk_x, chunk_z)`` from the native backend."""
     if _native is None:
         raise RuntimeError("Rust backend is not available")
     return _native.get_structure_pos_py(structure, world_seed, region_x, region_z)
 
 
-def iter_strongholds(world_seed: int, max_rings: int = 3) -> List[Tuple[str, int, int]]:
+def iter_strongholds(world_seed: int, max_rings: int = 3) -> list[tuple[str, int, int]]:
     """Return stronghold positions from the native backend."""
     if _native is None:
         raise RuntimeError("Rust backend is not available")
@@ -93,7 +93,7 @@ def find_structure_matches_range(
     start_seed: int,
     count: int,
     requirements: Iterable[RustStructureRequirement],
-) -> List[int]:
+) -> list[int]:
     """Find seeds matching all native structure requirements."""
     if _native is None:
         raise RuntimeError("Rust backend is not available")
@@ -106,7 +106,7 @@ def find_structure_matches_range(
 
 def compile_structure_only_requirements(
     criteria_spec: Mapping[str, Any],
-) -> Optional[List[RustStructureRequirement]]:
+) -> list[RustStructureRequirement] | None:
     """Return native requirements when a criteria spec is structure-only.
 
     The native backend supports normal random-spread structures and the first
@@ -122,7 +122,7 @@ def compile_structure_only_requirements(
     if not entries:
         return None
 
-    requirements: List[RustStructureRequirement] = []
+    requirements: list[RustStructureRequirement] = []
     for entry in entries:
         structure = str(entry["structure"])
         requirements.append(
@@ -157,7 +157,7 @@ def _is_structure_only_node(node: Any) -> bool:
 
 def compile_structure_only_tree(
     criteria_spec: Mapping[str, Any],
-) -> Optional[Mapping[str, Any]]:
+) -> Mapping[str, Any] | None:
     """Return a tree dict for the native evaluator when the spec is purely
     structure-only — covering the new ``conditions`` tree and the legacy flat
     ``nearby_structures`` keys (which compile to an ``all_of`` of leaves).
@@ -175,7 +175,7 @@ def compile_structure_only_tree(
     if criteria_spec.get("nearby_biomes") is not None:
         return None
 
-    children: List[Mapping[str, Any]] = []
+    children: list[Mapping[str, Any]] = []
 
     # Flat nearby_structures → cluster of structure leaves.
     for entry in criteria_spec.get("nearby_structures") or []:
@@ -207,7 +207,7 @@ def find_tree_matches_range(
     start_seed: int,
     count: int,
     tree: Mapping[str, Any],
-) -> List[int]:
+) -> list[int]:
     """Filter ``[start_seed, start_seed+count)`` via the native tree evaluator."""
     if _native is None:
         raise RuntimeError("Rust backend is not available")

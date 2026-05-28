@@ -56,12 +56,11 @@ References
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from .java_random import JavaRandom
-
 
 # --------------------------------------------------------------------------- #
 # Region-grid multipliers — fixed Mojang constants
@@ -142,7 +141,7 @@ class StructureConfig:
 # In cubiomes the entries are ``{salt, regionSize, chunkRange, ...}``, where
 # ``chunkRange`` equals ``spacing - separation``; we store ``separation``
 # directly so it matches the wiki's terminology.
-STRUCTURE_CONFIGS: Dict[str, StructureConfig] = {
+STRUCTURE_CONFIGS: dict[str, StructureConfig] = {
     "desert_pyramid": StructureConfig(14357617, 32, 8),
     "igloo":          StructureConfig(14357618, 32, 8),
     "jungle_temple":  StructureConfig(14357619, 32, 8),
@@ -287,8 +286,8 @@ def _floordiv(a: int, b: int) -> int:
 # Stronghold rings (1.9+): 8 rings, ``count`` strongholds each, distance to
 # the closest stronghold-ring origin in blocks. Source: cubiomes
 # (``getStrongholds``) and the Minecraft Wiki stronghold article.
-_STRONGHOLD_RING_COUNTS: List[int] = [3, 6, 10, 15, 21, 28, 36, 9]
-_STRONGHOLD_RING_DISTANCES: List[Tuple[int, int]] = [
+_STRONGHOLD_RING_COUNTS: list[int] = [3, 6, 10, 15, 21, 28, 36, 9]
+_STRONGHOLD_RING_DISTANCES: list[tuple[int, int]] = [
     (1280, 2816),
     (4352, 5888),
     (7424, 8960),
@@ -331,7 +330,7 @@ def iter_strongholds(
         d_min, d_max = _STRONGHOLD_RING_DISTANCES[ring_idx]
         # Each stronghold in the ring is placed at angle + k*(2π/count) plus
         # a small per-stronghold jitter consumed from the same RNG.
-        for k in range(count):
+        for _k in range(count):
             distance = d_min + rng.next_double() * (d_max - d_min)
             # The block X/Z come from the polar position. Java's source
             # rounds to chunk centres.
@@ -349,7 +348,7 @@ def iter_strongholds(
 # --------------------------------------------------------------------------- #
 # Public registry of available structure names
 # --------------------------------------------------------------------------- #
-SUPPORTED_STRUCTURES: FrozenSet[str] = frozenset(
+SUPPORTED_STRUCTURES: frozenset[str] = frozenset(
     list(STRUCTURE_CONFIGS) + ["stronghold"]
 )
 
@@ -364,7 +363,7 @@ if __name__ == "__main__":  # pragma: no cover
     print(f"Structures near origin for seed {seed} (MC 1.18+):")
     for s in ("village", "swamp_hut", "desert_pyramid", "shipwreck",
               "ocean_monument", "pillager_outpost"):
-        nearest: Optional[StructurePos] = None
+        nearest: StructurePos | None = None
         for pos in iter_structures_in_radius(s, seed, 0, 0, 5000):
             if nearest is None or pos.distance_to(0, 0) < nearest.distance_to(0, 0):
                 nearest = pos

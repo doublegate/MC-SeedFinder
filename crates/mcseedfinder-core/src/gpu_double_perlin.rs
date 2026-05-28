@@ -390,7 +390,7 @@ impl GpuDoublePerlin {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            let groups = ((coords.len() as u32) + 63) / 64;
+            let groups = (coords.len() as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
@@ -469,7 +469,7 @@ mod tests {
             [10.0, 0.0, -10.0],
             [0.5, 0.0, 0.5],
             [127.5, 0.0, 127.5],
-            [3.14159, 0.0, 2.71828],
+            [3.15, 0.0, 2.72],
             [-1000.0, 0.0, 1000.0],
         ];
         let gpu_results = gpu.sample_batch(&spec, &coords).expect("gpu dispatch");
