@@ -7,6 +7,19 @@ and uses semantic versioning while the public API settles.
 
 ## [Unreleased]
 
+### Changed
+
+- **Design polish pass (Phase 4b-7).** Complete styles refresh moving the
+  desktop to a refined dark editorial theme: high-contrast charcoal-green
+  surfaces so the cubiomes biome map carries the visual weight, a single
+  accent colour (cubiomes-leaf green) used sparingly for primary actions
+  and active state, a consistent 6/10/14/20-px spacing scale, tabular
+  numerals in the status bar so digit changes don't jitter the layout, and
+  pin/spawn glyphs that read clearly on the dark map. Removed the three
+  non-functional inspector tabs (Finder/Results/Analyzer) and added an
+  inline body background to index.html so the dark surface paints before
+  the bundle loads — no white flash on app launch.
+
 ### Added
 
 - **Share links + tile screenshot export (Phase 4b-6).** New "Share" panel

@@ -3,7 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>mcseedfinder</title>
+    <style>
+      /* Inline so the dark background paints before the bundle loads — no
+         white flash on app launch. */
+      html, body { background: #0f1612; color: #e8ede4; margin: 0; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

@@ -573,11 +573,6 @@ function App() {
       </section>
 
       <aside className="inspector">
-        <div className="tabs">
-          <button className="active">Finder</button>
-          <button>Results</button>
-          <button>Analyzer</button>
-        </div>
         <section className="panel">
           <h2>Live Results ({results.length})</h2>
           <div className="resultList">
