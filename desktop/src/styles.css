@@ -528,7 +528,7 @@ textarea {
 
 .mapContent {
   position: absolute;
-  inset: 0;
+  /* top/left/width/height set by main.tsx (drives the OVERSCAN factor). */
   will-change: transform;
 }
 

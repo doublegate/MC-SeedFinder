@@ -70,6 +70,14 @@ type StructurePin = {
 const TILE_MAX_PX = 1024;
 const TILE_MIN_PX = 64;
 
+// Over-render the tile slightly past the visible pane on each side. Lets a
+// drag-pan reveal already-rendered map content instead of black margins;
+// refetches with a new centre only on pointer-up. 1.5 means 25% over-render
+// per side — the user can drag ~25% of the pane before exposing black.
+const OVERSCAN = 1.5;
+// Inset of the over-rendered tile so its centre sits at the pane centre.
+const OVERSCAN_INSET_PCT = (1 - OVERSCAN) * 50;
+
 /** Pick tile dimensions that match the pane's aspect ratio, capped at TILE_MAX_PX
  *  along the longer axis. Caller multiplies by `scale` to get block coverage. */
 function tileSizeForPane(w: number, h: number): { sx: number; sz: number } {
@@ -402,7 +410,12 @@ function App() {
       setPins([]);
       return;
     }
-    const { sx, sz } = tileSizeForPane(paneSize.w, paneSize.h);
+    // Request a tile larger than the visible pane (over-render) so a
+    // drag-pan reveals already-loaded content instead of black margins.
+    const { sx, sz } = tileSizeForPane(
+      paneSize.w * OVERSCAN,
+      paneSize.h * OVERSCAN,
+    );
     const tileSpanX = sx * scale;
     const tileSpanZ = sz * scale;
     const tileX = viewCenter.x - Math.round(tileSpanX / 2);
@@ -476,12 +489,16 @@ function App() {
       if (pane && tile && (drag.dx !== 0 || drag.dz !== 0)) {
         const rect = pane.getBoundingClientRect();
         // Drag right → reveal LEFT of world → centre.x decreases.
-        // Use the actual tile's block coverage per axis (sx/sz can differ now
-        // that tiles match the pane's aspect ratio).
+        // The tile is rendered into a CSS box `OVERSCAN ×` the pane on each
+        // axis, so divide by `rect.{width,height} * OVERSCAN` to convert
+        // a pane-pixel drag into a fraction of the tile, then multiply by
+        // the tile's per-axis block coverage.
         const blockSpanX = tile.sx * tile.scale;
         const blockSpanZ = tile.sz * tile.scale;
-        const blockDx = (-drag.dx / rect.width) * blockSpanX;
-        const blockDz = (-drag.dz / rect.height) * blockSpanZ;
+        const tileCssW = rect.width * OVERSCAN;
+        const tileCssH = rect.height * OVERSCAN;
+        const blockDx = (-drag.dx / tileCssW) * blockSpanX;
+        const blockDz = (-drag.dz / tileCssH) * blockSpanZ;
         setViewCenter((c) => ({
           x: Math.round(c.x + blockDx),
           z: Math.round(c.z + blockDz),
@@ -593,6 +610,13 @@ function App() {
               <div
                 className="mapContent"
                 style={{
+                  // Over-rendered tile: 150% of the pane, inset by -25% on
+                  // each side so its centre aligns with the pane centre.
+                  // Drag's CSS translate stacks on top of the static inset.
+                  top: `${OVERSCAN_INSET_PCT}%`,
+                  left: `${OVERSCAN_INSET_PCT}%`,
+                  width: `${OVERSCAN * 100}%`,
+                  height: `${OVERSCAN * 100}%`,
                   transform: drag ? `translate(${drag.dx}px, ${drag.dz}px)` : undefined,
                 }}
               >
