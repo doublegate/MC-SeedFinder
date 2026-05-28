@@ -11,7 +11,7 @@
 //! the biome check.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -24,7 +24,7 @@ use uuid::Uuid;
 // it just looks unusual in `use` paths.
 use _native::biomes::{BiomeBackend, DEFAULT_Y};
 use _native::conditions::{self, CompiledNode, Node};
-use _native::gpu::GpuSearcher;
+use _native::gpu::{Combinator, GpuPredicate, GpuSearchSpec, GpuSearcher, MAX_PREDICATES};
 use _native::structures::{
     iter_strongholds, iter_structures_in_radius, StructureRequirement, StructureType,
 };
@@ -94,6 +94,16 @@ struct AppState {
     /// rapidly panning or clicking between matches. The pool amortises that
     /// cost to one-time-per-(version,dimension).
     biome_pool: Mutex<HashMap<(String, String), Vec<BiomeBackend>>>,
+    /// Per-kind monotonic request counters. Each command claims a sequence
+    /// number on entry; if a newer request bumps the counter past that
+    /// sequence number before the command finishes its expensive work, it
+    /// bails out early. Net effect: rapid pan/click only does the LATEST
+    /// request's work, even though every click already issued an invoke.
+    /// Each kind has its own counter so unrelated commands don't cancel
+    /// each other (a fresh tile fetch shouldn't kill a still-running analyze).
+    tile_counter: AtomicU64,
+    pins_counter: AtomicU64,
+    analyze_counter: AtomicU64,
 }
 
 /// Maximum cached BiomeBackends per (version, dimension). Concurrent tile
@@ -135,28 +145,104 @@ fn release_biome_backend(state: &AppState, version: &str, dimension: &str, backe
     }
 }
 
+/// Sentinel string a command returns when it's been superseded by a newer
+/// request of the same kind. React-side handlers silently ignore promise
+/// rejections matching this so the UI doesn't render a spurious error.
+const SUPERSEDED: &str = "superseded";
+
+/// True iff the counter has advanced past `my_seq` since this request started
+/// — meaning a newer request is on the way and our work would be thrown out
+/// anyway. Cheap (one relaxed atomic load). Call at every checkpoint a slow
+/// step could be skipped: backend acquire, pre-cubiomes, post-cubiomes.
+fn superseded(counter: &AtomicU64, my_seq: u64) -> bool {
+    counter.load(Ordering::Relaxed) > my_seq
+}
+
 #[derive(Default)]
 struct JobInner {
     results: Vec<SeedReport>,
     cancel: Arc<AtomicBool>,
 }
 
-/// If the compiled tree boils down to a single `NearbyStructure` predicate
-/// (possibly nested inside single-child groups, which is how the React tree
-/// builder represents a basic spec), return its requirement so the GPU
-/// prefilter can take the search. Returns `None` for clusters, multi-leaf
-/// groups, biome leaves, or stronghold (different RNG path).
-fn try_extract_single_nearby(node: &CompiledNode) -> Option<StructureRequirement> {
+/// Translate a [`StructureRequirement`] into the GPU predicate shape.
+/// Returns None for strongholds (different RNG path; not supported by the
+/// kernel) or for an invalid (negative) max_distance.
+fn req_to_predicate(req: &StructureRequirement) -> Option<GpuPredicate> {
+    if req.structure == StructureType::Stronghold || req.max_distance < 0 {
+        return None;
+    }
+    Some(GpuPredicate {
+        structure: req.structure,
+        max_distance: req.max_distance,
+        centre_x: req.centre_x,
+        centre_z: req.centre_z,
+    })
+}
+
+/// Detect whether a compiled conditions tree is structure-only and shaped
+/// such that the multi-predicate GPU kernel can evaluate it. Recognises:
+///   - single `NearbyStructure` (possibly wrapped in single-child groups)
+///     → any_of with 1 predicate
+///   - `Cluster` → cluster combinator
+///   - `AllOf` of N `NearbyStructure` leaves (N ≤ MAX_PREDICATES)
+///   - `AnyOf` of N `NearbyStructure` leaves (N ≤ MAX_PREDICATES)
+/// Anything else returns None and the search stays on the CPU path.
+fn try_extract_gpu_spec(node: &CompiledNode) -> Option<(Combinator, Vec<GpuPredicate>)> {
     match node {
-        CompiledNode::Nearby(req) => {
-            if req.structure == StructureType::Stronghold {
-                None
-            } else {
-                Some(req.clone())
+        CompiledNode::Nearby(req) => Some((Combinator::AnyOf, vec![req_to_predicate(req)?])),
+        CompiledNode::Cluster {
+            structures,
+            max_distance,
+            min_count,
+            centre_x,
+            centre_z,
+        } => {
+            if *max_distance < 0 || structures.is_empty() || structures.len() > MAX_PREDICATES {
+                return None;
             }
+            // Any stronghold disqualifies — not supported by the kernel.
+            if structures.iter().any(|s| *s == StructureType::Stronghold) {
+                return None;
+            }
+            let preds: Vec<GpuPredicate> = structures
+                .iter()
+                .map(|s| GpuPredicate {
+                    structure: *s,
+                    max_distance: *max_distance,
+                    centre_x: *centre_x,
+                    centre_z: *centre_z,
+                })
+                .collect();
+            Some((
+                Combinator::Cluster {
+                    min_count: *min_count,
+                },
+                preds,
+            ))
         }
-        CompiledNode::AllOf(children) | CompiledNode::AnyOf(children) if children.len() == 1 => {
-            try_extract_single_nearby(&children[0])
+        CompiledNode::AllOf(children) | CompiledNode::AnyOf(children) => {
+            if children.len() == 1 {
+                // Group wrapping one leaf; recurse so groups-around-clusters
+                // also qualify.
+                return try_extract_gpu_spec(&children[0]);
+            }
+            if children.is_empty() || children.len() > MAX_PREDICATES {
+                return None;
+            }
+            // All children must be NearbyStructure leaves (the GPU kernel
+            // doesn't support nested groups or clusters as predicates).
+            let mut preds: Vec<GpuPredicate> = Vec::with_capacity(children.len());
+            for c in children {
+                match c {
+                    CompiledNode::Nearby(req) => preds.push(req_to_predicate(req)?),
+                    _ => return None,
+                }
+            }
+            let comb = match node {
+                CompiledNode::AllOf(_) => Combinator::AllOf,
+                _ => Combinator::AnyOf,
+            };
+            Some((comb, preds))
         }
         _ => None,
     }
@@ -314,13 +400,14 @@ fn run_search_gpu(
     app: &AppHandle,
     job_id: &str,
     spec: &SearchSpec,
-    req: &StructureRequirement,
+    combinator: Combinator,
+    predicates: &[GpuPredicate],
     searcher: &GpuSearcher,
     cancel: &AtomicBool,
 ) {
     // 65k seeds per dispatch ≈ a few tens of ms on a modern GPU — small enough
     // for snappy cancellation, large enough that the per-dispatch overhead
-    // (uniform/buffer create + map_async) stays a small fraction of GPU time.
+    // (uniform write + map_async + poll) stays a small fraction of GPU time.
     const CHUNK: u64 = 65_536;
     let mut scanned: u64 = 0;
     let mut matches: u64 = 0;
@@ -332,14 +419,12 @@ fn run_search_gpu(
         }
         let this_chunk = CHUNK.min(spec.count - scanned);
         let chunk_start = spec.start_seed.wrapping_add(scanned as i64);
-        let chunk_matches = match searcher.find_nearby_structure_matches(
-            chunk_start,
-            this_chunk,
-            req.structure,
-            req.max_distance,
-            req.centre_x,
-            req.centre_z,
-        ) {
+        let chunk_matches = match searcher.find_matches(&GpuSearchSpec {
+            start_seed: chunk_start,
+            count: this_chunk,
+            combinator,
+            predicates,
+        }) {
             Ok(v) => v,
             Err(e) => {
                 emit_completed(
@@ -414,13 +499,21 @@ fn run_search(
     // the fast CPU path.
     const GPU_MIN_COUNT: u64 = 500_000;
     if spec.count >= GPU_MIN_COUNT && !conditions::has_biome_leaves(&compiled) {
-        if let Some(req) = try_extract_single_nearby(&compiled) {
+        if let Some((combinator, predicates)) = try_extract_gpu_spec(&compiled) {
             let state = app.try_state::<AppState>();
             let searcher = state
                 .as_ref()
                 .and_then(|s| s.gpu.get_or_init(GpuSearcher::try_new).as_ref());
             if let Some(searcher) = searcher {
-                run_search_gpu(&app, &job_id, &spec, &req, searcher, &cancel);
+                run_search_gpu(
+                    &app,
+                    &job_id,
+                    &spec,
+                    combinator,
+                    &predicates,
+                    searcher,
+                    &cancel,
+                );
                 return;
             }
         }
@@ -551,12 +644,20 @@ fn analyze_seed(
     dimension: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let my_seq = state.analyze_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.analyze_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
     let version = version.unwrap_or_else(|| "1.21".to_string());
     let dimension = dimension.unwrap_or_else(|| "overworld".to_string());
 
     // Pool-acquired backend — avoids the heavy setupGenerator call per analyze
     // when the user clicks through many results in a row.
     let mut backend = acquire_biome_backend(&state, &version, &dimension)?;
+    if superseded(&state.analyze_counter, my_seq) {
+        release_biome_backend(&state, &version, &dimension, backend);
+        return Err(SUPERSEDED.into());
+    }
     let origin_biome = backend.get_biome(seed, 0, 0);
 
     // Nearest village (block coords + distance), iter exact placements within 8000.
@@ -636,11 +737,24 @@ fn render_tile(
     request: TileRequest,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    // Claim the latest sequence number for the "tile" kind. Any earlier tile
+    // request that hasn't reached an expensive step yet will see the bumped
+    // counter and bail out. Cancellation is "best effort" — we can't
+    // interrupt cubiomes mid-call (it's a single C function), so the check
+    // points are: before backend acquire, before the cubiomes fill, and after.
+    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+
     // Pool-acquired backend — avoids re-running cubiomes' setupGenerator on
-    // every tile (which was the main source of the multi-second pauses when
-    // panning rapidly or clicking through matches). Each request typically
-    // hits the pool and runs in tens of ms instead of hundreds.
+    // every tile.
     let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
+    if superseded(&state.tile_counter, my_seq) {
+        release_biome_backend(&state, &request.version, &request.dimension, backend);
+        return Err(SUPERSEDED.into());
+    }
+
     let png_b64 = backend.render_tile_base64(
         request.seed,
         request.scale,
@@ -651,7 +765,12 @@ fn render_tile(
     );
     let version = request.version.clone();
     let dimension = request.dimension.clone();
-    let result = png_b64.map(|png| {
+    release_biome_backend(&state, &version, &dimension, backend);
+
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    png_b64.map(|png| {
         serde_json::json!({
             "png_base64": png,
             "seed": request.seed,
@@ -663,9 +782,7 @@ fn render_tile(
             "sx": request.sx,
             "sz": request.sz,
         })
-    });
-    release_biome_backend(&state, &version, &dimension, backend);
-    result
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -690,7 +807,12 @@ struct StructurePinOut {
 #[tauri::command]
 fn list_structures_in_view(
     request: StructuresInViewRequest,
+    state: State<'_, AppState>,
 ) -> Result<Vec<StructurePinOut>, String> {
+    let my_seq = state.pins_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.pins_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
     // Use the diagonal as a generous search radius around the view centre so
     // we don't miss placements that just barely overlap the rectangle.
     let centre_x = request.x + (request.sx as i32) / 2;
@@ -700,6 +822,9 @@ fn list_structures_in_view(
 
     let mut out: Vec<StructurePinOut> = Vec::new();
     for name in &request.structures {
+        if superseded(&state.pins_counter, my_seq) {
+            return Err(SUPERSEDED.into());
+        }
         let kind =
             StructureType::from_name(name).ok_or_else(|| format!("unknown structure {name:?}"))?;
         if kind == StructureType::Stronghold {

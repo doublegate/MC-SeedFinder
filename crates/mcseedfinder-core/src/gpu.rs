@@ -1,17 +1,19 @@
-//! wgpu compute prefilter for the structure-RNG hot path.
+//! wgpu compute prefilter for the structure-only conditions tree.
 //!
-//! Phase 6 ships GPU acceleration for the most common case — a single
-//! `NearbyStructure` predicate — dispatched in parallel over a contiguous
-//! seed range. The WGSL kernel (`gpu.wgsl`) implements Java's 48-bit LCG and
-//! the structure placement step bit-identically to the CPU code in
-//! `java_random.rs` / `structures.rs`; a parity test below dispatches a
-//! moderate seed range on both paths and asserts identical match lists.
+//! Phase 6b generalises the v1 kernel: instead of a single `NearbyStructure`,
+//! it now takes up to 8 predicates plus a combinator (any_of / all_of /
+//! cluster), so the GPU also handles:
+//!   - Cluster searches (quad-hut style).
+//!   - `all_of` / `any_of` groups of `NearbyStructure` leaves.
+//! The WGSL kernel (`gpu.wgsl`) implements Java's 48-bit LCG and the
+//! structure placement step bit-identically to the CPU code; the parity
+//! tests below dispatch GPU + CPU side by side and assert identical match
+//! lists for each combinator.
 //!
 //! Init is async (wgpu's `request_adapter` is async); we drive it with
 //! `pollster::block_on` so the rest of the code stays synchronous. If no
-//! adapter is available (headless CI, no Vulkan/Metal/DX12 driver), `new`
-//! returns `None` and the caller falls back to the CPU path. Same shape
-//! covers older GPUs that fail pipeline creation.
+//! adapter is available, `try_new` returns `None` and callers fall back to
+//! the CPU evaluator.
 
 #![cfg(feature = "gpu")]
 
@@ -29,54 +31,148 @@ fn i64_to_limbs(v: i64) -> (u32, u32) {
     (u as u32, (u >> 32) as u32)
 }
 
-/// Uniform layout — must match the WGSL `SearchParams` struct exactly. The
-/// `#[repr(C)]` + explicit ordering + 16-byte alignment make the wgpu uniform
-/// buffer happy without padding shenanigans.
+/// Maximum predicates the kernel supports. Matches the array length in
+/// `gpu.wgsl`. Increasing it grows the uniform buffer linearly.
+pub const MAX_PREDICATES: usize = 8;
+
+/// What kind of structure-only predicate the GPU is being asked to evaluate.
+#[derive(Debug, Clone, Copy)]
+pub enum Combinator {
+    /// Match if ≥1 predicate has any hit. `min_count` ignored.
+    AnyOf,
+    /// Match iff EVERY predicate has at least one hit.
+    AllOf,
+    /// Match iff the total hit count across all predicates ≥ `min_count`.
+    /// This is the quad-hut shape: same structures, common centre, threshold.
+    Cluster { min_count: u32 },
+}
+
+/// One element of the predicate list. Independently scoped:
+/// `(structure, centre, max_distance)` triple.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuPredicate {
+    pub structure: StructureType,
+    pub max_distance: i32,
+    pub centre_x: i32,
+    pub centre_z: i32,
+}
+
+/// Full host-side specification. Translated into the uniform layout below.
+#[derive(Debug, Clone)]
+pub struct GpuSearchSpec<'a> {
+    pub start_seed: i64,
+    pub count: u64,
+    pub combinator: Combinator,
+    pub predicates: &'a [GpuPredicate],
+}
+
+// ---------------------------------------------------------------------------
+// Uniform layout — must match `gpu.wgsl` exactly.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct PredicateUniform {
+    salt_lo: u32,
+    salt_hi: u32,
+    spacing: i32,
+    chunk_range: u32,
+    spread_type: u32,
+    centre_x: i32,
+    centre_z: i32,
+    rx_min: i32,
+    rx_max: i32,
+    rz_min: i32,
+    rz_max: i32,
+    max_dist_sq_lo: u32,
+    max_dist_sq_hi: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct SearchParamsUniform {
     start_seed_lo: u32,
     start_seed_hi: u32,
     count: u32,
-    spread_type: u32,
-    salt_lo: u32,
-    salt_hi: u32,
-    spacing: i32,
-    chunk_range: u32,
-    rx_min: i32,
-    rx_max: i32,
-    rz_min: i32,
-    rz_max: i32,
-    centre_x: i32,
-    centre_z: i32,
+    combinator: u32,
+    num_predicates: u32,
+    min_count: u32,
     region_mul_x_lo: u32,
     region_mul_x_hi: u32,
     region_mul_z_lo: u32,
     region_mul_z_hi: u32,
-    max_dist_sq_lo: u32,
-    max_dist_sq_hi: u32,
-    // Pad up to a 16-byte multiple to keep wgpu's strict uniform layout happy.
     _pad0: u32,
     _pad1: u32,
+    predicates: [PredicateUniform; MAX_PREDICATES],
 }
 
-/// One dispatch is bounded to `MAX_SEEDS_PER_DISPATCH` so we never blow past
-/// the typical 128 MiB storage-buffer limit on modest adapters. Callers loop.
+impl PredicateUniform {
+    /// Build the per-predicate uniform from a host-side `GpuPredicate`,
+    /// computing the region scan bounds the same way the CPU helpers do.
+    fn from_predicate(p: &GpuPredicate) -> Result<Self, &'static str> {
+        if p.structure == StructureType::Stronghold {
+            return Err(
+                "strongholds use iter_strongholds; GPU path is for random-spread structures",
+            );
+        }
+        if p.max_distance < 0 {
+            return Err("max_distance must be non-negative");
+        }
+        let cfg = structure_config(p.structure);
+        let chunk_radius = p.max_distance / 16 + 1;
+        let cx_chunk = p.centre_x.div_euclid(16);
+        let cz_chunk = p.centre_z.div_euclid(16);
+        let cx_min = cx_chunk - chunk_radius;
+        let cx_max = cx_chunk + chunk_radius;
+        let cz_min = cz_chunk - chunk_radius;
+        let cz_max = cz_chunk + chunk_radius;
+        let rx_min = cx_min.div_euclid(cfg.spacing);
+        let rx_max = cx_max.div_euclid(cfg.spacing);
+        let rz_min = cz_min.div_euclid(cfg.spacing);
+        let rz_max = cz_max.div_euclid(cfg.spacing);
+
+        let (salt_lo, salt_hi) = i64_to_limbs(cfg.salt);
+        let max_dist_sq: u64 = (p.max_distance as u64) * (p.max_distance as u64);
+
+        Ok(Self {
+            salt_lo,
+            salt_hi,
+            spacing: cfg.spacing,
+            chunk_range: cfg.chunk_range() as u32,
+            spread_type: match cfg.spread_type {
+                SpreadType::Linear => 0,
+                SpreadType::Triangular => 1,
+            },
+            centre_x: p.centre_x,
+            centre_z: p.centre_z,
+            rx_min,
+            rx_max,
+            rz_min,
+            rz_max,
+            max_dist_sq_lo: max_dist_sq as u32,
+            max_dist_sq_hi: (max_dist_sq >> 32) as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        })
+    }
+}
+
+/// One dispatch is bounded so we never blow past the typical 128 MiB storage
+/// limit on modest adapters. Callers loop until `spec.count` is exhausted.
 const MAX_SEEDS_PER_DISPATCH: u32 = 1_000_000;
 
-/// Persistent GPU resources. Initialise once per process and reuse.
-///
-/// In v1 every dispatch allocated fresh params/output/staging buffers and a
-/// fresh bind group. That per-dispatch churn was a large fraction of the
-/// total GPU time (wgpu's docs explicitly call this out as the most common
-/// performance mistake in compute pipelines). v2 pre-allocates a single set
-/// of buffers sized for the max chunk and reuses them across dispatches;
-/// per-dispatch we only `queue.write_buffer` the small (88-byte) uniform.
+// ---------------------------------------------------------------------------
+// Searcher (persistent buffers + bind group across dispatches)
+// ---------------------------------------------------------------------------
+
 pub struct GpuSearcher {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
-    /// Persistent buffers + bind group reused across dispatches.
     params_buffer: wgpu::Buffer,
     out_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
@@ -90,8 +186,6 @@ impl std::fmt::Debug for GpuSearcher {
 }
 
 impl GpuSearcher {
-    /// Try to initialise wgpu. Returns `None` if no compatible adapter is
-    /// reachable or pipeline creation fails — callers fall back to CPU.
     pub fn try_new() -> Option<Self> {
         pollster::block_on(Self::async_new()).ok()
     }
@@ -118,7 +212,7 @@ impl GpuSearcher {
                     required_limits: wgpu::Limits::downlevel_defaults(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
-                None, // optional trace path (debug only)
+                None,
             )
             .await
             .map_err(|_| "failed to acquire wgpu device")?;
@@ -169,10 +263,6 @@ impl GpuSearcher {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        // Persistent buffers sized for the maximum chunk. Per-dispatch we only
-        // queue.write_buffer the small uniform; the output + staging buffers
-        // are reused. Bind group is built once because all bindings point at
-        // these stable buffers.
         let params_size = std::mem::size_of::<SearchParamsUniform>() as wgpu::BufferAddress;
         let out_size = (MAX_SEEDS_PER_DISPATCH as wgpu::BufferAddress) * 4;
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -219,81 +309,53 @@ impl GpuSearcher {
         })
     }
 
-    /// Run the GPU prefilter for "structure within `max_distance` blocks of
-    /// `(centre_x, centre_z)`" across `[start_seed, start_seed + count)`.
-    /// Returns the matching seeds in ascending order. Strongholds are out of
-    /// scope (they use a different RNG path) — caller must filter those out.
-    pub fn find_nearby_structure_matches(
-        &self,
-        start_seed: i64,
-        count: u64,
-        structure: StructureType,
-        max_distance: i32,
-        centre_x: i32,
-        centre_z: i32,
-    ) -> Result<Vec<i64>, &'static str> {
-        if structure == StructureType::Stronghold {
-            return Err("strongholds use iter_strongholds, not the GPU prefilter");
+    /// Generic find: runs the multi-predicate kernel and returns matches in
+    /// ascending seed order. Handles any combinator the kernel knows.
+    pub fn find_matches(&self, spec: &GpuSearchSpec<'_>) -> Result<Vec<i64>, &'static str> {
+        if spec.predicates.is_empty() {
+            return Err("at least one predicate required");
         }
-        if max_distance < 0 {
-            return Err("max_distance must be non-negative");
+        if spec.predicates.len() > MAX_PREDICATES {
+            return Err("too many predicates for the GPU kernel");
         }
-        if count == 0 {
+        if spec.count == 0 {
             return Ok(Vec::new());
         }
 
-        let cfg = structure_config(structure);
-        // Region scan bounds mirror has_structure_in_radius's region walk.
-        let chunk_radius = max_distance / 16 + 1;
-        let cx_chunk = centre_x.div_euclid(16);
-        let cz_chunk = centre_z.div_euclid(16);
-        let cx_min = cx_chunk - chunk_radius;
-        let cx_max = cx_chunk + chunk_radius;
-        let cz_min = cz_chunk - chunk_radius;
-        let cz_max = cz_chunk + chunk_radius;
-        let rx_min = cx_min.div_euclid(cfg.spacing);
-        let rx_max = cx_max.div_euclid(cfg.spacing);
-        let rz_min = cz_min.div_euclid(cfg.spacing);
-        let rz_max = cz_max.div_euclid(cfg.spacing);
-
-        let (salt_lo, salt_hi) = i64_to_limbs(cfg.salt);
+        // Pre-build predicate uniforms once (shared across all dispatches).
+        let mut predicates_arr = [PredicateUniform::default(); MAX_PREDICATES];
+        for (i, p) in spec.predicates.iter().enumerate() {
+            predicates_arr[i] = PredicateUniform::from_predicate(p)?;
+        }
+        let (combinator, min_count) = match spec.combinator {
+            Combinator::AnyOf => (0, 1),
+            Combinator::AllOf => (1, 1),
+            Combinator::Cluster { min_count } => (2, min_count.max(1)),
+        };
         let (rmx_lo, rmx_hi) = i64_to_limbs(REGION_MUL_X);
         let (rmz_lo, rmz_hi) = i64_to_limbs(REGION_MUL_Z);
-        let max_dist_sq: u64 = (max_distance as u64) * (max_distance as u64);
 
         let mut matches: Vec<i64> = Vec::new();
         let mut offset: u64 = 0;
-        while offset < count {
-            let this_count = ((count - offset).min(MAX_SEEDS_PER_DISPATCH as u64)) as u32;
-            let chunk_start = start_seed.wrapping_add(offset as i64);
+        while offset < spec.count {
+            let this_count = ((spec.count - offset).min(MAX_SEEDS_PER_DISPATCH as u64)) as u32;
+            let chunk_start = spec.start_seed.wrapping_add(offset as i64);
             let (ss_lo, ss_hi) = i64_to_limbs(chunk_start);
 
             let params = SearchParamsUniform {
                 start_seed_lo: ss_lo,
                 start_seed_hi: ss_hi,
                 count: this_count,
-                spread_type: match cfg.spread_type {
-                    SpreadType::Linear => 0,
-                    SpreadType::Triangular => 1,
-                },
-                salt_lo,
-                salt_hi,
-                spacing: cfg.spacing,
-                chunk_range: cfg.chunk_range() as u32,
-                rx_min,
-                rx_max,
-                rz_min,
-                rz_max,
-                centre_x,
-                centre_z,
+                combinator,
+                num_predicates: spec.predicates.len() as u32,
+                min_count,
                 region_mul_x_lo: rmx_lo,
                 region_mul_x_hi: rmx_hi,
                 region_mul_z_lo: rmz_lo,
                 region_mul_z_hi: rmz_hi,
-                max_dist_sq_lo: max_dist_sq as u32,
-                max_dist_sq_hi: (max_dist_sq >> 32) as u32,
                 _pad0: 0,
                 _pad1: 0,
+                predicates: predicates_arr,
             };
             let chunk_matches = self.dispatch_one(&params)?;
             matches.extend(
@@ -306,15 +368,35 @@ impl GpuSearcher {
         Ok(matches)
     }
 
-    /// Drive one dispatch end-to-end using the persistent buffers + bind
-    /// group. Only the small uniform is uploaded per call; output/staging
-    /// are reused across dispatches.
+    /// Convenience wrapper preserving the v1 API for callers that only need a
+    /// single `NearbyStructure` predicate (any_of of size 1).
+    pub fn find_nearby_structure_matches(
+        &self,
+        start_seed: i64,
+        count: u64,
+        structure: StructureType,
+        max_distance: i32,
+        centre_x: i32,
+        centre_z: i32,
+    ) -> Result<Vec<i64>, &'static str> {
+        let preds = [GpuPredicate {
+            structure,
+            max_distance,
+            centre_x,
+            centre_z,
+        }];
+        self.find_matches(&GpuSearchSpec {
+            start_seed,
+            count,
+            combinator: Combinator::AnyOf,
+            predicates: &preds,
+        })
+    }
+
     fn dispatch_one(&self, params: &SearchParamsUniform) -> Result<Vec<u32>, &'static str> {
         let count = params.count as u64;
-        let out_byte_size = count * 4; // u32 per seed
+        let out_byte_size = count * 4;
 
-        // Upload the per-dispatch uniform. (wgpu's queue.write_buffer is the
-        // standard path for small/frequent uploads.)
         self.queue
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
 
@@ -330,24 +412,17 @@ impl GpuSearcher {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            // workgroup_size in WGSL is 64; dispatch ceil(count/64) workgroups.
             let groups = ((count as u32) + 63) / 64;
             pass.dispatch_workgroups(groups, 1, 1);
         }
-        // Copy only the live portion (count u32s) — staging is sized for max
-        // chunk but the trailing slots aren't meaningful for this dispatch.
         encoder.copy_buffer_to_buffer(&self.out_buffer, 0, &self.staging_buffer, 0, out_byte_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Read back. wgpu's map API is async; pollster blocks the calling thread.
         let slice = self.staging_buffer.slice(..out_byte_size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        // Drive the device until the map completes. wgpu 23's poll returns
-        // MaintainResult (not Result) — discard it; the actual signal that
-        // the buffer is ready comes through the map_async callback channel.
         let _ = self.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .map_err(|_| "wgpu map channel closed")?
@@ -361,7 +436,6 @@ impl GpuSearcher {
             .filter_map(|(i, &v)| if v != 0 { Some(i as u32) } else { None })
             .collect();
         drop(data);
-        // Unmap so the staging buffer can be re-bound for the next dispatch.
         self.staging_buffer.unmap();
         Ok(matches)
     }
@@ -370,71 +444,34 @@ impl GpuSearcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conditions::{compile, CompiledNode, Node};
     use crate::structures::{has_structure_in_radius, StructureRequirement};
 
-    /// The reason this whole file exists: GPU output must match CPU output
-    /// bit-for-bit. If parity fails this test surfaces it loudly with the
-    /// disagreeing seeds. Skipped automatically on hosts without a GPU.
+    fn make_searcher() -> Option<GpuSearcher> {
+        let s = GpuSearcher::try_new();
+        if s.is_none() {
+            eprintln!("skipping: no GPU adapter on this host");
+        }
+        s
+    }
+
+    // ---------- v1 parity: single NearbyStructure ----------
+
     #[test]
     fn gpu_matches_cpu_for_village_within_1000() {
-        let Some(searcher) = GpuSearcher::try_new() else {
-            eprintln!("skipping: no GPU adapter on this host");
+        let Some(searcher) = make_searcher() else {
             return;
         };
-
-        let start: i64 = 1;
-        let count: u64 = 2_000;
         let req = StructureRequirement {
             structure: StructureType::Village,
             max_distance: 1000,
             centre_x: 0,
             centre_z: 0,
         };
-
-        let gpu_matches = searcher
-            .find_nearby_structure_matches(
-                start,
-                count,
-                req.structure,
-                req.max_distance,
-                req.centre_x,
-                req.centre_z,
-            )
-            .expect("gpu dispatch");
-        let cpu_matches: Vec<i64> = (0..count)
-            .filter_map(|i| {
-                let seed = start.wrapping_add(i as i64);
-                has_structure_in_radius(seed, &req).then_some(seed)
-            })
-            .collect();
-        assert_eq!(
-            gpu_matches,
-            cpu_matches,
-            "GPU prefilter must agree with CPU. Seeds disagreed: \
-             GPU returned {} matches, CPU returned {}",
-            gpu_matches.len(),
-            cpu_matches.len()
-        );
-    }
-
-    /// Triangular-spread structures exercise the longer (4-call) RNG path.
-    #[test]
-    fn gpu_matches_cpu_for_triangular_structure() {
-        let Some(searcher) = GpuSearcher::try_new() else {
-            eprintln!("skipping: no GPU adapter on this host");
-            return;
-        };
-        let start: i64 = 1_000_000;
-        let count: u64 = 1_000;
-        let req = StructureRequirement {
-            structure: StructureType::OceanMonument, // Triangular spread
-            max_distance: 3000,
-            centre_x: 0,
-            centre_z: 0,
-        };
+        let count: u64 = 2_000;
         let gpu = searcher
             .find_nearby_structure_matches(
-                start,
+                1,
                 count,
                 req.structure,
                 req.max_distance,
@@ -444,18 +481,47 @@ mod tests {
             .expect("gpu dispatch");
         let cpu: Vec<i64> = (0..count)
             .filter_map(|i| {
-                let seed = start.wrapping_add(i as i64);
-                has_structure_in_radius(seed, &req).then_some(seed)
+                let s = 1i64.wrapping_add(i as i64);
+                has_structure_in_radius(s, &req).then_some(s)
             })
             .collect();
-        assert_eq!(gpu, cpu, "triangular GPU output drifted from CPU");
+        assert_eq!(gpu, cpu);
     }
 
-    /// Off-origin centre + a coarser radius exercise the rx/rz scan bounds.
+    #[test]
+    fn gpu_matches_cpu_for_triangular_structure() {
+        let Some(searcher) = make_searcher() else {
+            return;
+        };
+        let req = StructureRequirement {
+            structure: StructureType::OceanMonument,
+            max_distance: 3000,
+            centre_x: 0,
+            centre_z: 0,
+        };
+        let count: u64 = 1_000;
+        let gpu = searcher
+            .find_nearby_structure_matches(
+                1_000_000,
+                count,
+                req.structure,
+                req.max_distance,
+                req.centre_x,
+                req.centre_z,
+            )
+            .expect("gpu dispatch");
+        let cpu: Vec<i64> = (0..count)
+            .filter_map(|i| {
+                let s = 1_000_000i64.wrapping_add(i as i64);
+                has_structure_in_radius(s, &req).then_some(s)
+            })
+            .collect();
+        assert_eq!(gpu, cpu);
+    }
+
     #[test]
     fn gpu_matches_cpu_with_off_origin_centre() {
-        let Some(searcher) = GpuSearcher::try_new() else {
-            eprintln!("skipping: no GPU adapter on this host");
+        let Some(searcher) = make_searcher() else {
             return;
         };
         let req = StructureRequirement {
@@ -475,11 +541,160 @@ mod tests {
             )
             .expect("gpu dispatch");
         let cpu: Vec<i64> = (0..500)
-            .filter_map(|i| {
-                let seed = i as i64;
-                has_structure_in_radius(seed, &req).then_some(seed)
-            })
+            .filter_map(|i| has_structure_in_radius(i as i64, &req).then_some(i as i64))
             .collect();
         assert_eq!(gpu, cpu);
+    }
+
+    // ---------- v2 parity: multi-predicate kernels ----------
+
+    /// Helper: evaluate a CompiledNode against a contiguous seed range on the
+    /// CPU and return the matching seeds. Strict structure-only.
+    fn cpu_matches(node: &CompiledNode, start: i64, count: u64) -> Vec<i64> {
+        (0..count)
+            .filter_map(|i| {
+                let seed = start.wrapping_add(i as i64);
+                crate::conditions::evaluate(node, seed).then_some(seed)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gpu_cluster_matches_cpu() {
+        let Some(searcher) = make_searcher() else {
+            return;
+        };
+        // Cluster: ≥3 hits across {village, pillager_outpost} within 2000 of origin.
+        let preds = [
+            GpuPredicate {
+                structure: StructureType::Village,
+                max_distance: 2000,
+                centre_x: 0,
+                centre_z: 0,
+            },
+            GpuPredicate {
+                structure: StructureType::PillagerOutpost,
+                max_distance: 2000,
+                centre_x: 0,
+                centre_z: 0,
+            },
+        ];
+        let gpu = searcher
+            .find_matches(&GpuSearchSpec {
+                start_seed: 1,
+                count: 2_000,
+                combinator: Combinator::Cluster { min_count: 3 },
+                predicates: &preds,
+            })
+            .expect("gpu dispatch");
+        let node = compile(&Node::Cluster {
+            structures: vec!["village".into(), "pillager_outpost".into()],
+            max_distance: 2000,
+            min_count: 3,
+            centre_x: 0,
+            centre_z: 0,
+        })
+        .unwrap();
+        let cpu = cpu_matches(&node, 1, 2_000);
+        assert_eq!(gpu, cpu, "cluster GPU drifted from CPU");
+    }
+
+    #[test]
+    fn gpu_any_of_matches_cpu() {
+        let Some(searcher) = make_searcher() else {
+            return;
+        };
+        // any_of: village within 500 OR pillager_outpost within 1500.
+        let preds = [
+            GpuPredicate {
+                structure: StructureType::Village,
+                max_distance: 500,
+                centre_x: 0,
+                centre_z: 0,
+            },
+            GpuPredicate {
+                structure: StructureType::PillagerOutpost,
+                max_distance: 1500,
+                centre_x: 0,
+                centre_z: 0,
+            },
+        ];
+        let gpu = searcher
+            .find_matches(&GpuSearchSpec {
+                start_seed: 1,
+                count: 2_000,
+                combinator: Combinator::AnyOf,
+                predicates: &preds,
+            })
+            .expect("gpu dispatch");
+        let node = compile(&Node::AnyOf {
+            of: vec![
+                Node::NearbyStructure {
+                    structure: "village".into(),
+                    max_distance: 500,
+                    centre_x: 0,
+                    centre_z: 0,
+                },
+                Node::NearbyStructure {
+                    structure: "pillager_outpost".into(),
+                    max_distance: 1500,
+                    centre_x: 0,
+                    centre_z: 0,
+                },
+            ],
+        })
+        .unwrap();
+        let cpu = cpu_matches(&node, 1, 2_000);
+        assert_eq!(gpu, cpu, "any_of GPU drifted from CPU");
+    }
+
+    #[test]
+    fn gpu_all_of_matches_cpu() {
+        let Some(searcher) = make_searcher() else {
+            return;
+        };
+        // all_of: village within 2000 AND ocean_monument within 3000 (loose
+        // enough that some seeds will satisfy both).
+        let preds = [
+            GpuPredicate {
+                structure: StructureType::Village,
+                max_distance: 2000,
+                centre_x: 0,
+                centre_z: 0,
+            },
+            GpuPredicate {
+                structure: StructureType::OceanMonument,
+                max_distance: 3000,
+                centre_x: 0,
+                centre_z: 0,
+            },
+        ];
+        let gpu = searcher
+            .find_matches(&GpuSearchSpec {
+                start_seed: 1,
+                count: 2_000,
+                combinator: Combinator::AllOf,
+                predicates: &preds,
+            })
+            .expect("gpu dispatch");
+        let node = compile(&Node::AllOf {
+            of: vec![
+                Node::NearbyStructure {
+                    structure: "village".into(),
+                    max_distance: 2000,
+                    centre_x: 0,
+                    centre_z: 0,
+                },
+                Node::NearbyStructure {
+                    structure: "ocean_monument".into(),
+                    max_distance: 3000,
+                    centre_x: 0,
+                    centre_z: 0,
+                },
+            ],
+        })
+        .unwrap();
+        let cpu = cpu_matches(&node, 1, 2_000);
+        assert_eq!(gpu, cpu, "all_of GPU drifted from CPU");
     }
 }

@@ -9,6 +9,43 @@ and uses semantic versioning while the public API settles.
 
 ### Added
 
+- **GPU acceleration for cluster + multi-leaf groups (Phase 6b).** The WGSL
+  kernel is generalised from "one NearbyStructure" to "up to 8 predicates +
+  combinator". Three combinators land: `any_of`, `all_of`, and `cluster`
+  (the quad-hut shape — counts hits across the predicate list against a
+  `min_count`). The Tauri side has a new `try_extract_gpu_spec` that detects
+  cluster trees, `all_of`/`any_of` groups of NearbyStructure leaves, and
+  the v1 single-Nearby shape, all routing to the same kernel. Three new
+  GPU↔CPU parity tests (`gpu_cluster_matches_cpu`, `gpu_any_of_matches_cpu`,
+  `gpu_all_of_matches_cpu`) dispatch the new kernels against the CPU
+  evaluator and assert byte-identical match lists on 2,000-seed runs each.
+- **Per-request cancellation in Tauri commands.** New `tile_counter` /
+  `pins_counter` / `analyze_counter` atomics on `AppState`. Each command
+  claims a sequence number on entry; if a newer request bumps the counter
+  before the slow steps complete, the command bails out with a `superseded`
+  sentinel. React-side `isSupersededError` swallows those rejections
+  silently. Net effect: rapid pan/click no longer queues up minutes of
+  stale work behind the latest view.
+- **Cursor-anchored wheel zoom.** Each wheel tick keeps the world point
+  under the cursor pinned, computed from `viewCenter` + pane-relative
+  cursor offset at old/new `blocksPerPx`. Made workable by the per-request
+  cancellation above (every tick shifts viewCenter and would otherwise
+  fire a tile-fetch storm).
+- **Map legend** in the bottom-left of the map: coloured dots for village,
+  pillager outpost, ocean monument, woodland mansion, stronghold, and the
+  spawn marker, naming what each colour means.
+- **Phase 6c roadmap doc** (`docs/GPU.md`) covering full GPU biome
+  generation: the three architectural approaches, why it's a separate
+  multi-day effort, recommendation (full WGSL port, version-by-version
+  starting with 1.21).
+
+### Changed
+
+- **Background prefetch disabled** in `main.tsx`. The 4-neighbor prefetch
+  per view change was net-negative once the BiomePool amortised the
+  cubiomes setup cost; the LRU tile cache still serves repeat views.
+  See the Phase 6b commit for re-enable instructions.
+
 - **GPU compute prefilter via wgpu (Phase 6a).** New `crates/mcseedfinder-core/
   src/gpu.{wgsl,rs}` implements Java's 48-bit LCG and structure placement in
   WGSL, dispatched in parallel across a seed range. The WGSL kernel uses u32

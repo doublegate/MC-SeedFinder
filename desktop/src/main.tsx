@@ -122,6 +122,14 @@ function clampZoom(z: number): number {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
 }
 
+/** Tauri commands bail out with "superseded" when a newer request of the
+ *  same kind invalidates their work. Treat that as a benign signal, not an
+ *  error to surface in the UI. */
+function isSupersededError(e: unknown): boolean {
+  const s = String(e);
+  return s === "superseded" || s.endsWith(": superseded") || s.includes('"superseded"');
+}
+
 // ---------------------------------------------------------------------------
 // Tile LRU cache helpers
 // ---------------------------------------------------------------------------
@@ -341,6 +349,7 @@ function App() {
       });
       setAnalysis(a);
     } catch (e) {
+      if (isSupersededError(e)) return;
       setError(String(e));
     }
   }
@@ -554,7 +563,11 @@ function App() {
         setPins(ps);
         putCachedTile(tileCacheRef.current, key, t, TILE_CACHE_MAX);
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (cancelled) return;
+        // Rust "superseded" rejection means a newer request invalidated this
+        // one — silently drop, the newer fetch will fill the UI.
+        if (isSupersededError(e)) return;
+        setError(String(e));
       }
     })();
 
@@ -563,51 +576,14 @@ function App() {
     };
   }, [selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
 
-  // Background prefetch — DEBOUNCED. Firing 4 neighbor fetches on every
-  // micro-pan or rapid result click overloaded the Tauri command pool and
-  // serialised through the cubiomes backend, causing multi-second freezes.
-  // Now we wait until the view has been stable for 250 ms before queuing
-  // neighbors. If the user pans/clicks again before the timeout fires, the
-  // previous prefetch is cancelled. With the biome pool + smaller overscan,
-  // the foreground tile arrives in ~50 ms and the prefetches arrive shortly
-  // after for the next pan to serve from cache.
-  useEffect(() => {
-    if (selectedSeed == null) return;
-    const { sx, sz } = tileSizeForPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN);
-    const tileSpanX = sx * cubScale;
-    const tileSpanZ = sz * cubScale;
-    const tileX = viewCenter.x - Math.round(tileSpanX / 2);
-    const tileZ = viewCenter.z - Math.round(tileSpanZ / 2);
-    const handle = window.setTimeout(() => {
-      const neighborOffsets: Array<[number, number]> = [
-        [tileSpanX, 0],
-        [-tileSpanX, 0],
-        [0, tileSpanZ],
-        [0, -tileSpanZ],
-      ];
-      for (const [ox, oz] of neighborOffsets) {
-        const nx = tileX + ox;
-        const nz = tileZ + oz;
-        const nkey = tileKey(selectedSeed, version, nx, nz, sx, sz, cubScale);
-        if (tileCacheRef.current.has(nkey)) continue;
-        invoke<TileResponse>("render_tile", {
-          request: {
-            seed: selectedSeed,
-            version,
-            dimension: "overworld",
-            x: nx,
-            z: nz,
-            scale: cubScale,
-            sx,
-            sz,
-          },
-        })
-          .then((t) => putCachedTile(tileCacheRef.current, nkey, t, TILE_CACHE_MAX))
-          .catch(() => undefined);
-      }
-    }, 250);
-    return () => window.clearTimeout(handle);
-  }, [selectedSeed, version, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
+  // Background prefetch was disabled in Phase 6b. It compounded with rapid
+  // pan/click into a Tauri command-pool storm (5× tile fetches per view
+  // change), and after the foreground-only path got fast via the BiomePool +
+  // smaller OVERSCAN, the prefetch was net-negative for users who pan more
+  // than they re-read. The tileCacheRef LRU still serves repeat views.
+  // If you want it back: build a debounced setTimeout that fires four
+  // neighbor render_tile calls and stuffs them into tileCacheRef via
+  // putCachedTile. See the Phase-6a commit history for the original.
 
   // ---- Map pan handlers ----
   const onPanStart = useCallback(
@@ -670,14 +646,46 @@ function App() {
   // Wheel-to-zoom: each wheel tick multiplies zoom by exp(-deltaY/500),
   // ~+10% per notch on most mice — natural, continuous, and rounds into the
   // same cubScale boundary logic the buttons use.
+  // Wheel-zoom anchored to the cursor: the world point under the mouse stays
+  // put as you zoom. Computed by figuring out which world coord is currently
+  // beneath the cursor, then shifting `viewCenter` so the same world coord
+  // sits at the same screen position at the new zoom.
+  //
+  // Implementation note: every wheel tick shifts viewCenter, which fires the
+  // tile-fetch effect. Phase 6b's per-request cancellation in Tauri means
+  // only the latest tick's tile actually renders — without that the wheel
+  // would create a long tail of stale fetches.
   const onWheel = useCallback(
     (e: React.WheelEvent<HTMLDivElement>) => {
       if (selectedSeed == null) return;
       e.preventDefault();
       const factor = Math.exp(-e.deltaY / 500);
-      setZoomLevel((z) => clampZoom(z * factor));
+      const newZoom = clampZoom(zoomLevel * factor);
+      if (newZoom === zoomLevel) return;
+      const pane = mapPaneRef.current;
+      if (!pane) {
+        setZoomLevel(newZoom);
+        return;
+      }
+      const rect = pane.getBoundingClientRect();
+      // Cursor offset from pane centre, in pane CSS pixels.
+      const dxScreen = e.clientX - rect.left - rect.width / 2;
+      const dyScreen = e.clientY - rect.top - rect.height / 2;
+      // Current and new blocks-per-pane-pixel — derived from zoomLevel and
+      // DEFAULT_SCALE (this is the same conversion the drag-delta math uses).
+      const bppOld = DEFAULT_SCALE / zoomLevel;
+      const bppNew = DEFAULT_SCALE / newZoom;
+      // World point currently under the cursor.
+      const worldX = viewCenter.x + dxScreen * bppOld;
+      const worldZ = viewCenter.z + dyScreen * bppOld;
+      // New viewCenter that keeps that world point under the same cursor.
+      setZoomLevel(newZoom);
+      setViewCenter({
+        x: Math.round(worldX - dxScreen * bppNew),
+        z: Math.round(worldZ - dyScreen * bppNew),
+      });
     },
-    [selectedSeed],
+    [selectedSeed, zoomLevel, viewCenter.x, viewCenter.z],
   );
 
   // Smooth CSS-scale factor: applied to the over-rendered tile container so
@@ -818,6 +826,14 @@ function App() {
                 <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
                 <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
                 <button onClick={resetView} title="Recenter on origin">⌂</button>
+              </div>
+              <div className="mapLegend">
+                <span className="legendItem"><span className="legendDot pin-village" />Village</span>
+                <span className="legendItem"><span className="legendDot pin-pillager_outpost" />Outpost</span>
+                <span className="legendItem"><span className="legendDot pin-ocean_monument" />Monument</span>
+                <span className="legendItem"><span className="legendDot pin-woodland_mansion" />Mansion</span>
+                <span className="legendItem"><span className="legendDot pin-stronghold" />Stronghold</span>
+                <span className="legendItem"><span className="legendDot legendSpawn" />Spawn (0,0)</span>
               </div>
               <div className="tileLabel">
                 seed {tile.seed} · zoom {zoomLevel.toFixed(2)}× (1:{tile.scale}) ·
