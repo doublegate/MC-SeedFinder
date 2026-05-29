@@ -20,6 +20,8 @@ pub mod gpu_climate;
 pub mod gpu_double_perlin;
 #[cfg(all(feature = "gpu", feature = "biomes"))]
 pub mod gpu_noise;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_xoroshiro;
 pub mod java_random;
 pub mod structures;
 

@@ -53,6 +53,18 @@ int mcsf_str2mc(const char *s) {
     return str2mc(s);
 }
 
+/* Phase A oracle: emit the first `k` xNextLong outputs of a Xoroshiro128++
+ * seeded from `seed` via cubiomes' xSetSeed. This is the bit-exact reference
+ * the WGSL Xoroshiro port (gpu_xoroshiro.wgsl) is tested against. `out` must
+ * have room for `k` uint64_t values. */
+void mcsf_xoroshiro_stream(uint64_t seed, int k, uint64_t *out) {
+    Xoroshiro xr;
+    xSetSeed(&xr, seed);
+    for (int i = 0; i < k; i++) {
+        out[i] = xNextLong(&xr);
+    }
+}
+
 /* Reference oracle for the Rust-side buried_treasure per-chunk roll
  * (structures.rs::roll_buried_treasure_chunk). Returns 1 iff cubiomes'
  * own getStructurePos(Treasure, ...) succeeds at (chunkX, chunkZ),
