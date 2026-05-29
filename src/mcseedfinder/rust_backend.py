@@ -136,9 +136,12 @@ def compile_structure_only_requirements(
     return requirements
 
 
-# Node types the native tree evaluator handles. Anything else (biome-touching
-# leaves: spawn_biome, nearby_biomes, biome_area) forces fallback to Python.
+# Node types the native tree evaluator handles. The structure-only set drives
+# the cheap structure-only fast path; the full set (with biome leaves) drives
+# the new biome-aware native path that uses a shared cubiomes BiomeBackend.
 _NATIVE_TREE_LEAFS = {"nearby_structure", "cluster"}
+_NATIVE_TREE_BIOME_LEAFS = {"spawn_biome", "nearby_biomes", "biome_area"}
+_NATIVE_TREE_LEAFS_FULL = _NATIVE_TREE_LEAFS | _NATIVE_TREE_BIOME_LEAFS
 _NATIVE_TREE_GROUPS = {"all_of", "any_of", "none_of"}
 
 
@@ -153,6 +156,154 @@ def _is_structure_only_node(node: Any) -> bool:
         of = node.get("of") or []
         return bool(of) and all(_is_structure_only_node(c) for c in of)
     return False
+
+
+def _resolve_biome_leaf(
+    node: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Convert a biome leaf (with biome NAMES) into the wire shape expected by
+    the Rust evaluator (numeric cubiomes IDs). Returns None for unrecognised
+    leaf types or when the biome catalog can't resolve a name."""
+    from .biomes import numeric_ids_for
+
+    t = node.get("type")
+    biome_names = node.get("biomes")
+    if biome_names is None:
+        return None
+    try:
+        ids = sorted(numeric_ids_for(biome_names))
+    except KeyError:
+        return None
+    if t == "spawn_biome":
+        return {
+            "type": "spawn_biome",
+            "biomes": ids,
+            "spawn_radius": int(node.get("spawn_radius", 64)),
+        }
+    if t == "nearby_biomes":
+        return {
+            "type": "nearby_biomes",
+            "biomes": ids,
+            "radius": int(node.get("radius", 2000)),
+            "all_required": bool(node.get("all", node.get("all_required", False))),
+            "samples_per_axis": int(node.get("samples", node.get("samples_per_axis", 16))),
+        }
+    if t == "biome_area":
+        return {
+            "type": "biome_area",
+            "biomes": ids,
+            "radius": int(node.get("radius", 1000)),
+            "samples_per_axis": int(node.get("samples", node.get("samples_per_axis", 16))),
+            "min_samples": int(node.get("min_samples", 8)),
+            "centre_x": int(node.get("centre_x", 0)),
+            "centre_z": int(node.get("centre_z", 0)),
+        }
+    return None
+
+
+def _node_for_native(node: Any) -> Mapping[str, Any] | None:
+    """Recursively rebuild a conditions-tree node into the wire shape the
+    Rust evaluator consumes (structure leaves are pass-through; biome leaves
+    have names resolved to IDs; groups recurse). Returns None if any leaf
+    has a type the native evaluator doesn't recognise."""
+    if not isinstance(node, Mapping):
+        return None
+    t = node.get("type")
+    if t in _NATIVE_TREE_LEAFS:
+        # Structure leaves already use the wire-format keys.
+        return dict(node)
+    if t in _NATIVE_TREE_BIOME_LEAFS:
+        return _resolve_biome_leaf(node)
+    if t in _NATIVE_TREE_GROUPS:
+        of = node.get("of") or []
+        if not of:
+            return None
+        children: list[Mapping[str, Any]] = []
+        for c in of:
+            converted = _node_for_native(c)
+            if converted is None:
+                return None
+            children.append(converted)
+        return {"type": t, "of": children}
+    return None
+
+
+def compile_native_tree_full(
+    criteria_spec: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Build a tree dict for the biome-aware native evaluator.
+
+    Accepts both structure leaves and biome leaves (with biome names; resolved
+    to numeric IDs here). Returns ``None`` when the spec contains anything the
+    native evaluator doesn't recognise so the caller can fall back to the
+    Python path without ever silently dropping a criterion. The companion
+    [`find_tree_matches_range_compiled_with_biomes`] is what actually runs the
+    search — this helper is just the spec-to-wire-format conversion.
+    """
+    if _native is None:
+        return None
+
+    children: list[Mapping[str, Any]] = []
+
+    # Flat nearby_structures → structure leaves.
+    for entry in criteria_spec.get("nearby_structures") or []:
+        children.append(
+            {
+                "type": "nearby_structure",
+                "structure": str(entry["structure"]),
+                "max_distance": int(entry.get("max_distance", 1500)),
+                "centre_x": int(entry.get("centre_x", 0)),
+                "centre_z": int(entry.get("centre_z", 0)),
+            }
+        )
+
+    # Flat spawn_biome key → spawn_biome leaf with resolved IDs.
+    spawn = criteria_spec.get("spawn_biome")
+    if spawn is not None:
+        try:
+            from .biomes import numeric_ids_for
+
+            children.append(
+                {
+                    "type": "spawn_biome",
+                    "biomes": sorted(numeric_ids_for(spawn)),
+                    "spawn_radius": int(criteria_spec.get("spawn_radius", 64)),
+                }
+            )
+        except KeyError:
+            return None
+
+    # Flat nearby_biomes key.
+    nb = criteria_spec.get("nearby_biomes")
+    if nb is not None:
+        try:
+            from .biomes import numeric_ids_for
+
+            children.append(
+                {
+                    "type": "nearby_biomes",
+                    "biomes": sorted(numeric_ids_for(nb["biomes"])),
+                    "radius": int(nb.get("radius", 2000)),
+                    "all_required": bool(nb.get("all", nb.get("all_required", False))),
+                    "samples_per_axis": int(nb.get("samples", 16)),
+                }
+            )
+        except KeyError:
+            return None
+
+    # Recursive conditions tree.
+    tree = criteria_spec.get("conditions")
+    if tree is not None:
+        converted = _node_for_native(tree)
+        if converted is None:
+            return None
+        children.append(converted)
+
+    if not children:
+        return None
+    if len(children) == 1:
+        return children[0]
+    return {"type": "all_of", "of": children}
 
 
 def compile_structure_only_tree(
@@ -208,9 +359,89 @@ def find_tree_matches_range(
     count: int,
     tree: Mapping[str, Any],
 ) -> list[int]:
-    """Filter ``[start_seed, start_seed+count)`` via the native tree evaluator."""
+    """Filter ``[start_seed, start_seed+count)`` via the native tree evaluator.
+
+    Re-parses and re-compiles the tree on every call. For repeated calls
+    against the same criteria — the worker-pool case — prefer
+    :func:`compile_native_tree` once at worker init plus
+    :func:`find_tree_matches_range_compiled` per chunk.
+    """
     if _native is None:
         raise RuntimeError("Rust backend is not available")
     import json
 
     return _native.find_tree_matches_range(start_seed, count, json.dumps(tree))
+
+
+def compile_native_tree(tree: Mapping[str, Any]) -> Any | None:
+    """Compile a structure-only tree once and return a reusable native handle.
+
+    Returns ``None`` when the native extension is unavailable, or when the
+    JSON encode fails for some reason. Errors from the validator (unknown
+    structure, negative distance, …) are still raised so they surface at
+    pool-init time rather than per chunk.
+    """
+    if _native is None or not hasattr(_native, "compile_tree"):
+        return None
+    import json
+
+    return _native.compile_tree(json.dumps(tree))
+
+
+def find_tree_matches_range_compiled(
+    start_seed: int,
+    count: int,
+    compiled: Any,
+) -> list[int]:
+    """Filter ``[start_seed, start_seed+count)`` using a pre-compiled handle.
+
+    The handle is the value returned by :func:`compile_native_tree`. Skips
+    the per-chunk JSON parse + compile and releases the GIL around the
+    inner Rust loop.
+    """
+    if _native is None:
+        raise RuntimeError("Rust backend is not available")
+    return _native.find_tree_matches_range_compiled(start_seed, count, compiled)
+
+
+def find_tree_matches_range_compiled_with_biomes(
+    start_seed: int,
+    count: int,
+    compiled: Any,
+    backend: Any,
+) -> list[int]:
+    """Biome-aware sibling of :func:`find_tree_matches_range_compiled`.
+
+    Runs entirely inside Rust + cubiomes — no per-coord PyO3 callback into
+    Python. Requires that ``backend`` be a ``CubiomesBiomeBackend`` (the
+    object returned by :func:`make_biome_backend`).
+
+    Returns an empty list and falls back to the caller's Python path if the
+    extension was built without cubiomes or the biome-aware native entry
+    point isn't present.
+    """
+    if _native is None or not hasattr(_native, "find_tree_matches_range_compiled_with_biomes"):
+        raise RuntimeError("biome-aware native search not available")
+    return _native.find_tree_matches_range_compiled_with_biomes(
+        start_seed, count, compiled, backend
+    )
+
+
+def has_biome_aware_native() -> bool:
+    """True iff this build exposes :func:`find_tree_matches_range_compiled_with_biomes`."""
+    return _native is not None and hasattr(
+        _native, "find_tree_matches_range_compiled_with_biomes"
+    )
+
+
+def is_supported_version(version: str) -> bool:
+    """True iff the bundled cubiomes recognises ``version``.
+
+    Lets the CLI surface a clear "this version isn't in the bundled cubiomes"
+    error before the user invests time in a search. Returns ``False`` if the
+    extension wasn't built with cubiomes — the caller should then either
+    accept the version (approximate-biomes builds) or warn separately.
+    """
+    if _native is None or not hasattr(_native, "is_supported_version"):
+        return False
+    return bool(_native.is_supported_version(version))

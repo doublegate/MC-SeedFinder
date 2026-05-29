@@ -345,14 +345,21 @@ and uses semantic versioning while the public API settles.
   the run/cancel buttons reflect live state, and "Analyze" calls into Rust
   for the exact origin biome of the selected seed.
 
-### Deferred (Phase 4a-2 / 4b)
+### Completed since the 4a-2 / 4b deferral
 
-- Biome criteria in desktop *search* specs are rejected with a clear typed
-  error for now; the Python engine retains full biome support. Biome
-  evaluation in Rust is a separate piece of work.
-- `render_tile` (cubiomes colormap → base64 PNG) and `import_level_dat`
-  (NBT seed reader via fastnbt) remain "not_yet_implemented" responses.
-- `pause`/`resume` are no-ops; cancellation works.
+- Biome criteria in desktop *search* specs are now evaluated natively via
+  `conditions::evaluate_with_biomes` with a single per-search cubiomes
+  `BiomeBackend` (`desktop/src-tauri/src/main.rs::run_search`, gated on
+  `conditions::has_biome_leaves`).
+- `render_tile` ships as both a base64-PNG path (`render_tile`) and the
+  faster raw-RGBA path (`render_tile_rgba_cmd`), saving ~30–45 ms per tile.
+- `import_level_dat` is wired up via `fastnbt` + `flate2`, reading the
+  modern `Data.WorldGenSettings.seed` with a legacy `Data.RandomSeed` fallback.
+
+### Still deferred
+
+- `pause`/`resume` Tauri commands are no-ops; cancellation works. Tracked
+  for the next phase alongside the broader job-lifecycle work.
 
 ### Added
 

@@ -53,10 +53,16 @@ from typing import Any
 from .criteria import CriteriaSet, compile_criteria
 from .rust_backend import (
     RustStructureRequirement,
+    compile_native_tree,
+    compile_native_tree_full,
     compile_structure_only_requirements,
     compile_structure_only_tree,
     find_structure_matches_range,
     find_tree_matches_range,
+    find_tree_matches_range_compiled,
+    find_tree_matches_range_compiled_with_biomes,
+    has_biome_aware_native,
+    make_biome_backend,
 )
 from .rust_backend import (
     is_available as rust_backend_available,
@@ -109,6 +115,22 @@ class Match:
 _WORKER_CRITERIA: CriteriaSet | None = None
 _WORKER_RUST_STRUCTURE_REQUIREMENTS: list[RustStructureRequirement] | None = None
 _WORKER_NATIVE_TREE: Mapping[str, Any] | None = None
+# Compiled handle for the structure-only native tree path. Computed once at
+# worker init from `_WORKER_NATIVE_TREE`; reused across every chunk so we
+# avoid re-doing `json.dumps(tree)` + Rust-side `serde_json::from_str` +
+# `compile()` for every dispatch.
+_WORKER_NATIVE_TREE_COMPILED: Any | None = None
+# Compiled handle for the BIOME-AWARE native tree path (covers biome leaves
+# in addition to structure leaves). When present, biome searches stay
+# entirely in Rust + cubiomes instead of falling back to the per-coord
+# Python evaluator (R3 — fix for the silent ~10⁴× perf cliff on biome
+# criteria). `None` when the spec doesn't qualify or cubiomes isn't built.
+_WORKER_NATIVE_TREE_FULL_COMPILED: Any | None = None
+# Dedicated cubiomes BiomeBackend reused across every chunk dispatch in
+# this worker. Sized for the search's version/dimension; mutated by every
+# `apply_seed` call inside the evaluator (the backend caches the last
+# seed to skip redundant generator re-init).
+_WORKER_BIOME_BACKEND: Any | None = None
 
 
 def _worker_init(
@@ -122,6 +144,8 @@ def _worker_init(
     so only the version/dimension strings cross the process boundary.
     """
     global _WORKER_CRITERIA, _WORKER_RUST_STRUCTURE_REQUIREMENTS, _WORKER_NATIVE_TREE
+    global _WORKER_NATIVE_TREE_COMPILED, _WORKER_NATIVE_TREE_FULL_COMPILED
+    global _WORKER_BIOME_BACKEND
     _WORKER_CRITERIA = compile_criteria(
         criteria_spec,
         biome_version=biome_version,
@@ -130,10 +154,33 @@ def _worker_init(
     _WORKER_RUST_STRUCTURE_REQUIREMENTS = compile_structure_only_requirements(
         criteria_spec
     )
-    # The richer structure-only tree path covers clusters and logic gates. Falls
-    # back to None (forcing Python evaluation) when any biome criterion is
-    # present anywhere in the spec — biome conditions stay on Python for now.
+    # The richer structure-only tree path covers clusters and logic gates.
+    # Falls back to None when any biome criterion is in the spec (biome
+    # leaves get routed to the biome-aware compiled tree below instead).
     _WORKER_NATIVE_TREE = compile_structure_only_tree(criteria_spec)
+    _WORKER_NATIVE_TREE_COMPILED = (
+        compile_native_tree(_WORKER_NATIVE_TREE)
+        if _WORKER_NATIVE_TREE is not None
+        else None
+    )
+    # Biome-aware native compile path (R3). Only attempt when the cubiomes
+    # extension and the biome-aware entry point are present; the build
+    # otherwise stays on the Python evaluator with a one-line warning the
+    # first time it's hit (see _check_chunk).
+    _WORKER_NATIVE_TREE_FULL_COMPILED = None
+    _WORKER_BIOME_BACKEND = None
+    if has_biome_aware_native() and biome_version is not None:
+        full_tree = compile_native_tree_full(criteria_spec)
+        if full_tree is not None:
+            compiled = compile_native_tree(full_tree)
+            if compiled is not None and getattr(compiled, "has_biome_leaves", False):
+                backend = make_biome_backend(biome_version, biome_dimension)
+                if backend is not None:
+                    _WORKER_NATIVE_TREE_FULL_COMPILED = compiled
+                    _WORKER_BIOME_BACKEND = backend
+
+
+_FALLBACK_WARNED = False
 
 
 def _check_chunk(seeds: list[int]) -> list[int]:
@@ -144,9 +191,25 @@ def _check_chunk(seeds: list[int]) -> list[int]:
     """
     assert _WORKER_CRITERIA is not None, "worker not initialised"
     if rust_backend_available() and _is_contiguous(seeds):
-        # Prefer the richer tree fast-path (covers cluster + logic gates); fall
-        # back to the legacy flat-structure path; finally Python evaluation.
+        # 1. Biome-aware native path (R3) — when present, beats the Python
+        #    per-coord PyO3 fallback by 3–4 orders of magnitude.
+        if (
+            _WORKER_NATIVE_TREE_FULL_COMPILED is not None
+            and _WORKER_BIOME_BACKEND is not None
+        ):
+            return find_tree_matches_range_compiled_with_biomes(
+                seeds[0],
+                len(seeds),
+                _WORKER_NATIVE_TREE_FULL_COMPILED,
+                _WORKER_BIOME_BACKEND,
+            )
+        # 2. Structure-only native fast path (covers cluster + logic gates).
+        if _WORKER_NATIVE_TREE_COMPILED is not None:
+            return find_tree_matches_range_compiled(
+                seeds[0], len(seeds), _WORKER_NATIVE_TREE_COMPILED
+            )
         if _WORKER_NATIVE_TREE is not None:
+            # Fallback if the native build is too old to expose `compile_tree`.
             return find_tree_matches_range(seeds[0], len(seeds), _WORKER_NATIVE_TREE)
         if _WORKER_RUST_STRUCTURE_REQUIREMENTS:
             return find_structure_matches_range(
@@ -154,6 +217,25 @@ def _check_chunk(seeds: list[int]) -> list[int]:
                 len(seeds),
                 _WORKER_RUST_STRUCTURE_REQUIREMENTS,
             )
+    # Surface a one-shot warning when we silently fall back to the Python
+    # evaluator on a biome-touching spec — that's the slow cliff R3 was
+    # supposed to close, so the user should see it (e.g. when cubiomes
+    # isn't built, or when the spec mixes in something the native tree
+    # doesn't recognise yet).
+    global _FALLBACK_WARNED
+    if (
+        not _FALLBACK_WARNED
+        and _WORKER_CRITERIA.needs_biome_lookup
+        and rust_backend_available()
+    ):
+        import sys
+
+        print(
+            "mcseedfinder: warning — biome-aware native search unavailable for this "
+            "spec; falling back to Python evaluator (much slower)",
+            file=sys.stderr,
+        )
+        _FALLBACK_WARNED = True
     return [s for s in seeds if _WORKER_CRITERIA.matches(s)]
 
 

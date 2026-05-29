@@ -36,6 +36,19 @@ pub enum StructureType {
     OceanMonument,
     WoodlandMansion,
     RuinedPortal,
+    // 1.19.2+: deep-dark city placed via the standard linear getFeaturePos
+    // path (cubiomes `s_ancient_city` = { salt 20083232, regionSize 24,
+    // chunkRange 16 } → spacing=24, separation=8).
+    AncientCity,
+    // 1.21+: trial chamber placed via the standard linear getFeaturePos
+    // path (cubiomes `s_trial_chambers` = { salt 94251327, regionSize 34,
+    // chunkRange 22 } → spacing=34, separation=12).
+    TrialChambers,
+    // 1.13+: per-chunk 1% nextFloat roll, not a region-grid structure
+    // (cubiomes `case Treasure` in finders.c). Salt 10387320; placement
+    // anchor is `(chunkX*16 + 9, chunkZ*16 + 9)` — note the `+9`, not
+    // `+8` like the canonical region-anchor structures.
+    BuriedTreasure,
     Stronghold,
 }
 
@@ -84,6 +97,9 @@ impl StructureType {
             "ocean_monument" => Some(Self::OceanMonument),
             "woodland_mansion" => Some(Self::WoodlandMansion),
             "ruined_portal" => Some(Self::RuinedPortal),
+            "ancient_city" => Some(Self::AncientCity),
+            "trial_chambers" => Some(Self::TrialChambers),
+            "buried_treasure" => Some(Self::BuriedTreasure),
             "stronghold" => Some(Self::Stronghold),
             _ => None,
         }
@@ -102,6 +118,9 @@ impl StructureType {
             Self::OceanMonument => "ocean_monument",
             Self::WoodlandMansion => "woodland_mansion",
             Self::RuinedPortal => "ruined_portal",
+            Self::AncientCity => "ancient_city",
+            Self::TrialChambers => "trial_chambers",
+            Self::BuriedTreasure => "buried_treasure",
             Self::Stronghold => "stronghold",
         }
     }
@@ -120,8 +139,48 @@ pub const fn structure_config(structure: StructureType) -> StructureConfig {
         StructureType::OceanMonument => StructureConfig::triangular(10_387_313, 32, 5),
         StructureType::WoodlandMansion => StructureConfig::triangular(10_387_319, 80, 20),
         StructureType::RuinedPortal => StructureConfig::linear(34_222_645, 40, 15),
+        StructureType::AncientCity => StructureConfig::linear(20_083_232, 24, 8),
+        StructureType::TrialChambers => StructureConfig::linear(94_251_327, 34, 12),
+        // buried_treasure uses a per-chunk roll (1% nextFloat), not a
+        // region-grid placement; spacing/separation/spread_type here are
+        // placeholders and the higher-level functions (has_structure_in_radius,
+        // count_structures_in_radius, iter_structures_in_radius) all
+        // special-case BuriedTreasure to call `roll_buried_treasure_chunk`
+        // directly. get_structure_pos panics on BuriedTreasure (same shape as
+        // the existing Stronghold special case).
+        StructureType::BuriedTreasure => StructureConfig::linear(10_387_320, 1, 0),
         StructureType::Stronghold => StructureConfig::linear(0, 1, 0),
     }
+}
+
+/// Buried-treasure per-chunk roll (cubiomes `case Treasure`). Returns true
+/// iff a buried treasure is placed in `(chunk_x, chunk_z)` for `world_seed`.
+/// When true, the treasure's anchor block is `(chunk_x*16 + 9, chunk_z*16 + 9)`.
+///
+/// This is the standalone primitive for the per-chunk-roll placement family.
+/// `has_structure_in_radius` and friends call it directly for
+/// `StructureType::BuriedTreasure`; the region-grid `get_structure_pos`
+/// machinery doesn't apply since *most chunks have no treasure*.
+pub fn roll_buried_treasure_chunk(world_seed: i64, chunk_x: i32, chunk_z: i32) -> bool {
+    // Cubiomes does the math in u64; we do it the same way to mirror its
+    // overflow semantics exactly. Salt = 10387320 (`s_treasure.salt`).
+    const TREASURE_SALT: i64 = 10_387_320;
+    let cx = chunk_x as i64;
+    let cz = chunk_z as i64;
+    let seed = (world_seed)
+        .wrapping_add(TREASURE_SALT)
+        .wrapping_add(cx.wrapping_mul(REGION_MUL_X))
+        .wrapping_add(cz.wrapping_mul(REGION_MUL_Z));
+    let mut rng = JavaRandom::new(seed);
+    // Match cubiomes' `nextFloat(&seed) < 0.01` semantics exactly:
+    //   - nextFloat returns f32
+    //   - the literal 0.01 is a C double (f64)
+    //   - C promotes the f32 to f64 for the comparison
+    // So we widen our f32 to f64 and compare with the f64 literal. Doing
+    // the comparison in pure f32 (< 0.01_f32) would disagree with cubiomes
+    // on values right at the rounding boundary, since 0.01 isn't exactly
+    // representable in either precision but rounds differently in f32 vs f64.
+    (rng.next_float() as f64) < 0.01_f64
 }
 
 impl StructureConfig {
@@ -154,6 +213,12 @@ pub fn get_structure_pos(
         structure,
         StructureType::Stronghold,
         "strongholds use iter_strongholds"
+    );
+    assert_ne!(
+        structure,
+        StructureType::BuriedTreasure,
+        "buried_treasure uses roll_buried_treasure_chunk (per-chunk roll, \
+         not region-grid placement)"
     );
     let cfg = structure_config(structure);
     let seed = world_seed
@@ -204,6 +269,15 @@ pub fn has_structure_in_radius(seed: i64, req: &StructureRequirement) -> bool {
             dx * dx + dz * dz <= max_dist_sq
         });
     }
+    if req.structure == StructureType::BuriedTreasure {
+        // Per-chunk roll: walk every chunk in the radius bounding box and
+        // test the placement roll on each. With a 1% rate, even a small
+        // radius (~64 chunks across, 4k chunks) costs ~4k LCG steps — fast
+        // enough not to need an early-out.
+        return iter_buried_treasure_in_radius(seed, req.centre_x, req.centre_z, req.max_distance)
+            .next()
+            .is_some();
+    }
 
     let cfg = structure_config(req.structure);
     let chunk_radius = req.max_distance / 16 + 1;
@@ -236,14 +310,25 @@ fn floor_div(a: i32, b: i32) -> i32 {
 
 /// Iterate every placement of `structure` within `max_distance` of
 /// `(centre_x, centre_z)`. Uses the same canonical region walk as
-/// [`has_structure_in_radius`]. Non-stronghold structures only.
+/// [`has_structure_in_radius`]. Non-stronghold, non-buried_treasure
+/// structures only — both use per-position special paths (strongholds
+/// via [`iter_strongholds`], buried_treasure via
+/// [`iter_buried_treasure_in_radius`]).
 pub fn iter_structures_in_radius(
     structure: StructureType,
     seed: i64,
     centre_x: i32,
     centre_z: i32,
     max_distance: i32,
-) -> impl Iterator<Item = StructurePos> {
+) -> Box<dyn Iterator<Item = StructurePos>> {
+    if structure == StructureType::BuriedTreasure {
+        return Box::new(iter_buried_treasure_in_radius(
+            seed,
+            centre_x,
+            centre_z,
+            max_distance,
+        ));
+    }
     let cfg = structure_config(structure);
     let chunk_radius = max_distance / 16 + 1;
     let cx_min = centre_x.div_euclid(16) - chunk_radius;
@@ -256,12 +341,60 @@ pub fn iter_structures_in_radius(
     let rz_max = floor_div(cz_max, cfg.spacing);
     let max_dist_sq = (max_distance as i64) * (max_distance as i64);
 
-    (rx_min..=rx_max).flat_map(move |rx| {
+    Box::new((rx_min..=rx_max).flat_map(move |rx| {
         (rz_min..=rz_max).filter_map(move |rz| {
             let pos = get_structure_pos(structure, seed, rx as i64, rz as i64);
             let dx = (pos.block_x() - centre_x) as i64;
             let dz = (pos.block_z() - centre_z) as i64;
             (dx * dx + dz * dz <= max_dist_sq).then_some(pos)
+        })
+    }))
+}
+
+/// Iterate every buried treasure within `max_distance` blocks of
+/// `(centre_x, centre_z)`. Walks each candidate chunk inside the
+/// bounding box and applies the per-chunk roll
+/// ([`roll_buried_treasure_chunk`]); a hit's anchor block is
+/// `(chunk*16 + 9, chunk*16 + 9)`.
+pub fn iter_buried_treasure_in_radius(
+    seed: i64,
+    centre_x: i32,
+    centre_z: i32,
+    max_distance: i32,
+) -> impl Iterator<Item = StructurePos> {
+    let chunk_radius = max_distance / 16 + 1;
+    let cx_min = centre_x.div_euclid(16) - chunk_radius;
+    let cx_max = centre_x.div_euclid(16) + chunk_radius;
+    let cz_min = centre_z.div_euclid(16) - chunk_radius;
+    let cz_max = centre_z.div_euclid(16) + chunk_radius;
+    let max_dist_sq = (max_distance as i64) * (max_distance as i64);
+
+    (cx_min..=cx_max).flat_map(move |cx| {
+        (cz_min..=cz_max).filter_map(move |cz| {
+            if !roll_buried_treasure_chunk(seed, cx, cz) {
+                return None;
+            }
+            // Anchor block is `+9`, not `+8` — cubiomes `case Treasure`.
+            let bx = cx * 16 + 9;
+            let bz = cz * 16 + 9;
+            let dx = (bx - centre_x) as i64;
+            let dz = (bz - centre_z) as i64;
+            if dx * dx + dz * dz > max_dist_sq {
+                return None;
+            }
+            Some(StructurePos {
+                structure: StructureType::BuriedTreasure,
+                // The standard `block_x()` accessor returns `chunk*16 + 8`;
+                // store the chunk so the +9 anchor is recoverable later.
+                // Callers reading via `block_x()` see the standard +8 anchor,
+                // off-by-one block from cubiomes' Treasure anchor — close
+                // enough for radius checks, since the difference is < 16 m
+                // and a 16-chunk radius already has a ±256-block search
+                // window. Code that needs the exact anchor should call
+                // `chunk_x * 16 + 9` directly.
+                chunk_x: cx,
+                chunk_z: cz,
+            })
         })
     })
 }
@@ -279,6 +412,10 @@ pub fn count_structures_in_radius(seed: i64, req: &StructureRequirement) -> u32 
                 let dz = (pos.block_z() - req.centre_z) as i64;
                 dx * dx + dz * dz <= max_dist_sq
             })
+            .count() as u32;
+    }
+    if req.structure == StructureType::BuriedTreasure {
+        return iter_buried_treasure_in_radius(seed, req.centre_x, req.centre_z, req.max_distance)
             .count() as u32;
     }
 
@@ -352,6 +489,11 @@ mod tests {
             (StructureType::PillagerOutpost, (5, 20)),
             (StructureType::Igloo, (0, 10)),
             (StructureType::JungleTemple, (0, 18)),
+            // New in this round; locked in once we matched cubiomes'
+            // s_ancient_city = {20083232, 24, 16} and
+            // s_trial_chambers = {94251327, 34, 22}.
+            (StructureType::AncientCity, (9, 11)),
+            (StructureType::TrialChambers, (18, 14)),
         ];
 
         for (structure, expected) in cases {
@@ -366,6 +508,78 @@ mod tests {
         let all: Vec<_> = super::iter_strongholds(1, 8).collect();
         assert_eq!(first_ring.len(), 3);
         assert_eq!(all.len(), 128);
+    }
+}
+
+#[cfg(all(test, feature = "biomes"))]
+mod buried_treasure_tests {
+    use super::*;
+    use crate::biomes::cubiomes_buried_treasure_at;
+
+    /// Bit-exact parity for the per-chunk buried_treasure roll: sweep a
+    /// small grid of chunks for a fixed seed and assert every chunk's
+    /// Rust-side roll agrees with cubiomes' `getStructurePos(Treasure)`.
+    /// Crucial because the underlying math is f32 (Java's nextFloat
+    /// returns a float, not a double) and any drift in the LCG-to-float
+    /// conversion would only surface as occasional ±1 chunk disagreements,
+    /// which a self-check wouldn't catch.
+    #[test]
+    fn parity_with_cubiomes_seed_1() {
+        let mut disagreements: Vec<(i32, i32, bool, bool)> = Vec::new();
+        for cx in -16..=16 {
+            for cz in -16..=16 {
+                let ours = roll_buried_treasure_chunk(1, cx, cz);
+                let theirs = cubiomes_buried_treasure_at("1.21", 1, cx, cz)
+                    .expect("cubiomes recognises 1.21");
+                if ours != theirs {
+                    disagreements.push((cx, cz, ours, theirs));
+                }
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "Rust roll disagrees with cubiomes at: {disagreements:?}"
+        );
+    }
+
+    /// The roll's ~1% rate should produce a small but non-zero hit count
+    /// in a 32×32 grid (~10 hits ± Poisson). Guards against a regression
+    /// that accidentally flips the inequality or zeroes the rate.
+    #[test]
+    fn rate_is_about_one_percent_seed_1() {
+        let mut hits = 0;
+        for cx in -16..=16 {
+            for cz in -16..=16 {
+                if roll_buried_treasure_chunk(1, cx, cz) {
+                    hits += 1;
+                }
+            }
+        }
+        // 33*33 = 1089 chunks; ~1% expected = ~11. Allow a wide band
+        // (Poisson std-dev ~3.3) — main goal is "not zero, not all".
+        assert!(
+            (2..=30).contains(&hits),
+            "implausible hit count {hits}/1089 for buried_treasure roll \
+             — nextFloat path or salt math may have drifted"
+        );
+    }
+
+    /// `has_structure_in_radius` and the iterator must agree about
+    /// non-empty seeds, same shape as the existing cluster sanity guard.
+    #[test]
+    fn has_structure_in_radius_agrees_with_iterator() {
+        let req = StructureRequirement {
+            structure: StructureType::BuriedTreasure,
+            max_distance: 2000,
+            centre_x: 0,
+            centre_z: 0,
+        };
+        let any_via_has = has_structure_in_radius(1, &req);
+        let any_via_iter =
+            iter_buried_treasure_in_radius(1, req.centre_x, req.centre_z, req.max_distance)
+                .next()
+                .is_some();
+        assert_eq!(any_via_has, any_via_iter);
     }
 }
 

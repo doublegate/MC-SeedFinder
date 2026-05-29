@@ -56,6 +56,16 @@ impl JavaRandom {
         let low = self.next(27) as u64;
         (high + low) as f64 / ((1_u64 << 53) as f64)
     }
+
+    /// Java's `Random.nextFloat()`: `next(24) / (1 << 24)` as a float.
+    /// Used by per-chunk-roll placement (e.g. buried_treasure's 1%
+    /// probability test). The cast through f32 matches Java's float
+    /// arithmetic — using f64 here would compute a slightly different
+    /// value at the seventh decimal place and silently shift the cutoff
+    /// for marginal seeds.
+    pub fn next_float(&mut self) -> f32 {
+        self.next(24) as f32 / ((1_u32 << 24) as f32)
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +91,19 @@ mod tests {
     fn next_double_seed_0() {
         let got = JavaRandom::new(0).next_double();
         assert!((got - 0.730967787376657).abs() < 1e-15);
+    }
+
+    /// Java's nextFloat for seed=0 first call → 0.73096776 (verified against
+    /// the JDK source). Pins the f32-precision contract used by the
+    /// buried_treasure per-chunk roll.
+    #[test]
+    fn next_float_seed_0() {
+        let got = JavaRandom::new(0).next_float();
+        // f32 round-trip tolerance — same value Java would print.
+        assert!(
+            (got - 0.730_967_76_f32).abs() < 1e-7,
+            "got {got}, expected ~0.73096776"
+        );
     }
 
     #[test]

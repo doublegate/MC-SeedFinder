@@ -1159,6 +1159,15 @@ textarea {
   text-align: left;
   cursor: pointer;
   transition: border-color 100ms ease, background 100ms ease;
+  /* Browser-native virtualization (D8). Off-screen rows skip layout,
+   * paint, and style recalc — the browser still keeps them in the DOM
+   * so accessibility / find-in-page / scroll-restoration all work, but
+   * a 10k-row result list stays smooth. `contain-intrinsic-size` tells
+   * the browser the row's reserved size so total scroll height is
+   * correct without measuring every row. Supported in WebKitGTK,
+   * WebView2 (Chromium), and WKWebView — all three Tauri backends. */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 56px;
 }
 
 /* Text column inside .result — separates seed number (top) from version /

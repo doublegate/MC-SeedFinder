@@ -1,0 +1,19 @@
+# Workspace-level cargo configuration.
+#
+# `rustc-wrapper = ""` neutralises a globally-configured `sccache` (or similar)
+# that cannot run inside the project sandbox/CI. Previously contributors and
+# CI both prefixed every command with `RUSTC_WRAPPER=` to work around this;
+# pinning it here removes that ceremony. Override locally with
+# `CARGO_BUILD_RUSTC_WRAPPER=sccache cargo build` if you want sccache back.
+[build]
+rustc-wrapper = ""
+
+# Native-CPU release build: opt in with
+#
+#   CARGO_BUILD_RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# Distributed wheels stay portable (baseline x86_64-v2) by default.
+# build.rs additionally enables `-march=native` for the vendored cubiomes C
+# sources when the env var `MCSF_NATIVE_CPU=1` is set, so a native build
+# is `MCSF_NATIVE_CPU=1 CARGO_BUILD_RUSTFLAGS="-C target-cpu=native" cargo
+# build --release`.

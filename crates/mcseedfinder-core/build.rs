@@ -41,6 +41,12 @@ fn main() {
     build.flag_if_supported("-fwrapv");
     // The vendored C is upstream code; don't fail our build on its warnings.
     build.warnings(false);
+    // Opt-in native build: pairs with `CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"`
+    // for the Rust side. Distributed wheels stay at the baseline.
+    println!("cargo:rerun-if-env-changed=MCSF_NATIVE_CPU");
+    if std::env::var("MCSF_NATIVE_CPU").as_deref() == Ok("1") {
+        build.flag_if_supported("-march=native");
+    }
 
     for src in cubiomes_srcs {
         let path = format!("{cubiomes}/{src}");

@@ -325,6 +325,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Parse args and run the search. Returns a UNIX-style exit code."""
     args = build_parser().parse_args(argv)
 
+    # ---- Version guard rail ----
+    # Catch unsupported Minecraft versions early — otherwise the user sees
+    # either a hard cubiomes "from_strs" failure later, or silently
+    # incorrect biome results if the spec only used structure criteria.
+    # Only checked for Java + when cubiomes is in the build (the
+    # approximate-biomes / no-cubiomes path accepts any version string).
+    if args.edition == "java":
+        from .rust_backend import has_cubiomes, is_supported_version
+
+        if has_cubiomes() and not is_supported_version(args.version):
+            print(
+                f"error: Minecraft version {args.version!r} is not supported by the "
+                "bundled cubiomes. Pass --version with a value the bundled cubiomes "
+                "recognises (e.g. 1.18, 1.19.2, 1.20.4, 1.21). See "
+                "docs/SUPPORTED_VERSIONS.md for the current matrix.",
+                file=sys.stderr,
+            )
+            return 2
+
     # ---- Information modes ----
     if args.list_structures:
         for s in sorted(SUPPORTED_STRUCTURES):

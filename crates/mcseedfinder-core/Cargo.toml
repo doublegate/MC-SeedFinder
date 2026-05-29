@@ -27,6 +27,12 @@ biomes = []
 # init falls back to CPU at runtime if no GPU adapter is reachable, so the
 # feature is safe to ship enabled in production builds.
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+# Rayon-backed parallel search inside a single Rust call. Off by default
+# because the typical mc-seed-finder deployment already parallelises at the
+# Python multiprocessing layer (one worker per core); rayon on top would
+# oversubscribe. Enable for single-process consumers (Tauri's per-job
+# thread, CLI runs with --workers=1, bench harnesses).
+parallel = ["dep:rayon"]
 # NOTE: `pyo3` is intentionally NOT declared as an explicit feature. It stays an
 # implicit feature of the optional `pyo3` dependency so that maturin's
 # `features = ["pyo3/extension-module"]` activates `#[cfg(feature = "pyo3")]`.
@@ -49,6 +55,9 @@ base64 = "0.22"
 wgpu = { version = "23", optional = true, default-features = false, features = ["metal", "dx12", "wgsl"] }
 bytemuck = { version = "1.16", optional = true, features = ["derive"] }
 pollster = { version = "0.4", optional = true }
+# Data-parallel search loop. Gated behind the `parallel` feature so the
+# default build stays multiprocessing-friendly (see the feature comment above).
+rayon = { version = "1.10", optional = true }
 
 [build-dependencies]
 # Compiles the vendored cubiomes C sources + shim when the `biomes` feature is on.

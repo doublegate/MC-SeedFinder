@@ -53,6 +53,24 @@ int mcsf_str2mc(const char *s) {
     return str2mc(s);
 }
 
+/* Reference oracle for the Rust-side buried_treasure per-chunk roll
+ * (structures.rs::roll_buried_treasure_chunk). Returns 1 iff cubiomes'
+ * own getStructurePos(Treasure, ...) succeeds at (chunkX, chunkZ),
+ * 0 otherwise. The MC version controls which structure config is used,
+ * though for Treasure the config is stable from 1.13 onwards.
+ *
+ * Lets the Rust unit tests compare us bit-exactly against cubiomes
+ * instead of just self-checking against the math we ported.
+ */
+int mcsf_buried_treasure_at(int mc, uint64_t world_seed, int chunk_x, int chunk_z) {
+    StructureConfig sconf;
+    if (!getStructureConfig(Treasure, mc, &sconf)) {
+        return 0;
+    }
+    Pos pos;
+    return getStructurePos(Treasure, mc, world_seed, chunk_x, chunk_z, &pos);
+}
+
 /* Batch biome generation for a rectangular area. Mirrors cubiomes' genBiomes
  * — far faster than per-pixel getBiomeAt for tile rendering. `out` must hold
  * at least sx*sz int32s. Returns 0 on success. y/sy = 0 → 2D plane. */

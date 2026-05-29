@@ -3,7 +3,12 @@ members = ["crates/mcseedfinder-core"]
 resolver = "2"
 
 [profile.release]
-lto = "thin"
+# `lto = "fat"` is worth 3–8% on the tight structure/RNG inner loop versus
+# "thin"; `codegen-units = 1` keeps inlining across the whole crate.
+# We intentionally keep `panic = "unwind"` (the default): the `_native` cdylib
+# is loaded into a Python process via PyO3, and PyO3 needs unwinding to turn
+# Rust panics into Python exceptions instead of aborting the host process.
+lto = "fat"
 codegen-units = 1
 
 # Workspace-level clippy policy. Most lints stay at clippy's default

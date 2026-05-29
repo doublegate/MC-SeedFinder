@@ -110,8 +110,17 @@ struct AppState {
 /// Maximum cached BiomeBackends per (version, dimension). Concurrent tile
 /// requests grab from this pool in parallel; if more than this number are
 /// in-flight at once, extras are allocated and dropped on release rather
-/// than retained. 4 covers foreground + 3 prefetches comfortably.
-const BIOME_POOL_MAX: usize = 4;
+/// than retained. We size to the machine's hardware-thread count (clamped
+/// to [4, 16]) so a saturated pool doesn't fall through to the slow
+/// `setupGenerator` path (~200 ms per call). Each cached Generator costs a
+/// few MB of RAM, hence the upper bound. Use a function rather than a const
+/// because `available_parallelism()` queries the OS at runtime.
+fn biome_pool_max() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 16)
+}
 
 fn acquire_biome_backend(
     state: &AppState,
@@ -139,7 +148,7 @@ fn release_biome_backend(state: &AppState, version: &str, dimension: &str, backe
     let key = (version.to_string(), dimension.to_string());
     if let Ok(mut guard) = state.biome_pool.lock() {
         let vec = guard.entry(key).or_default();
-        if vec.len() < BIOME_POOL_MAX {
+        if vec.len() < biome_pool_max() {
             vec.push(backend);
         }
         // Else: drop. Excess backends release their cubiomes allocation.
@@ -187,6 +196,7 @@ fn req_to_predicate(req: &StructureRequirement) -> Option<GpuPredicate> {
 ///   - `Cluster` → cluster combinator
 ///   - `AllOf` of N `NearbyStructure` leaves (N ≤ MAX_PREDICATES)
 ///   - `AnyOf` of N `NearbyStructure` leaves (N ≤ MAX_PREDICATES)
+///
 /// Anything else returns None and the search stays on the CPU path.
 fn try_extract_gpu_spec(node: &CompiledNode) -> Option<(Combinator, Vec<GpuPredicate>)> {
     match node {
@@ -202,7 +212,7 @@ fn try_extract_gpu_spec(node: &CompiledNode) -> Option<(Combinator, Vec<GpuPredi
                 return None;
             }
             // Any stronghold disqualifies — not supported by the kernel.
-            if structures.iter().any(|s| *s == StructureType::Stronghold) {
+            if structures.contains(&StructureType::Stronghold) {
                 return None;
             }
             let preds: Vec<GpuPredicate> = structures
@@ -353,14 +363,48 @@ fn start_search(
             },
         );
 
+    // Per-search constants: edition / version / dimension / exactness /
+    // matched_features don't change across matches in a single search, so
+    // we ship them ONCE with `search-started` and the frontend stitches
+    // them into each batched `search-matches` event. Saves ~6 allocations
+    // + one HashMap per match (D6).
+    let needs_biomes = conditions::has_biome_leaves(&compiled);
+    let mut exactness = HashMap::new();
+    exactness.insert("structures".to_string(), "exact".to_string());
+    if needs_biomes {
+        exactness.insert("biomes".to_string(), "exact".to_string());
+    }
+    let matched_features = if needs_biomes {
+        vec!["structure_conditions".into(), "biome_conditions".into()]
+    } else {
+        vec!["structure_conditions".into()]
+    };
+    let meta = SearchMeta {
+        edition: spec.edition.clone(),
+        version: spec.version.clone(),
+        dimension: spec.dimension.clone(),
+        exactness,
+        matched_features,
+    };
+
     let app_clone = app.clone();
     let job_id_clone = job_id.clone();
     let spec_clone = spec.clone();
+    let meta_clone = meta.clone();
     thread::spawn(move || {
-        run_search(app_clone, job_id_clone, spec_clone, compiled, cancel);
+        run_search(
+            app_clone,
+            job_id_clone,
+            spec_clone,
+            compiled,
+            cancel,
+            meta_clone,
+        );
     });
 
-    // Emit a "started" lifecycle event so the UI can flip into a running state.
+    // Emit a "started" lifecycle event so the UI can flip into a running
+    // state. Includes the per-search constants the frontend needs to
+    // materialise SeedReports from the slim `search-matches` batches.
     let _ = app.emit(
         "search-started",
         serde_json::json!({
@@ -368,10 +412,96 @@ fn start_search(
             "count": spec.count,
             "version": spec.version,
             "dimension": spec.dimension,
+            "meta": meta,
         }),
     );
 
     Ok(job_id)
+}
+
+/// Per-search constants emitted with `search-started` so per-match events
+/// don't need to repeat them. The frontend reads these once and
+/// reconstructs a full `SeedReport` for every batched seed it receives.
+#[derive(Debug, Serialize, Clone)]
+struct SearchMeta {
+    edition: String,
+    version: String,
+    dimension: String,
+    /// "structures" → "exact" always; biome status depends on whether the
+    /// spec contains biome leaves at compile time.
+    exactness: HashMap<String, String>,
+    /// What the search verified — same Vec used to fill each SeedReport.
+    matched_features: Vec<String>,
+}
+
+/// Batched per-match payload (D5/D6/D7). Carries just the seeds + how many
+/// have been found across the search so far; the frontend stitches in the
+/// per-search constants from `search-started`. Saves ~6 allocations + a
+/// fresh HashMap per match versus the old one-event-per-match path.
+#[derive(Debug, Serialize, Clone)]
+struct MatchBatchEvent {
+    job_id: String,
+    seeds: Vec<i64>,
+    /// Total matches found so far (including this batch). Lets the UI
+    /// update its progress badge from a batch event without waiting for
+    /// the next `search-progress`.
+    matches_total: u64,
+}
+
+/// Coalesces match emissions so the UI doesn't pay React's O(n²) array
+/// rebuild for every seed when the search hits thousands of matches.
+/// Flushes when the buffer fills up (`BATCH_MAX`) OR a wall-clock window
+/// has elapsed since the last flush (`BATCH_DEADLINE_MS`).
+struct MatchBatcher {
+    job_id: String,
+    pending: Vec<i64>,
+    /// Total cumulative matches; emitted as `matches_total` so the UI
+    /// doesn't have to maintain a running count.
+    matches_total: u64,
+    last_flush: std::time::Instant,
+}
+
+impl MatchBatcher {
+    const BATCH_MAX: usize = 32;
+    const BATCH_DEADLINE_MS: u128 = 100;
+
+    fn new(job_id: String) -> Self {
+        Self {
+            job_id,
+            pending: Vec::with_capacity(Self::BATCH_MAX),
+            matches_total: 0,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+
+    /// Buffer a hit. Flushes when full OR the deadline window has elapsed
+    /// since the last flush. Increments `matches_total` either way.
+    fn push(&mut self, app: &AppHandle, seed: i64) {
+        self.pending.push(seed);
+        self.matches_total += 1;
+        let elapsed = self.last_flush.elapsed().as_millis();
+        if self.pending.len() >= Self::BATCH_MAX || elapsed >= Self::BATCH_DEADLINE_MS {
+            self.flush(app);
+        }
+    }
+
+    /// Force-emit any buffered seeds (called at chunk boundaries and on
+    /// completion so the user never sees a stale results panel).
+    fn flush(&mut self, app: &AppHandle) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let seeds = std::mem::take(&mut self.pending);
+        let _ = app.emit(
+            "search-matches",
+            MatchBatchEvent {
+                job_id: self.job_id.clone(),
+                seeds,
+                matches_total: self.matches_total,
+            },
+        );
+        self.last_flush = std::time::Instant::now();
+    }
 }
 
 fn emit_completed(
@@ -397,6 +527,12 @@ fn emit_completed(
 /// GPU fast-path. Chunks dispatches so the cancel flag can be checked between
 /// each, and so a `search-progress` event fires at chunk boundaries (same
 /// shape as the CPU path so the UI doesn't have to special-case it).
+///
+/// 8 parameters is one over clippy's default cap, but they're all distinct
+/// inputs the kernel genuinely needs (handle, ids, spec, kernel-cfg,
+/// resources, cancellation, per-search constants). A bundling struct would
+/// just push the noise into a one-call-site type definition.
+#[allow(clippy::too_many_arguments)]
 fn run_search_gpu(
     app: &AppHandle,
     job_id: &str,
@@ -405,6 +541,7 @@ fn run_search_gpu(
     predicates: &[GpuPredicate],
     searcher: &GpuSearcher,
     cancel: &AtomicBool,
+    meta: &SearchMeta,
 ) {
     // 65k seeds per dispatch ≈ a few tens of ms on a modern GPU — small enough
     // for snappy cancellation, large enough that the per-dispatch overhead
@@ -412,9 +549,18 @@ fn run_search_gpu(
     const CHUNK: u64 = 65_536;
     let mut scanned: u64 = 0;
     let mut matches: u64 = 0;
+    let mut batcher = MatchBatcher::new(job_id.to_string());
+    // The GPU path advertises itself in `matched_features` so the UI / export
+    // can distinguish "GPU-verified structure prefilter" from the CPU mixed
+    // structure+biome path. Extend the shared meta locally.
+    let mut gpu_matched_features = meta.matched_features.clone();
+    if !gpu_matched_features.iter().any(|f| f == "gpu_prefilter") {
+        gpu_matched_features.push("gpu_prefilter".into());
+    }
 
     while scanned < spec.count {
         if cancel.load(Ordering::Relaxed) {
+            batcher.flush(app);
             emit_completed(app, job_id, scanned, matches, "cancelled", None);
             return;
         }
@@ -428,6 +574,7 @@ fn run_search_gpu(
         }) {
             Ok(v) => v,
             Err(e) => {
+                batcher.flush(app);
                 emit_completed(
                     app,
                     job_id,
@@ -441,35 +588,35 @@ fn run_search_gpu(
         };
 
         for seed in chunk_matches {
-            let mut exactness = HashMap::new();
-            exactness.insert("structures".to_string(), "exact".to_string());
             let report = SeedReport {
                 seed,
-                edition: spec.edition.clone(),
-                version: spec.version.clone(),
-                dimension: spec.dimension.clone(),
+                edition: meta.edition.clone(),
+                version: meta.version.clone(),
+                dimension: meta.dimension.clone(),
                 score: 0.0,
-                matched_features: vec!["structure_conditions".into(), "gpu_prefilter".into()],
-                exactness,
+                matched_features: gpu_matched_features.clone(),
+                exactness: meta.exactness.clone(),
                 warnings: Vec::new(),
             };
             if let Some(jobs) = app.try_state::<AppState>() {
                 if let Ok(mut guard) = jobs.jobs.lock() {
                     if let Some(inner) = guard.get_mut(job_id) {
-                        inner.results.push(report.clone());
+                        inner.results.push(report);
                     }
                 }
             }
-            let _ = app.emit("search-match", &report);
+            batcher.push(app, seed);
             matches += 1;
             if matches >= spec.max_matches {
                 let scanned_final = scanned + this_chunk;
+                batcher.flush(app);
                 emit_completed(app, job_id, scanned_final, matches, "max_matches", None);
                 return;
             }
         }
 
         scanned += this_chunk;
+        batcher.flush(app);
         let _ = app.emit(
             "search-progress",
             ProgressEvent {
@@ -480,6 +627,7 @@ fn run_search_gpu(
         );
     }
 
+    batcher.flush(app);
     emit_completed(app, job_id, scanned, matches, "range_exhausted", None);
 }
 
@@ -489,6 +637,7 @@ fn run_search(
     spec: SearchSpec,
     compiled: CompiledNode,
     cancel: Arc<AtomicBool>,
+    meta: SearchMeta,
 ) {
     // GPU fast-path: route to wgpu ONLY when the dispatch is large enough to
     // amortise the per-dispatch overhead (buffer-create + queue-submit +
@@ -514,6 +663,7 @@ fn run_search(
                     &predicates,
                     searcher,
                     &cancel,
+                    &meta,
                 );
                 return;
             }
@@ -543,37 +693,7 @@ fn run_search(
         None
     };
 
-    let report_match = |seed: i64, scanned_at: u64, matches_so_far: u64| {
-        let mut exactness = HashMap::new();
-        exactness.insert("structures".to_string(), "exact".to_string());
-        if needs_biomes {
-            exactness.insert("biomes".to_string(), "exact".to_string());
-        }
-        let report = SeedReport {
-            seed,
-            edition: spec.edition.clone(),
-            version: spec.version.clone(),
-            dimension: spec.dimension.clone(),
-            score: 0.0,
-            matched_features: if needs_biomes {
-                vec!["structure_conditions".into(), "biome_conditions".into()]
-            } else {
-                vec!["structure_conditions".into()]
-            },
-            exactness,
-            warnings: Vec::new(),
-        };
-        if let Some(jobs) = app.try_state::<AppState>() {
-            if let Ok(mut guard) = jobs.jobs.lock() {
-                if let Some(inner) = guard.get_mut(&job_id) {
-                    inner.results.push(report.clone());
-                }
-            }
-        }
-        let _ = app.emit("search-match", &report);
-        let _ = scanned_at; // reserved for richer telemetry
-        let _ = matches_so_far;
-    };
+    let mut batcher = MatchBatcher::new(job_id.clone());
 
     let chunk: u64 = 4096;
     let mut scanned: u64 = 0;
@@ -581,6 +701,7 @@ fn run_search(
 
     while scanned < spec.count {
         if cancel.load(Ordering::Relaxed) {
+            batcher.flush(&app);
             emit_completed(&app, &job_id, scanned, matches, "cancelled", None);
             return;
         }
@@ -593,15 +714,40 @@ fn run_search(
             };
             if hit {
                 matches += 1;
-                report_match(seed, scanned + i, matches);
+                // Store a full SeedReport for export_results to hand back
+                // later; emit only the seed itself via the batcher (the
+                // frontend stitches in the per-search constants from the
+                // `search-started` meta).
+                let report = SeedReport {
+                    seed,
+                    edition: meta.edition.clone(),
+                    version: meta.version.clone(),
+                    dimension: meta.dimension.clone(),
+                    score: 0.0,
+                    matched_features: meta.matched_features.clone(),
+                    exactness: meta.exactness.clone(),
+                    warnings: Vec::new(),
+                };
+                if let Some(jobs) = app.try_state::<AppState>() {
+                    if let Ok(mut guard) = jobs.jobs.lock() {
+                        if let Some(inner) = guard.get_mut(&job_id) {
+                            inner.results.push(report);
+                        }
+                    }
+                }
+                batcher.push(&app, seed);
                 if matches >= spec.max_matches {
                     let scanned_final = scanned + i + 1;
+                    batcher.flush(&app);
                     emit_completed(&app, &job_id, scanned_final, matches, "max_matches", None);
                     return;
                 }
             }
         }
         scanned += this_chunk;
+        // Flush at chunk boundaries so users always see results within
+        // ~one chunk's wall-clock time even on very-sparse searches.
+        batcher.flush(&app);
         let _ = app.emit(
             "search-progress",
             ProgressEvent {
@@ -612,6 +758,7 @@ fn run_search(
         );
     }
 
+    batcher.flush(&app);
     emit_completed(&app, &job_id, scanned, matches, "range_exhausted", None);
 }
 
@@ -854,6 +1001,77 @@ fn render_tile_rgba_cmd(
             "y": request.y,
         })
     })
+}
+
+/// Binary-IPC variant of [`render_tile_rgba_cmd`]. Returns the same RGBA +
+/// biome-IDs payload packed into a single `tauri::ipc::Response` body so
+/// Tauri ships it as raw bytes instead of a JSON array of numbers.
+///
+/// Why: the JSON-array path expands a 1.7 MB tile to ~6 MB of JSON text
+/// (3-5× bloat), pays JSON-encode on Rust + JSON.parse on the WebView,
+/// and forces the receiver into `new Uint8ClampedArray(numberArray)`
+/// which copies every cell. The binary path drops all of that — IPC
+/// becomes a single memcpy and the receiver can alias the ArrayBuffer
+/// for `ImageData`. Empirically a 50–100 ms saving per tile fetch and
+/// the map "feels like a different app".
+///
+/// Wire format (little-endian):
+/// ```text
+///   off  size  field
+///     0     4  magic "MCSF"
+///     4     4  format version (u32, = 1)
+///     8     4  y (i32, the sampled Minecraft Y)
+///    12     4  bytes_len (u32, = sx*sz*4)
+///    16     4  ids_len (u32, = sx*sz)
+///    20  Bytes RGBA pixel buffer (bytes_len bytes)
+///   ...  ids   biome IDs as u8s (ids_len bytes)
+/// ```
+///
+/// Metadata the response does NOT include (seed/scale/x/z/sx/sz/version/
+/// dimension) is already known to the caller since it sent them in the
+/// request, so we don't pay to echo them back.
+#[tauri::command]
+fn render_tile_rgba_binary(
+    request: TileRequest,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
+    if superseded(&state.tile_counter, my_seq) {
+        release_biome_backend(&state, &request.version, &request.dimension, backend);
+        return Err(SUPERSEDED.into());
+    }
+    let result = backend.render_tile_rgba_and_ids_at_y(
+        request.seed,
+        request.scale,
+        request.x,
+        request.z,
+        request.sx,
+        request.sz,
+        request.y,
+    );
+    let version = request.version.clone();
+    let dimension = request.dimension.clone();
+    release_biome_backend(&state, &version, &dimension, backend);
+    if superseded(&state.tile_counter, my_seq) {
+        return Err(SUPERSEDED.into());
+    }
+    let (rgba, biome_ids) = result?;
+    // Pack: 20-byte header + rgba + biome_ids. Allocate exact capacity so
+    // the buffer doesn't grow via reallocations.
+    const HEADER_LEN: usize = 20;
+    let mut out = Vec::with_capacity(HEADER_LEN + rgba.len() + biome_ids.len());
+    out.extend_from_slice(b"MCSF"); // magic
+    out.extend_from_slice(&1u32.to_le_bytes()); // format version
+    out.extend_from_slice(&request.y.to_le_bytes()); // sampled Y
+    out.extend_from_slice(&(rgba.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(biome_ids.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rgba);
+    out.extend_from_slice(&biome_ids);
+    Ok(tauri::ipc::Response::new(out))
 }
 
 /// Heightmap request: same view rectangle as `TileRequest` but the
@@ -1203,6 +1421,24 @@ fn main() {
 
     tauri::Builder::default()
         .manage(AppState::default())
+        // Eager-warm the GpuSearcher in a background thread at startup.
+        // First-search lazy init costs ~200–500 ms (adapter request + pipeline
+        // compile + persistent buffer allocation) and used to block the search
+        // thread on the user's first large structure-only search. Doing it at
+        // app launch hides that cost behind splash/window-paint time. The
+        // OnceLock guarantees idempotency if `run_search` happens to win the
+        // race; both call sites use `get_or_init`. Failure is silent — the
+        // CPU path is always available as a fallback, and `try_new` returns
+        // `None` cleanly when no GPU adapter exists (e.g. CI / headless).
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    let _ = state.gpu.get_or_init(GpuSearcher::try_new);
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_search,
             pause_search,
@@ -1211,6 +1447,7 @@ fn main() {
             analyze_seed,
             render_tile,
             render_tile_rgba_cmd,
+            render_tile_rgba_binary,
             surface_height_tile_cmd,
             list_slime_chunks_cmd,
             world_spawn_cmd,

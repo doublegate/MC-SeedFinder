@@ -53,8 +53,10 @@ export type HoverInfo = {
 
 export type Map3DProps = {
   tile: {
-    bytes: number[];
-    biomeIds?: number[]; // per-cell cubiomes biome IDs (u8 in number[])
+    // Aliased over the binary IPC payload (D1). Random index access works
+    // exactly like a number[] but with no JSON parse / no per-element copy.
+    bytes: Uint8Array;
+    biomeIds?: Uint8Array; // per-cell cubiomes biome IDs (u8)
     sx: number;
     sz: number;
     x: number; // top-left block X

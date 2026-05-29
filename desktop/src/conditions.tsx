@@ -225,13 +225,42 @@ export const PRESET_TEMPLATES: PresetTemplate[] = [
   },
 ];
 
-/** Convert a UI tree to the wire-format JSON the backend accepts. */
+/** Convert a UI tree to the wire-format JSON the backend accepts.
+ *
+ * Defensively guards against pathological trees: the `seen` set detects
+ * self-references (would infinite-recurse) and the `depth` cap catches
+ * very deep trees before they blow the JS stack. Throws a clear error in
+ * either case so the React error boundary surfaces something usable
+ * instead of "Maximum call stack size exceeded" with no context.
+ */
+const NODE_MAX_DEPTH = 64;
 export function nodeToWire(n: TreeNode): Record<string, unknown> {
+  return nodeToWireImpl(n, new WeakSet(), 0);
+}
+function nodeToWireImpl(
+  n: TreeNode,
+  seen: WeakSet<TreeNode>,
+  depth: number,
+): Record<string, unknown> {
+  if (depth > NODE_MAX_DEPTH) {
+    throw new Error(
+      `nodeToWire: tree exceeds max depth ${NODE_MAX_DEPTH} (suspect a cycle or pathological nesting)`,
+    );
+  }
+  if (seen.has(n)) {
+    throw new Error(
+      `nodeToWire: cycle detected at node id=${n.id} type=${n.type} — refusing to serialize`,
+    );
+  }
+  seen.add(n);
   switch (n.type) {
     case "all_of":
     case "any_of":
     case "none_of":
-      return { type: n.type, of: n.of.map(nodeToWire) };
+      return {
+        type: n.type,
+        of: n.of.map((c) => nodeToWireImpl(c, seen, depth + 1)),
+      };
     case "nearby_structure":
       return { type: "nearby_structure", structure: n.structure, max_distance: n.max_distance, centre_x: n.centre_x, centre_z: n.centre_z };
     case "cluster":

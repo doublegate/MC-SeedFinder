@@ -154,8 +154,19 @@ STRUCTURE_CONFIGS: dict[str, StructureConfig] = {
     "ocean_monument": StructureConfig(10387313, 32, 5, SpreadType.TRIANGULAR),
     "woodland_mansion": StructureConfig(10387319, 80, 20, SpreadType.TRIANGULAR),
     "ruined_portal":  StructureConfig(34222645, 40, 15),
-    # Note: stronghold positions use a *completely different* algorithm
-    # (concentric rings around origin). See `iter_strongholds` below.
+    # 1.19.2+: deep-dark city, standard linear getFeaturePos
+    # (cubiomes s_ancient_city = {20083232, 24, 16} → separation=24-16=8).
+    "ancient_city":   StructureConfig(20083232, 24, 8),
+    # 1.21+: trial chambers, standard linear getFeaturePos
+    # (cubiomes s_trial_chambers = {94251327, 34, 22} → separation=34-22=12).
+    "trial_chambers": StructureConfig(94251327, 34, 12),
+    # Notes on entries with non-region-grid placement:
+    #
+    # * stronghold — concentric-ring algorithm (see ``iter_strongholds``).
+    # * buried_treasure — per-chunk 1% nextFloat roll (cubiomes `case
+    #   Treasure`). The salt is real but spacing/separation are dummy
+    #   placeholders here; the real evaluator branches via
+    #   ``roll_buried_treasure_chunk`` + ``iter_buried_treasure_in_radius``.
 }
 
 
@@ -187,6 +198,65 @@ class StructurePos:
         return math.hypot(dx, dz)
 
 
+_BURIED_TREASURE_SALT = 10387320
+
+
+def roll_buried_treasure_chunk(world_seed: int, chunk_x: int, chunk_z: int) -> bool:
+    """True iff a buried treasure is placed in ``(chunk_x, chunk_z)``.
+
+    Buried treasure uses a per-chunk roll rather than the standard region
+    grid: at every chunk, mix the salt + region multipliers into the world
+    seed, seed Java's RNG, and check ``nextFloat() < 0.01``. The placement
+    anchor when true is ``(chunk_x * 16 + 9, chunk_z * 16 + 9)`` — note the
+    ``+9``, not the ``+8`` used by canonical region-anchor structures.
+    Mirrors the Rust ``structures::roll_buried_treasure_chunk`` and cubiomes
+    ``case Treasure`` in ``finders.c``.
+    """
+    k = (
+        world_seed
+        + _BURIED_TREASURE_SALT
+        + chunk_x * _REGION_MUL_X
+        + chunk_z * _REGION_MUL_Z
+    )
+    k = _wrap_signed_long(k)
+    rng = JavaRandom(k)
+    # Cubiomes' `nextFloat(&seed) < 0.01` is f32 < f64 (the literal 0.01
+    # promotes via C's usual arithmetic conversions). Python's `next_float`
+    # returns f64 — round-trip through `struct` to drop to f32 precision so
+    # the comparison matches cubiomes bit-exactly even at the rounding
+    # boundary (where naïve f64-vs-f64 disagrees with f32-promoted-to-f64).
+    import struct
+    raw_f64 = rng.next_float()
+    f32_as_f64 = struct.unpack("f", struct.pack("f", raw_f64))[0]
+    return f32_as_f64 < 0.01
+
+
+def iter_buried_treasure_in_radius(
+    world_seed: int,
+    centre_block_x: int,
+    centre_block_z: int,
+    block_radius: int,
+) -> Iterator[StructurePos]:
+    """Yield every buried treasure within ``block_radius`` of the centre."""
+    chunk_radius = (block_radius // 16) + 1
+    cx_min = (centre_block_x // 16) - chunk_radius
+    cx_max = (centre_block_x // 16) + chunk_radius
+    cz_min = (centre_block_z // 16) - chunk_radius
+    cz_max = (centre_block_z // 16) + chunk_radius
+    block_radius_sq = block_radius * block_radius
+    for cx in range(cx_min, cx_max + 1):
+        for cz in range(cz_min, cz_max + 1):
+            if not roll_buried_treasure_chunk(world_seed, cx, cz):
+                continue
+            bx = cx * 16 + 9
+            bz = cz * 16 + 9
+            dx = bx - centre_block_x
+            dz = bz - centre_block_z
+            if dx * dx + dz * dz > block_radius_sq:
+                continue
+            yield StructurePos(structure="buried_treasure", chunk_x=cx, chunk_z=cz)
+
+
 def get_structure_pos(
     structure: str, world_seed: int, region_x: int, region_z: int
 ) -> StructurePos:
@@ -199,6 +269,10 @@ def get_structure_pos(
     suitable terrain height). Without a real biome generator we return the
     candidate chunk; the criteria layer can filter further if you have one.
 
+    Buried treasure uses a per-chunk roll, not a region-grid placement —
+    callers should use :func:`roll_buried_treasure_chunk` or
+    :func:`iter_buried_treasure_in_radius` instead.
+
     Parameters
     ----------
     structure:
@@ -210,6 +284,11 @@ def get_structure_pos(
         Region grid coordinates. To find the structure near chunk
         ``(cx, cz)``, use ``region_x = cx // spacing`` etc.
     """
+    if structure == "buried_treasure":
+        raise ValueError(
+            "buried_treasure uses per-chunk roll; "
+            "call roll_buried_treasure_chunk() / iter_buried_treasure_in_radius()"
+        )
     cfg = STRUCTURE_CONFIGS[structure]
 
     # ---- Per-region RNG seed ----
@@ -250,7 +329,15 @@ def iter_structures_in_radius(
     of the search circle, then filters by Euclidean distance. For a 2000-block
     radius this is on the order of a few hundred regions per structure type,
     so even a brute-force seed sweep stays fast.
+
+    Buried treasure is dispatched to its per-chunk-roll iterator since the
+    region-grid framework doesn't model "most chunks have no placement".
     """
+    if structure == "buried_treasure":
+        yield from iter_buried_treasure_in_radius(
+            world_seed, centre_block_x, centre_block_z, block_radius
+        )
+        return
     cfg = STRUCTURE_CONFIGS[structure]
     # Convert the search box to chunk coords, then to region coords.
     chunk_radius = (block_radius // 16) + 1

@@ -32,11 +32,14 @@ from __future__ import annotations
 
 import unittest
 
+from mcseedfinder import rust_backend
 from mcseedfinder.structures import (
     STRUCTURE_CONFIGS,
     get_structure_pos,
+    iter_buried_treasure_in_radius,
     iter_strongholds,
     iter_structures_in_radius,
+    roll_buried_treasure_chunk,
 )
 
 
@@ -54,6 +57,12 @@ class TestStructureMath(unittest.TestCase):
         "pillager_outpost": ( 5, 20),
         "igloo":            ( 0, 10),
         "jungle_temple":    ( 0, 18),
+        # 1.19.2+ deep-dark city: salt 20083232, spread 16.
+        "ancient_city":     ( 9, 11),
+        # 1.21+ trial chambers: salt 94251327, spread 22.
+        "trial_chambers":   (18, 14),
+        # buried_treasure deliberately omitted — it uses the per-chunk roll
+        # path (no region-grid placement). See `TestBuriedTreasureRoll`.
     }
 
     def test_known_first_region_positions(self) -> None:
@@ -105,6 +114,70 @@ class TestStructureMath(unittest.TestCase):
         ]
         for name in required:
             self.assertIn(name, STRUCTURE_CONFIGS, f"Missing config for {name}")
+
+
+class TestBuriedTreasureRoll(unittest.TestCase):
+    """Per-chunk roll placement for buried_treasure (cubiomes `case Treasure`)."""
+
+    def test_python_matches_rust_native_for_seed_1(self) -> None:
+        """Bit-exact parity between the Python and Rust implementations of
+        the buried_treasure roll. The Rust side is in turn parity-checked
+        against cubiomes in its own test suite, so this transitively ties
+        Python to cubiomes."""
+        if not rust_backend.is_available():
+            self.skipTest("native extension not built")
+        from mcseedfinder._native import roll_buried_treasure_chunk_py
+        for cx in range(-16, 17):
+            for cz in range(-16, 17):
+                ours = roll_buried_treasure_chunk(1, cx, cz)
+                native = roll_buried_treasure_chunk_py(1, cx, cz)
+                self.assertEqual(
+                    ours, native,
+                    f"Python/Rust roll disagree at chunk ({cx}, {cz}) for seed=1"
+                )
+
+    def test_rate_is_about_one_percent(self) -> None:
+        """~1% chance per chunk → expect 2..30 hits in a 33×33 grid (Poisson
+        std ~3.3). Wide band so it doesn't flake; catches regressions where
+        the salt math or float threshold drift drastically."""
+        hits = sum(
+            1
+            for cx in range(-16, 17)
+            for cz in range(-16, 17)
+            if roll_buried_treasure_chunk(1, cx, cz)
+        )
+        self.assertTrue(
+            2 <= hits <= 30,
+            f"implausible buried_treasure rate: {hits}/1089 for seed=1",
+        )
+
+    def test_iter_yields_anchors_inside_radius(self) -> None:
+        """Every yielded position must lie within the requested block
+        radius of the centre — guards against bounding-box bugs at the
+        circle's edge."""
+        radius = 2000
+        results = list(iter_buried_treasure_in_radius(1, 0, 0, radius))
+        for pos in results:
+            anchor_x = pos.chunk_x * 16 + 9  # buried_treasure uses +9, not +8
+            anchor_z = pos.chunk_z * 16 + 9
+            self.assertLessEqual(
+                anchor_x * anchor_x + anchor_z * anchor_z, radius * radius,
+                f"buried_treasure at ({anchor_x},{anchor_z}) outside {radius}-block radius"
+            )
+
+    def test_iter_in_radius_dispatches_through_structures_helper(self) -> None:
+        """``iter_structures_in_radius('buried_treasure', ...)`` must route
+        to the per-chunk path — not error or fall through to the region
+        framework that doesn't model 1%-per-chunk placement."""
+        direct = sorted(
+            (p.chunk_x, p.chunk_z)
+            for p in iter_buried_treasure_in_radius(1, 0, 0, 2000)
+        )
+        dispatched = sorted(
+            (p.chunk_x, p.chunk_z)
+            for p in iter_structures_in_radius("buried_treasure", 1, 0, 0, 2000)
+        )
+        self.assertEqual(direct, dispatched)
 
 
 if __name__ == "__main__":  # pragma: no cover

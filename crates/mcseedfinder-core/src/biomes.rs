@@ -81,6 +81,12 @@ extern "C" {
         out_ids: *mut c_int,
     ) -> c_int;
     fn mcsf_get_spawn(g: *const CubGenerator, out_x: *mut c_int, out_z: *mut c_int);
+    /// Reference oracle for the Rust-side buried_treasure roll. Returns 1
+    /// when cubiomes' own `getStructurePos(Treasure, ...)` succeeds at
+    /// `(chunk_x, chunk_z)` for `world_seed` at MC version `mc`, 0 otherwise.
+    /// Linked from `csrc/shim.c::mcsf_buried_treasure_at`.
+    fn mcsf_buried_treasure_at(mc: c_int, world_seed: u64, chunk_x: c_int, chunk_z: c_int)
+        -> c_int;
     fn mcsf_climate_np(
         g: *mut CubGenerator,
         x: c_int,
@@ -88,6 +94,26 @@ extern "C" {
         z: c_int,
         out_np6: *mut i64,
     ) -> c_int;
+}
+
+/// Reference: ask cubiomes whether a buried treasure is placed at
+/// `(chunk_x, chunk_z)` for `world_seed` on the given Minecraft version
+/// string. Returns `Some(true|false)` when the version parses, `None`
+/// otherwise. Used by the Rust parity test in `structures.rs`.
+pub fn cubiomes_buried_treasure_at(
+    version: &str,
+    world_seed: i64,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> Option<bool> {
+    use std::ffi::CString;
+    let c = CString::new(version).ok()?;
+    let mc = unsafe { mcsf_str2mc(c.as_ptr()) };
+    if mc <= 0 {
+        return None;
+    }
+    let result = unsafe { mcsf_buried_treasure_at(mc, world_seed as u64, chunk_x, chunk_z) };
+    Some(result != 0)
 }
 
 /// 256-entry cubiomes biome RGB colormap, fetched once.

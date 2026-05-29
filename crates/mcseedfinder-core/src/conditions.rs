@@ -398,6 +398,41 @@ pub fn find_matches_range(start_seed: i64, count: u64, root: &CompiledNode) -> V
         .collect()
 }
 
+/// Rayon-parallel sibling of [`find_matches_range`]. Returns the same
+/// matches in the same (sorted) order as the serial version — guaranteed
+/// because we map over a deterministic seed range and rayon's
+/// `into_par_iter().filter_map().collect()` on a `Range<u64>` preserves
+/// element order. Threads run on rayon's global pool; callers that need a
+/// specific thread count should install a dedicated pool with
+/// `rayon::ThreadPoolBuilder` and call this inside `pool.install(...)`.
+///
+/// Use this when running the search in a single OS process (e.g. the Tauri
+/// desktop's per-job thread). The Python multiprocessing coordinator should
+/// keep using the serial [`find_matches_range`] — running rayon inside each
+/// worker would oversubscribe the CPU.
+#[cfg(feature = "parallel")]
+pub fn find_matches_range_parallel(start_seed: i64, count: u64, root: &CompiledNode) -> Vec<i64> {
+    use rayon::prelude::*;
+    // `with_min_len` requires `IndexedParallelIterator`, which rayon
+    // implements only for `Range<u32 | i32 | usize | isize>` — NOT the
+    // 64-bit variants (whose index space can exceed `usize` on 32-bit
+    // targets). On 64-bit platforms `usize` is `u64`, so the cast is
+    // lossless. On 32-bit platforms a single search dispatch larger than
+    // 2^32 seeds is the (extremely unlikely) ceiling; saturate defensively.
+    let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
+    // `with_min_len` keeps work-stealing units big enough that scheduling
+    // overhead doesn't eat the per-seed savings. Empirically a few thousand
+    // seeds per task is the sweet spot for the structure-RNG inner loop.
+    (0..count_usize)
+        .into_par_iter()
+        .with_min_len(4096)
+        .filter_map(|offset| {
+            let seed = start_seed.wrapping_add(offset as i64);
+            evaluate(root, seed).then_some(seed)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Biome-aware evaluator. The cubiomes-backed BiomeBackend lives in
 // `crate::biomes` and is only compiled with the `biomes` feature, so the
@@ -575,6 +610,60 @@ pub fn find_matches_range_with_biomes(
             evaluate_with_biomes(root, seed, backend).then_some(seed)
         })
         .collect()
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod parallel_tests {
+    use super::*;
+
+    /// Rayon-parallel search must return identical results (same elements,
+    /// same order) to the serial path for the same compiled tree. This is
+    /// the load-bearing parity guarantee for the R1 optimisation: if the
+    /// two paths ever disagree, the Tauri desktop and the Python CLI would
+    /// silently produce different match sets for the same spec.
+    #[test]
+    fn parallel_matches_serial_for_village_search() {
+        let tree = compile(&Node::NearbyStructure {
+            structure: "village".into(),
+            max_distance: 800,
+            centre_x: 0,
+            centre_z: 0,
+        })
+        .unwrap();
+        // 200_000 seeds is far above `with_min_len(4096)` so rayon really
+        // does split the work across threads; small enough to stay fast.
+        let serial = find_matches_range(1, 200_000, &tree);
+        let parallel = find_matches_range_parallel(1, 200_000, &tree);
+        assert_eq!(serial, parallel);
+        assert!(!serial.is_empty(), "village within 800 blocks should hit");
+    }
+
+    /// Parity must hold across a composite tree too — the evaluator's
+    /// short-circuit logic is the same in both paths but a sloppy refactor
+    /// of one without the other would surface here.
+    #[test]
+    fn parallel_matches_serial_for_any_of_tree() {
+        let tree = compile(&Node::AnyOf {
+            of: vec![
+                Node::NearbyStructure {
+                    structure: "village".into(),
+                    max_distance: 400,
+                    centre_x: 0,
+                    centre_z: 0,
+                },
+                Node::NearbyStructure {
+                    structure: "desert_pyramid".into(),
+                    max_distance: 400,
+                    centre_x: 0,
+                    centre_z: 0,
+                },
+            ],
+        })
+        .unwrap();
+        let serial = find_matches_range(1, 50_000, &tree);
+        let parallel = find_matches_range_parallel(1, 50_000, &tree);
+        assert_eq!(serial, parallel);
+    }
 }
 
 #[cfg(all(test, feature = "biomes"))]

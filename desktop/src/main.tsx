@@ -18,6 +18,81 @@ import "./styles.css";
 const WEBGPU_AVAILABLE = hasWebGPU();
 
 // ---------------------------------------------------------------------------
+// Binary tile IPC (D1)
+// ---------------------------------------------------------------------------
+
+const TILE_BIN_MAGIC = "MCSF";
+const TILE_BIN_HEADER_LEN = 20;
+
+/** Tile-request shape shared by the binary command + the legacy thumbs path. */
+type TileRequestPayload = {
+  seed: number;
+  version: string;
+  dimension: string;
+  x: number;
+  z: number;
+  scale: number;
+  sx: number;
+  sz: number;
+  y?: number;
+};
+
+/** Call `render_tile_rgba_binary` and parse its packed payload into a
+ *  `TileResponse`. Throws if the response doesn't look like our format —
+ *  upstream callers already treat tile errors as benign (superseded /
+ *  backend errors leave the canvas empty). */
+async function invokeTileBinary(req: TileRequestPayload): Promise<TileResponse> {
+  // Tauri 2 returns `tauri::ipc::Response` bytes as `ArrayBuffer` here.
+  // The older JSON command returned `{bytes: number[], biome_ids: number[],
+  // ...metadata}`; the binary command returns only the pixel data + biome
+  // IDs, and the frontend fills the metadata back in from the request.
+  const buf = (await invoke("render_tile_rgba_binary", { request: req })) as ArrayBuffer;
+  if (buf.byteLength < TILE_BIN_HEADER_LEN) {
+    throw new Error(`tile binary too short: ${buf.byteLength}`);
+  }
+  const view = new DataView(buf);
+  const magic = String.fromCharCode(
+    view.getUint8(0),
+    view.getUint8(1),
+    view.getUint8(2),
+    view.getUint8(3),
+  );
+  if (magic !== TILE_BIN_MAGIC) {
+    throw new Error(`tile binary bad magic: ${magic}`);
+  }
+  const formatVersion = view.getUint32(4, /* littleEndian */ true);
+  if (formatVersion !== 1) {
+    throw new Error(`tile binary unsupported version: ${formatVersion}`);
+  }
+  const y = view.getInt32(8, true);
+  const bytesLen = view.getUint32(12, true);
+  const idsLen = view.getUint32(16, true);
+  const expected = TILE_BIN_HEADER_LEN + bytesLen + idsLen;
+  if (buf.byteLength !== expected) {
+    throw new Error(
+      `tile binary length mismatch: got ${buf.byteLength}, expected ${expected}`,
+    );
+  }
+  // Alias the underlying buffer — no copies. The RGBA + biome_ids slices
+  // hand directly to Canvas2D / Three.js.
+  const bytes = new Uint8Array(buf, TILE_BIN_HEADER_LEN, bytesLen);
+  const biome_ids = idsLen > 0
+    ? new Uint8Array(buf, TILE_BIN_HEADER_LEN + bytesLen, idsLen)
+    : undefined;
+  return {
+    bytes,
+    biome_ids,
+    seed: req.seed,
+    scale: req.scale,
+    x: req.x,
+    z: req.z,
+    sx: req.sx,
+    sz: req.sz,
+    y,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Types mirroring the Tauri command surface
 // ---------------------------------------------------------------------------
 
@@ -30,6 +105,25 @@ type SearchResult = {
   matched_features: string[];
   exactness: Record<string, string>;
   warnings: string[];
+};
+
+/** Per-search constants emitted with `search-started`. The backend ships
+ *  these once and reuses them across every batched `search-matches`
+ *  event instead of repeating them per match (D6). */
+type SearchMeta = {
+  edition: string;
+  version: string;
+  dimension: string;
+  exactness: Record<string, string>;
+  matched_features: string[];
+};
+
+/** Batched per-match payload (D5). Just the seeds + cumulative count;
+ *  per-search constants come from the most-recent `SearchMeta`. */
+type SearchMatchBatch = {
+  job_id: string;
+  seeds: number[];
+  matches_total: number;
 };
 
 type JobState = {
@@ -49,24 +143,23 @@ type Analysis = {
   strongholds: { block_x: number; block_z: number }[];
 };
 
-// Raw RGBA tile from `render_tile_rgba_cmd`. `bytes` is sx*sz*4 (one byte per
-// channel, row-major, top-left origin). The frontend blits it via a Canvas2D
-// `putImageData`, skipping PNG encode + base64 + browser decode (~30-45 ms
-// saved per tile vs the legacy PNG path).
+// Raw RGBA tile, returned by `render_tile_rgba_binary` (binary IPC; the
+// older `render_tile_rgba_cmd` JSON-array path is still wired for back-compat
+// but unused by the frontend). `bytes` is `sx*sz*4` (RGBA row-major,
+// top-left origin); `biome_ids` is `sx*sz` u8s in the same order. Carried
+// as typed arrays so we never pay JSON encode/decode or per-element copies.
 type TileResponse = {
-  bytes: number[];
-  /** Per-cell cubiomes biome IDs (u8 stored as JS numbers), row-major,
-   *  same order as `bytes`. Used by the 3D voxel renderer and the cursor
-   *  biome-name readout. Optional for back-compat with older backends. */
-  biome_ids?: number[];
+  bytes: Uint8Array;
+  /** Per-cell cubiomes biome IDs (u8), same row-major order as `bytes`.
+   *  Used by the 3D voxel renderer and the cursor biome-name readout. */
+  biome_ids?: Uint8Array;
   seed: number;
   scale: number;
   x: number;
   z: number;
   sx: number;
   sz: number;
-  /** Minecraft block Y at which the biomes were sampled. Optional for
-   *  back-compat with older backends that don't echo it. */
+  /** Minecraft block Y at which the biomes were sampled. */
   y?: number;
 };
 
@@ -178,10 +271,18 @@ function TileCanvas({
     canvas.height = tile.sz;
     const ctx = canvas.getContext("2d", { willReadFrequently: false });
     if (!ctx) return;
-    // tile.bytes arrives as number[] over JSON IPC — wrap as Uint8ClampedArray
-    // (one allocation, no copy). ImageData expects RGBA in row-major order,
-    // top-left origin — exactly what BiomeBackend::render_tile_rgba produces.
-    const clamped = new Uint8ClampedArray(tile.bytes);
+    // tile.bytes arrives as Uint8Array aliased over the binary IPC payload.
+    // Build a Uint8ClampedArray VIEW (zero-copy) so ImageData can blit it
+    // directly. ImageData expects RGBA in row-major order, top-left origin —
+    // exactly what BiomeBackend::render_tile_rgba produces.
+    // The `as ArrayBuffer` cast narrows ArrayBufferLike (the union that
+    // includes SharedArrayBuffer) to the concrete type ImageData wants;
+    // Tauri's IPC never hands us a SharedArrayBuffer.
+    const clamped = new Uint8ClampedArray(
+      tile.bytes.buffer as ArrayBuffer,
+      tile.bytes.byteOffset,
+      tile.bytes.byteLength,
+    );
     const img = new ImageData(clamped, tile.sx, tile.sz);
     ctx.putImageData(img, 0, 0);
   }, [tile, canvasRef]);
@@ -325,11 +426,48 @@ function ResultThumbnail({
   dimension: string;
   cacheRef: React.MutableRefObject<ThumbCache>;
 }) {
-  const [bytes, setBytes] = useState<number[] | null>(() => {
+  const [bytes, setBytes] = useState<Uint8Array | null>(() => {
     const cached = cacheRef.current.get(`${seed}|${version}|${dimension}`);
     return cached ? cached.bytes : null;
   });
+  // Has the canvas entered the viewport at least once? Gates the cubiomes
+  // fetch so a 1000-row result list doesn't fan out 1000 tile requests at
+  // once — the BiomePool ceiling (≤16) would queue them serially and
+  // thumbnail loading would take minutes. Cached results paint immediately
+  // (no observer needed); fresh results wait until the row scrolls in.
+  const [inView, setInView] = useState<boolean>(() => {
+    return cacheRef.current.has(`${seed}|${version}|${dimension}`);
+  });
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    if (inView) return; // Already in view (or cached) — no observer needed.
+    const canvas = canvasRef.current;
+    if (!canvas || typeof IntersectionObserver === "undefined") {
+      // Old browsers / SSR / unmounted: fall back to fetching immediately.
+      setInView(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setInView(true);
+            observer.disconnect();
+            return;
+          }
+        }
+      },
+      // 200px rootMargin pre-fetches one viewport's worth of thumbnails
+      // below the fold so a fast scroll doesn't leave the user staring
+      // at empty canvases.
+      { rootMargin: "200px" },
+    );
+    observer.observe(canvas);
+    return () => {
+      observer.disconnect();
+    };
+  }, [inView]);
 
   useEffect(() => {
     const key = `${seed}|${version}|${dimension}`;
@@ -338,20 +476,20 @@ function ResultThumbnail({
       setBytes(cached.bytes);
       return;
     }
+    // Defer fetch until the row has scrolled into view (or close to it).
+    if (!inView) return;
     let cancelled = false;
     (async () => {
       try {
-        const t = await invoke<TileResponse>("render_tile_rgba_cmd", {
-          request: {
-            seed,
-            version,
-            dimension,
-            x: THUMB_X,
-            z: THUMB_Z,
-            scale: THUMB_SCALE,
-            sx: THUMB_SX,
-            sz: THUMB_SZ,
-          },
+        const t = await invokeTileBinary({
+          seed,
+          version,
+          dimension,
+          x: THUMB_X,
+          z: THUMB_Z,
+          scale: THUMB_SCALE,
+          sx: THUMB_SX,
+          sz: THUMB_SZ,
         });
         if (cancelled) return;
         cacheRef.current.set(key, t);
@@ -369,7 +507,7 @@ function ResultThumbnail({
     return () => {
       cancelled = true;
     };
-  }, [seed, version, dimension, cacheRef]);
+  }, [seed, version, dimension, cacheRef, inView]);
 
   useEffect(() => {
     if (!bytes) return;
@@ -377,7 +515,12 @@ function ResultThumbnail({
     if (!canvas) return;
     const ctx = canvas.getContext("2d", { willReadFrequently: false });
     if (!ctx) return;
-    const clamped = new Uint8ClampedArray(bytes);
+    // Zero-copy view over the aliased binary IPC buffer.
+    const clamped = new Uint8ClampedArray(
+      bytes.buffer as ArrayBuffer,
+      bytes.byteOffset,
+      bytes.byteLength,
+    );
     const img = new ImageData(clamped, THUMB_SX, THUMB_SZ);
     ctx.putImageData(img, 0, 0);
   }, [bytes]);
@@ -395,12 +538,17 @@ function ResultThumbnail({
 }
 
 // Structures shown as pins on the map (and queried in batch from the backend).
+// Anything in this list must be in the backend's `StructureType::from_name`
+// table (Rust crates/mcseedfinder-core/src/structures.rs) — extras here would
+// silently render no pins.
 const PIN_STRUCTURES = [
   "village",
   "pillager_outpost",
   "ocean_monument",
   "woodland_mansion",
   "stronghold",
+  "ancient_city",
+  "trial_chambers",
 ];
 
 // ---------------------------------------------------------------------------
@@ -517,10 +665,28 @@ function App() {
   // jobId — without the sentinel, every event would arrive while the ref is
   // still "" and get filtered out.
   const activeJobIdRef = useRef<string>("");
+  // The most recent `search-started`'s `meta` payload (D6). Captured into a
+  // ref so the `search-matches` batch listener can stitch full SearchResult
+  // objects without each batch carrying the per-search constants again.
+  const searchMetaRef = useRef<SearchMeta | null>(null);
 
   function jobMatches(eventJobId: string): boolean {
     const active = activeJobIdRef.current;
     return active !== "" && (active === "*" || active === eventJobId);
+  }
+
+  /** Reconstruct a SearchResult from a seed + the captured per-search meta. */
+  function resultFromMeta(seed: number, meta: SearchMeta): SearchResult {
+    return {
+      seed,
+      edition: meta.edition,
+      version: meta.version,
+      dimension: meta.dimension,
+      score: 0,
+      matched_features: meta.matched_features,
+      exactness: meta.exactness,
+      warnings: [],
+    };
   }
 
   const spec = useMemo(
@@ -543,11 +709,29 @@ function App() {
     let unlistenFns: UnlistenFn[] = [];
     (async () => {
       unlistenFns.push(
-        await listen<SearchResult>("search-match", (event) => {
+        // Capture per-search constants for the batch listener below to
+        // stitch into each SearchResult (D6).
+        await listen<{ job_id: string; meta?: SearchMeta }>(
+          "search-started",
+          (event) => {
+            if (event.payload.meta) {
+              searchMetaRef.current = event.payload.meta;
+            }
+          },
+        ),
+        // Batched match payload (D5/D6/D7). One IPC event per ~100 ms (or per
+        // 32 seeds, whichever comes first) instead of one per match — kills
+        // the O(n²) React array rebuilds that used to make 1k+ result lists
+        // jank during fast searches.
+        await listen<SearchMatchBatch>("search-matches", (event) => {
           if (!activeJobIdRef.current) return;
-          setResults((prev) => [...prev, event.payload]);
-          setJob((j) => ({ ...j, matches: j.matches + 1 }));
-          setSelectedSeed((s) => (s == null ? event.payload.seed : s));
+          const meta = searchMetaRef.current;
+          if (!meta) return; // stale event from before `search-started` arrived
+          const batch = event.payload.seeds.map((s) => resultFromMeta(s, meta));
+          if (batch.length === 0) return;
+          setResults((prev) => prev.concat(batch));
+          setJob((j) => ({ ...j, matches: event.payload.matches_total }));
+          setSelectedSeed((s) => (s == null ? batch[0].seed : s));
         }),
         await listen<{ job_id: string; scanned: number; matches: number }>(
           "search-progress",
@@ -890,20 +1074,18 @@ function App() {
       }
 
       try {
-        const tilePromise = cached
+        const tilePromise: Promise<TileResponse> = cached
           ? Promise.resolve(cached)
-          : invoke<TileResponse>("render_tile_rgba_cmd", {
-              request: {
-                seed: selectedSeed,
-                version,
-                dimension,
-                x: tileX,
-                z: tileZ,
-                scale: cubScale,
-                sx,
-                sz,
-                y: fetchY,
-              },
+          : invokeTileBinary({
+              seed: selectedSeed,
+              version,
+              dimension,
+              x: tileX,
+              z: tileZ,
+              scale: cubScale,
+              sx,
+              sz,
+              y: fetchY,
             });
         const pinsPromise = invoke<StructurePin[]>("list_structures_in_view", {
           request: {
@@ -1010,18 +1192,16 @@ function App() {
         );
         if (tileCacheRef.current.has(key)) return; // already cached
         try {
-          const t = await invoke<TileResponse>("render_tile_rgba_cmd", {
-            request: {
-              seed: selectedSeed,
-              version,
-              dimension,
-              x: tileX,
-              z: tileZ,
-              scale: cubScale,
-              sx,
-              sz,
-              y: targetY,
-            },
+          const t = await invokeTileBinary({
+            seed: selectedSeed,
+            version,
+            dimension,
+            x: tileX,
+            z: tileZ,
+            scale: cubScale,
+            sx,
+            sz,
+            y: targetY,
           });
           // Cache only — don't update visible state.
           putCachedTile(tileCacheRef.current, key, t, TILE_CACHE_MAX);
@@ -1136,19 +1316,31 @@ function App() {
     const unlistens: UnlistenFn[] = [];
     (async () => {
       unlistens.push(
-        await listen<SearchResult>("search-match", (event) => {
+        // Show ONE toast per batch even if the batch contains multiple
+        // seeds — otherwise a search that finds 32 seeds in the same
+        // 100 ms window would spawn 32 notifications.
+        await listen<SearchMatchBatch>("search-matches", (event) => {
           if (
             typeof window.Notification === "undefined" ||
             notifyPermissionRef.current !== "granted" ||
-            !document.hidden
+            !document.hidden ||
+            event.payload.seeds.length === 0
           ) {
             return;
           }
+          const seeds = event.payload.seeds;
+          const meta = searchMetaRef.current;
+          const featuresCount = meta?.matched_features.length ?? 1;
+          const title =
+            seeds.length === 1
+              ? `mc-seed-finder: seed ${seeds[0]}`
+              : `mc-seed-finder: ${seeds.length} new seeds`;
           try {
-            new window.Notification(`mc-seed-finder: seed ${event.payload.seed}`, {
-              body: `${event.payload.matched_features.length} feature${
-                event.payload.matched_features.length === 1 ? "" : "s"
-              } matched`,
+            new window.Notification(title, {
+              body:
+                seeds.length === 1
+                  ? `${featuresCount} feature${featuresCount === 1 ? "" : "s"} matched`
+                  : `latest: ${seeds[seeds.length - 1]}`,
               silent: false,
             });
           } catch {
@@ -1894,4 +2086,108 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root") as HTMLElement).render(<App />);
+// ---------------------------------------------------------------------------
+// Error boundary
+// ---------------------------------------------------------------------------
+// Without a boundary, ANY render-time or commit-time throw unmounts the whole
+// React tree and the user sees only the body background colour with no way to
+// recover. The boundary catches the throw, surfaces the message, and lets the
+// user retry without restarting the app. Critically it also reveals the real
+// error in the on-screen panel + the console — far more diagnostic than a
+// silent blank window.
+type ErrorBoundaryState = {
+  error: Error | null;
+  info: string | null;
+};
+
+class AppErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = { error: null, info: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error, info: null };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+    // Log to the dev console so the stack trace is preserved alongside the
+    // visible panel. React already logs uncaught errors, but if the boundary
+    // catches them React's default reporter doesn't fire — we restore that.
+    // eslint-disable-next-line no-console
+    console.error("[mc-seed-finder] caught uncaught render error:", error, info);
+    this.setState({ error, info: info.componentStack ?? null });
+  }
+
+  handleReset = (): void => {
+    this.setState({ error: null, info: null });
+  };
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div
+          style={{
+            padding: 24,
+            color: "#f4a8a8",
+            background: "#1a1010",
+            fontFamily: "monospace",
+            fontSize: 13,
+            whiteSpace: "pre-wrap",
+            minHeight: "100vh",
+            overflowY: "auto",
+          }}
+        >
+          <h2 style={{ color: "#ff7676", margin: "0 0 12px" }}>
+            mc-seed-finder crashed
+          </h2>
+          <p style={{ color: "#d6d6d6", marginBottom: 12 }}>
+            The UI threw an uncaught error. The app is still running — click
+            Reset to recover, then check the dev console for the full trace.
+          </p>
+          <button
+            onClick={this.handleReset}
+            style={{
+              padding: "6px 14px",
+              background: "#3a8056",
+              color: "#fff",
+              border: "none",
+              borderRadius: 4,
+              cursor: "pointer",
+              marginBottom: 16,
+            }}
+          >
+            Reset
+          </button>
+          <div style={{ marginBottom: 12 }}>
+            <strong>Error:</strong>{" "}
+            {this.state.error.name}: {this.state.error.message}
+          </div>
+          {this.state.error.stack && (
+            <details open style={{ marginBottom: 12 }}>
+              <summary style={{ cursor: "pointer", color: "#ffb84a" }}>
+                Stack trace
+              </summary>
+              <pre style={{ overflowX: "auto" }}>{this.state.error.stack}</pre>
+            </details>
+          )}
+          {this.state.info && (
+            <details>
+              <summary style={{ cursor: "pointer", color: "#ffb84a" }}>
+                Component stack
+              </summary>
+              <pre style={{ overflowX: "auto" }}>{this.state.info}</pre>
+            </details>
+          )}
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+createRoot(document.getElementById("root") as HTMLElement).render(
+  <AppErrorBoundary>
+    <App />
+  </AppErrorBoundary>,
+);
