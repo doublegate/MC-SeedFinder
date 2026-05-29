@@ -35,6 +35,7 @@ type TileRequestPayload = {
   sx: number;
   sz: number;
   y?: number;
+  purpose?: "map" | "thumb" | "prefetch";
 };
 
 /** Call `render_tile_rgba_binary` and parse its packed payload into a
@@ -194,6 +195,12 @@ type StructurePin = {
 // letterboxing and reflows on window resize. The cap bounds cubiomes work +
 // PNG encoding per tile; the CSS then upscales to fill larger panes.
 const TILE_MAX_PX = 1024;
+// The 3D view renders one instanced column per tile pixel. A full 1024px
+// desktop pane would mean hundreds of thousands to a million instances plus
+// matching height/color arrays, which can freeze or crash the WebView. Keep
+// the 3D sampling grid square so window aspect changes resize the canvas and
+// camera only; they should not reshape the sampled world into a long ribbon.
+const TILE_3D_SIZE_PX = 256;
 const TILE_MIN_PX = 64;
 
 // Over-render the tile slightly past the visible pane on each side. Lets a
@@ -210,16 +217,20 @@ const OVERSCAN_INSET_PCT = (1 - OVERSCAN) * 50;
 
 /** Pick tile dimensions that match the pane's aspect ratio, capped at TILE_MAX_PX
  *  along the longer axis. Caller multiplies by `scale` to get block coverage. */
-function tileSizeForPane(w: number, h: number): { sx: number; sz: number } {
+function tileSizeForPane(w: number, h: number, maxPx = TILE_MAX_PX): { sx: number; sz: number } {
   const safeW = Math.max(TILE_MIN_PX, Math.round(w));
   const safeH = Math.max(TILE_MIN_PX, Math.round(h));
   const aspect = safeW / safeH;
   if (aspect >= 1) {
-    const sx = Math.min(TILE_MAX_PX, safeW);
+    const sx = Math.min(maxPx, safeW);
     return { sx, sz: Math.max(TILE_MIN_PX, Math.round(sx / aspect)) };
   }
-  const sz = Math.min(TILE_MAX_PX, safeH);
+  const sz = Math.min(maxPx, safeH);
   return { sx: Math.max(TILE_MIN_PX, Math.round(sz * aspect)), sz };
+}
+
+function tileSizeFor3DPane(_w: number, _h: number): { sx: number; sz: number } {
+  return { sx: TILE_3D_SIZE_PX, sz: TILE_3D_SIZE_PX };
 }
 // cubiomes' supported scales: 1, 4, 16, 64, 256. Lower index = closer zoom.
 const SCALE_LEVELS = [1, 4, 16, 64, 256] as const;
@@ -337,8 +348,8 @@ function heightKey(
   return `h:${seed}|${version}|${dimension}|${x},${z}|${sx}x${sz}`;
 }
 
-/** Minecraft 1.18+ build range. The wheel-driven Y scrubber in the 3D
- *  isometric view is clamped to this; default starting Y is sea level. */
+/** Minecraft 1.18+ build range. The 3D layer slider is clamped to this;
+ *  default starting Y is sea level. */
 const Y_MIN = -64;
 const Y_MAX = 319;
 const Y_DEFAULT = 63;
@@ -397,6 +408,8 @@ const THUMB_SZ = 36;
 const THUMB_SCALE = 16;
 const THUMB_X = -(THUMB_SX * THUMB_SCALE) / 2;
 const THUMB_Z = -(THUMB_SZ * THUMB_SCALE) / 2;
+const RESULT_RENDER_LIMIT = 500;
+const HISTOGRAM_BUCKETS = 32;
 
 /**
  * Small biome preview canvas rendered inline with each search result —
@@ -490,6 +503,7 @@ function ResultThumbnail({
           scale: THUMB_SCALE,
           sx: THUMB_SX,
           sz: THUMB_SZ,
+          purpose: "thumb",
         });
         if (cancelled) return;
         cacheRef.current.set(key, t);
@@ -573,12 +587,12 @@ function App() {
   const [pins, setPins] = useState<StructurePin[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // Map view state. `zoomLevel` is a continuous float; `pickScale(zoomLevel)`
-  // chooses the cubiomes discrete scale to render with, and CSS scales the
-  // tile by the residual ratio so pinch/wheel feels smooth without forcing a
-  // cubiomes re-render at every micro-tick. zoomLevel = 1.0 → DEFAULT_SCALE.
+  // Map view state. `zoomLevel` controls map zoom steps: it affects cubiomes
+  // scale and can request new tiles. `displayZoom3D` is camera-only fine zoom
+  // inside the already-rendered 3D view and never changes tile scale/loading.
   const [viewCenter, setViewCenter] = useState({ x: 0, z: 0 });
   const [zoomLevel, setZoomLevel] = useState(1.0);
+  const [displayZoom3D, setDisplayZoom3D] = useState(1.0);
   // The cubiomes scale derived from zoomLevel. Memoized so the tile fetch
   // effect doesn't re-run on every continuous-zoom tick — only when the
   // chosen discrete scale actually changes.
@@ -595,7 +609,7 @@ function App() {
   // piece for fluid pan was tile *availability*, which this fixes.
   const tileCacheRef = useRef<Map<string, TileResponse>>(new Map());
   // Bumped from 32 → 96 in PR 2 (3D view) — the working set grows from
-  // (zoom × pan) to (zoom × pan × Y slice) once the wheel scrubs Y.
+  // (zoom × pan) to (zoom × pan × Y slice) once the layer slider scrubs Y.
   const TILE_CACHE_MAX = 96;
   // Separate cache for the inline result-list thumbnails (#6). Keeps the
   // 36×36 previews from churning the main-map LRU.
@@ -605,7 +619,7 @@ function App() {
   const heightCacheRef = useRef<Map<string, HeightTileResponse>>(new Map());
   const HEIGHT_CACHE_MAX = 32;
 
-  // 3D isometric map view + the Y the wheel scrubs to. Behind a toggle
+  // 3D isometric map view + the Y controlled by the side layer slider. Behind a toggle
   // during PR 2 (default 2D); flipped to 3D-default in PR 3 once the
   // 3D path proves out across Tauri WebView backends.
   // PR 3 (Phase 7+): flipped default to "3D" once the voxel pipeline +
@@ -714,6 +728,7 @@ function App() {
         await listen<{ job_id: string; meta?: SearchMeta }>(
           "search-started",
           (event) => {
+            if (!jobMatches(event.payload.job_id)) return;
             if (event.payload.meta) {
               searchMetaRef.current = event.payload.meta;
             }
@@ -724,7 +739,7 @@ function App() {
         // the O(n²) React array rebuilds that used to make 1k+ result lists
         // jank during fast searches.
         await listen<SearchMatchBatch>("search-matches", (event) => {
-          if (!activeJobIdRef.current) return;
+          if (!jobMatches(event.payload.job_id)) return;
           const meta = searchMetaRef.current;
           if (!meta) return; // stale event from before `search-started` arrived
           const batch = event.payload.seeds.map((s) => resultFromMeta(s, meta));
@@ -802,7 +817,9 @@ function App() {
     activeJobIdRef.current = "*";
     try {
       const jobId = await invoke<string>("start_search", { spec });
-      activeJobIdRef.current = jobId;
+      if (activeJobIdRef.current === "*") {
+        activeJobIdRef.current = jobId;
+      }
       setJob((j) => ({ ...j, jobId }));
     } catch (e) {
       activeJobIdRef.current = "";
@@ -1025,10 +1042,10 @@ function App() {
     // scale) handles the residual continuous zoom in/out.
     // Request a tile larger than the visible pane (over-render) so a
     // drag-pan reveals already-loaded content instead of black margins.
-    const { sx, sz } = tileSizeForPane(
-      paneSize.w * OVERSCAN,
-      paneSize.h * OVERSCAN,
-    );
+    const { sx, sz } =
+      mapView === "3D"
+        ? tileSizeFor3DPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN)
+        : tileSizeForPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN, TILE_MAX_PX);
     const tileSpanX = sx * cubScale;
     const tileSpanZ = sz * cubScale;
     const tileX = viewCenter.x - Math.round(tileSpanX / 2);
@@ -1086,6 +1103,7 @@ function App() {
               sx,
               sz,
               y: fetchY,
+              purpose: "map",
             });
         const pinsPromise = invoke<StructurePin[]>("list_structures_in_view", {
           request: {
@@ -1130,7 +1148,7 @@ function App() {
             if (oldest === undefined) break;
             heightCacheRef.current.delete(oldest);
           }
-        } else if (mapView !== "3D") {
+        } else {
           setHeightTile(null);
         }
       } catch (e) {
@@ -1168,10 +1186,10 @@ function App() {
     if (cubScale !== 4) return; // mirrors the heightmap path's gate
 
     const handle = window.setTimeout(() => {
-      const { sx, sz } = tileSizeForPane(
-        paneSize.w * OVERSCAN,
-        paneSize.h * OVERSCAN,
-      );
+        const { sx, sz } = tileSizeFor3DPane(
+          paneSize.w * OVERSCAN,
+          paneSize.h * OVERSCAN,
+        );
       const tileSpanX = sx * cubScale;
       const tileSpanZ = sz * cubScale;
       const tileX = viewCenter.x - Math.round(tileSpanX / 2);
@@ -1202,6 +1220,7 @@ function App() {
             sx,
             sz,
             y: targetY,
+            purpose: "prefetch",
           });
           // Cache only — don't update visible state.
           putCachedTile(tileCacheRef.current, key, t, TILE_CACHE_MAX);
@@ -1213,9 +1232,8 @@ function App() {
         }
       };
 
-      // Wheel step size — see Map3D's wheel handler. Mirror it here so
-      // a single notch lands in cache. Shift+wheel jumps 16; we don't
-      // prefetch those bigger steps (they're explicitly fast-traversal).
+      // Slider keyboard step size. Mirror it here so a single j/k step lands
+      // in cache. Shift+j/k jumps 16; we don't prefetch those bigger steps.
       void prefetchAt(yLevel + 4);
       void prefetchAt(yLevel - 4);
     }, 200);
@@ -1233,7 +1251,10 @@ function App() {
       setSlimeChunks([]);
       return;
     }
-    const { sx, sz } = tileSizeForPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN);
+    const { sx, sz } =
+      mapView === "3D"
+        ? tileSizeFor3DPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN)
+        : tileSizeForPane(paneSize.w * OVERSCAN, paneSize.h * OVERSCAN, TILE_MAX_PX);
     const tileSpanX = sx * cubScale;
     const tileSpanZ = sz * cubScale;
     const tileX = viewCenter.x - Math.round(tileSpanX / 2);
@@ -1254,7 +1275,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [overlays.slime, selectedSeed, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h]);
+  }, [overlays.slime, selectedSeed, viewCenter.x, viewCenter.z, cubScale, paneSize.w, paneSize.h, mapView]);
 
   // Climate np[6] debug overlay (#11). Debounced: only fires after the
   // cursor rests on the same cell for ~300ms, so dragging the mouse
@@ -1374,7 +1395,7 @@ function App() {
   }
 
   // Keyboard shortcuts (#18). Vim-like. j/k = Y -4/+4 (Shift = ×4 = 16);
-  // h/l = zoom out/in (one notch); 2/3 = mapView toggle; arrows = pan;
+  // h/l = zoom out/in; 2/3 = mapView toggle; arrows = pan;
   // r = recenter. Ignored while typing in an input/textarea/contentEditable.
   useEffect(() => {
     function isTyping(target: EventTarget | null): boolean {
@@ -1499,19 +1520,22 @@ function App() {
     [drag, zoomLevel],
   );
 
-  // Zoom by a multiplicative step. 1.4× per click gives a noticeable but not
-  // jarring jump, ~5 clicks to traverse the full range. Continuous wheel
-  // (below) uses much finer steps.
+  function resetView() {
+    setViewCenter({ x: 0, z: 0 });
+    setZoomLevel(1.0);
+    setDisplayZoom3D(1.0);
+  }
+
   function zoomIn() {
     setZoomLevel((z) => clampZoom(z * 1.4));
   }
   function zoomOut() {
     setZoomLevel((z) => clampZoom(z / 1.4));
   }
-  function resetView() {
-    setViewCenter({ x: 0, z: 0 });
-    setZoomLevel(1.0);
-  }
+
+  const zoomDisplay3DByFactor = useCallback((factor: number) => {
+    setDisplayZoom3D((z) => clampZoom(z * factor));
+  }, []);
 
   // Wheel-to-zoom: each wheel tick multiplies zoom by exp(-deltaY/500),
   // ~+10% per notch on most mice — natural, continuous, and rounds into the
@@ -1564,6 +1588,23 @@ function App() {
   // (the steady-state after a refetch), cssScale ≈ 1 at the matching
   // zoomLevel and grows/shrinks linearly until a scale boundary crosses.
   const cssScale = tile ? (zoomLevel * tile.scale) / DEFAULT_SCALE : 1;
+
+  const visibleResults = useMemo(
+    () => results.slice(0, RESULT_RENDER_LIMIT),
+    [results],
+  );
+  const hiddenResultCount = Math.max(0, results.length - visibleResults.length);
+  const histogramCounts = useMemo(() => {
+    if (results.length <= 1) return [];
+    const counts = new Array(HISTOGRAM_BUCKETS).fill(0);
+    const safeCount = Math.max(1, count);
+    for (const r of results) {
+      // seed in i64 range; bucket on the low 32 bits relative to count.
+      const idx = Math.abs(Math.floor(((r.seed % safeCount) / safeCount) * HISTOGRAM_BUCKETS));
+      counts[Math.min(HISTOGRAM_BUCKETS - 1, idx)] += 1;
+    }
+    return counts;
+  }, [results, count]);
 
   // Helper: world (block) coord → percentage within the rendered tile.
   // Uses per-axis spans because the tile is no longer guaranteed square
@@ -1737,11 +1778,14 @@ function App() {
               }}
               heights={heightTile?.heights ?? null}
               pins={pins}
-              cameraZoom={zoomLevel}
+              cameraZoom={zoomLevel * displayZoom3D}
               yLevel={yLevel}
               yMin={Y_MIN}
               yMax={Y_MAX}
-              onYDelta={(d) => setYLevel((y) => clampY(y + d))}
+              onZoomFactor={zoomDisplay3DByFactor}
+              onPanByBlocks={(dx, dz) => {
+                setViewCenter((c) => ({ x: c.x + dx, z: c.z + dz }));
+              }}
               onYSet={(y) => setYLevel(clampY(y))}
               onHover={setHover}
               slimeChunks={overlays.slime ? slimeChunks : []}
@@ -1751,8 +1795,8 @@ function App() {
               showSpawnChunks={overlays.spawn}
             />
             <div className="mapControls">
-              <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
-              <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
+              <button onClick={zoomIn} title="Zoom in to the next map scale">+</button>
+              <button onClick={zoomOut} title="Zoom out to the next map scale">−</button>
               <button onClick={resetView} title="Recenter on origin">⌂</button>
               <button
                 onClick={() => setMapView("2D")}
@@ -1886,12 +1930,12 @@ function App() {
                   })}
                 </div>
                 <div className="mapControls">
-                  <button onClick={zoomIn} title="Zoom in (smaller scale)">+</button>
-                  <button onClick={zoomOut} title="Zoom out (larger scale)">−</button>
+                  <button onClick={zoomIn} title="Zoom in to the next map scale">+</button>
+                  <button onClick={zoomOut} title="Zoom out to the next map scale">−</button>
                   <button onClick={resetView} title="Recenter on origin">⌂</button>
                   <button
                     onClick={() => setMapView("3D")}
-                    title="Switch to 3D isometric map (wheel scrubs Y)"
+                    title="Switch to 3D isometric map"
                     className="viewToggle"
                   >
                     3D
@@ -1932,28 +1976,21 @@ function App() {
               does nothing (yet). */}
           {results.length > 1 && (
             <div className="matchHistogram" title={`${results.length} matches across the search range`}>
-              {(() => {
-                const BUCKETS = 32;
-                const counts = new Array(BUCKETS).fill(0);
-                for (const r of results) {
-                  // seed in i64 range; bucket on the low 32 bits relative to count.
-                  const idx = Math.abs(Math.floor(((r.seed % count) / count) * BUCKETS));
-                  counts[Math.min(BUCKETS - 1, idx)] += 1;
-                }
-                const maxCount = Math.max(1, ...counts);
-                return counts.map((c, i) => (
+              {histogramCounts.map((c, i) => {
+                const maxCount = Math.max(1, ...histogramCounts);
+                return (
                   <div
                     key={i}
                     className="histBar"
                     style={{ height: `${(c / maxCount) * 100}%` }}
                     title={`bucket ${i}: ${c} matches`}
                   />
-                ));
-              })()}
+                );
+              })}
             </div>
           )}
           <div className="resultList">
-            {results.map((result) => (
+            {visibleResults.map((result) => (
               <button
                 key={result.seed}
                 className={selectedSeed === result.seed ? "result active" : "result"}
@@ -1971,6 +2008,11 @@ function App() {
                 </div>
               </button>
             ))}
+            {hiddenResultCount > 0 && (
+              <div className="hint">
+                Showing first {RESULT_RENDER_LIMIT} matches; {hiddenResultCount} more are kept for export.
+              </div>
+            )}
             {results.length === 0 && job.status === "idle" && (
               <div className="hint">Press Run to start a search. Matches stream in live.</div>
             )}

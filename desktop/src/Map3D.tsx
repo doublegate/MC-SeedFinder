@@ -1,16 +1,16 @@
 /**
  * 3D isometric biome map (Phase 7+).
  *
- * Renders the world as **true voxel columns** — one `InstancedMesh` instance
- * per scale-grid cell — using:
- *   • per-instance scale = approximate surface height (from cubiomes'
+ * Renders the world as Minecraft-like surface voxels — one cube instance per
+ * scale-grid cell — using:
+ *   • per-instance y-position = approximate surface height (from cubiomes'
  *     `mapApproxHeight`, labelled "approximate terrain" in the HUD),
- *   • per-instance colour = biome at the wheel-driven Y level (bit-exact
+ *   • per-instance colour = biome at the slider-selected Y level (bit-exact
  *     via cubiomes' `genBiomes` at that Y).
  *
- * The wheel scrubs the Y slice → biome IDs change → instance colours
- * repaint. The heightmap doesn't depend on Y, so column heights persist
- * while you scroll through Y.
+ * The side Y slider selects the biome sample depth → biome IDs change →
+ * instance colours repaint. The heightmap doesn't depend on Y, so column
+ * heights persist while you scrub the layer slider.
  *
  * Pointer-driven biome readout uses R3F's `onPointerMove` on the
  * InstancedMesh. `event.instanceId` identifies the cell; we look up its
@@ -22,9 +22,9 @@
  * the "approximate terrain" pill in the HUD makes that visible.
  */
 
-import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
-import { Html, MapControls, OrthographicCamera } from "@react-three/drei";
-import { useEffect, useMemo, useRef } from "react";
+import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Html, OrbitControls, OrthographicCamera } from "@react-three/drei";
+import { useEffect, useMemo, useRef, type ComponentRef } from "react";
 import * as THREE from "three";
 import { YSlider } from "./YSlider";
 
@@ -65,15 +65,17 @@ export type Map3DProps = {
   };
   heights: number[] | null; // sx*sz f32 block-heights, or null for flat plane
   pins: { structure: string; block_x: number; block_z: number }[];
-  /** Camera zoom (orthographic). 1.0 = baseline; +/- buttons multiply by 1.4. */
+  /** Camera zoom (orthographic). 1.0 = baseline; wheel adjusts continuously. */
   cameraZoom: number;
-  /** Block Y the wheel is currently scrubbed to. */
+  /** Block Y currently selected by the side Y slider. */
   yLevel: number;
   /** 1.18+ build range — defines the YSlider track extent. */
   yMin: number;
   yMax: number;
-  /** Wheel delta callback (4-block step per notch; Shift = ×4 / 16 blocks). */
-  onYDelta: (delta: number) => void;
+  /** Wheel zoom callback. Factor > 1 zooms in, factor < 1 zooms out. */
+  onZoomFactor: (factor: number) => void;
+  /** Commit a completed 3D pan back to the app-level map centre in blocks. */
+  onPanByBlocks: (dx: number, dz: number) => void;
   /** Direct Y setter (used by the side YSlider's drag handler). */
   onYSet: (y: number) => void;
   /** Pointer hover callback. Fires when the hovered cell changes; null when
@@ -225,7 +227,7 @@ function SpawnMarker({
   );
 }
 
-/** Imperative camera-zoom sync — the +/- buttons drive a prop, and the
+/** Imperative camera-zoom sync — wheel/key zoom drives a prop, and the
  *  orthographic camera's `zoom` field is updated here in response. */
 function CameraZoomSync({ cameraZoom }: { cameraZoom: number }) {
   const { camera } = useThree();
@@ -238,30 +240,74 @@ function CameraZoomSync({ cameraZoom }: { cameraZoom: number }) {
   return null;
 }
 
-/** RELIEF scales the heightmap into Three.js world units. heights are in
- *  blocks; the voxel grid is in scale-grid units (1 unit = `scale` blocks).
- *  We divide by scale to keep heights proportional to width, then multiply
- *  by RELIEF to exaggerate vertical relief — 2.0 makes a 200-block
- *  mountain ~100 grid units tall, unmistakeably 3D.
- *
- *  MIN_H ensures cells whose approximate height is ≤ 0 (deep ocean floor,
- *  or absent heightmap) still render a thin slab the user can hover over.
- *
- *  FADE_MS is the crossfade duration when new tile bytes arrive. ~120ms
- *  is long enough to read as a "transition" rather than a snap, short
- *  enough not to feel laggy. */
-const RELIEF = 2.0;
-const MIN_H = 0.6;
-const FADE_MS = 120;
+function CameraFitSync({
+  tile,
+  cameraZoom,
+}: {
+  tile: Map3DProps["tile"];
+  cameraZoom: number;
+}) {
+  const { camera, size } = useThree();
+  useEffect(() => {
+    if (!(camera instanceof THREE.OrthographicCamera)) return;
 
-function cellHeight(rawY: number | undefined, scale: number): number {
-  if (rawY == null) return MIN_H;
-  const h = (rawY / scale) * RELIEF;
-  return Math.max(MIN_H, h);
+    const aspect = Math.max(0.1, size.width / Math.max(1, size.height));
+    // The voxel map is a square grid viewed from an isometric camera. Use a
+    // cover-style fit against the live canvas aspect so the scene grows into
+    // wide/tall panes instead of preserving blank letterbox space.
+    const footprintW = (tile.sx + tile.sz) * 0.78;
+    const maxHeight = Math.max(tile.sx, tile.sz) * 0.58;
+    const terrainH = Math.max(24, maxHeight);
+    const footprintH = (tile.sx + tile.sz) * 0.38 + terrainH;
+    const margin = 1.0;
+
+    let halfW = (footprintW * margin) / 2;
+    let halfH = (footprintH * margin) / 2;
+    const footprintAspect = halfW / halfH;
+
+    if (aspect > footprintAspect) {
+      halfH = halfW / aspect;
+    } else {
+      halfW = halfH * aspect;
+    }
+
+    camera.left = -halfW;
+    camera.right = halfW;
+    camera.top = halfH;
+    camera.bottom = -halfH;
+    camera.zoom = cameraZoom;
+    camera.updateProjectionMatrix();
+  }, [camera, size.width, size.height, tile.sx, tile.sz, cameraZoom]);
+  return null;
 }
 
-/** InstancedMesh of one thin box per (i, j) cell. Per-instance scale →
- *  voxel column height; per-instance colour → biome at current Y.
+/** RELIEF maps block Y into grid units. Each rendered instance is a filled
+ *  terrain column whose top sits on an integer voxel layer. This avoids side
+ *  view "floating surface cube" holes while keeping the instance count bounded
+ *  to one terrain column per tile cell.
+ *
+ *  COLUMN_SIZE is only slightly below 1.0. The clear colour shows through as
+ *  subtle seams between neighboring columns without overwhelming biome colour.
+ *  This avoids Three.js wireframe diagonals, which draw the cube face
+ *  triangulation and alias badly at zoomed-out isometric views. */
+const RELIEF = 2.0;
+const COLUMN_SIZE = 0.9;
+const SCENE_CLEAR = "#0f1711";
+
+function worldYToSceneY(worldY: number, scale: number, yMin: number): number {
+  return Math.round(((worldY - yMin) / scale) * RELIEF);
+}
+
+function columnHeight(rawY: number | undefined, scale: number, yMin: number): number {
+  if (rawY == null) return 1;
+  const h = worldYToSceneY(rawY, scale, yMin) + 1;
+  return Math.max(1, h);
+}
+
+/** InstancedMesh of one filled terrain column per (i, j) cell. Per-instance
+ *  height → approximate surface height; per-instance colour → biome at
+ *  current Y. Fine dark seams come from the sub-1.0 column width/depth
+ *  exposing the dark background between adjacent columns.
  *
  *  Update strategy:
  *  - geometry/material/mesh are created once per (sx, sz) — recreating
@@ -275,11 +321,13 @@ function VoxelColumns({
   tile,
   heights,
   yLevel,
+  yMin,
   onHover,
 }: {
   tile: Map3DProps["tile"];
   heights: number[] | null;
   yLevel: number;
+  yMin: number;
   onHover: (info: HoverInfo | null) => void;
 }) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
@@ -290,6 +338,55 @@ function VoxelColumns({
   // Shared scratch objects — avoid per-instance allocations.
   const tmpMatrix = useMemo(() => new THREE.Matrix4(), []);
   const tmpColor = useMemo(() => new THREE.Color(), []);
+  const decorateBlockMaterial = useMemo(
+    () => (shader: { vertexShader: string; fragmentShader: string }) => {
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          "#include <common>",
+          `#include <common>
+varying vec3 vBlockLocal;
+varying vec3 vBlockNormal;
+varying float vBlockHeight;`,
+        )
+        .replace(
+          "#include <begin_vertex>",
+          `#include <begin_vertex>
+vBlockLocal = position + vec3(0.5);
+vBlockNormal = normal;
+#ifdef USE_INSTANCING
+  vBlockHeight = max(1.0, length(instanceMatrix[1].xyz));
+#else
+  vBlockHeight = 1.0;
+#endif`,
+        );
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          "#include <common>",
+          `#include <common>
+varying vec3 vBlockLocal;
+varying vec3 vBlockNormal;
+varying float vBlockHeight;
+
+float mcsfLine(float coord, float width) {
+  float d = min(fract(coord), 1.0 - fract(coord));
+  return 1.0 - smoothstep(width, width + 0.015, d);
+}`,
+        )
+        .replace(
+          "#include <opaque_fragment>",
+          `vec3 n = normalize(vBlockNormal);
+float topFace = step(0.55, n.y);
+float sideFace = max(step(0.55, abs(n.x)), step(0.55, abs(n.z)));
+float sideCoord = mix(vBlockLocal.x, vBlockLocal.z, step(0.55, abs(n.x)));
+float topGrid = max(mcsfLine(vBlockLocal.x, 0.045), mcsfLine(vBlockLocal.z, 0.045));
+float sideGrid = max(mcsfLine(sideCoord, 0.038), mcsfLine(vBlockLocal.y * vBlockHeight, 0.036));
+float grid = max(topGrid * topFace, sideGrid * sideFace);
+outgoingLight = mix(outgoingLight, outgoingLight * 0.18, grid * 0.82);
+#include <opaque_fragment>`,
+        );
+    },
+    [],
+  );
 
   // (Re)write per-instance matrices whenever sx/sz/heights change.
   useEffect(() => {
@@ -297,96 +394,41 @@ function VoxelColumns({
     if (!mesh) return;
     const halfX = sx / 2;
     const halfZ = sz / 2;
+    const layerH = columnHeight(yLevel, tile.scale, yMin);
     for (let j = 0; j < sz; j++) {
       for (let i = 0; i < sx; i++) {
         const idx = j * sx + i;
-        const h = cellHeight(heights?.[idx], tile.scale);
-        // Centre each box at (i + 0.5 - sx/2, h/2, j + 0.5 - sz/2). Bottom
-        // sits on the ground plane (y=0); top reaches y=h.
+        const surfaceH = columnHeight(heights?.[idx], tile.scale, yMin);
+        const h = Math.min(surfaceH, layerH);
         const xCell = i + 0.5 - halfX;
         const zCell = j + 0.5 - halfZ;
-        tmpMatrix.makeScale(1, h, 1);
+        tmpMatrix.makeScale(COLUMN_SIZE, h, COLUMN_SIZE);
         tmpMatrix.setPosition(xCell, h * 0.5, zCell);
         mesh.setMatrixAt(idx, tmpMatrix);
       }
     }
     mesh.instanceMatrix.needsUpdate = true;
     mesh.computeBoundingSphere(); // raycast culling
-  }, [heights, sx, sz, tile.scale, tmpMatrix]);
+  }, [heights, sx, sz, tile.scale, yLevel, yMin, tmpMatrix]);
 
-  // Crossfade animation state. When new tile bytes arrive, snapshot the
-  // CURRENTLY-displayed RGB into `prevColorsRef` and start a fresh fade
-  // timer. The useFrame loop below blends prev → new over FADE_MS.
-  //
-  // We snapshot the live instanceColor buffer (which itself may be
-  // mid-fade) so rapid wheel scrubs animate from "whatever you're seeing
-  // right now" → "the freshly-arrived bytes", never snapping back to a
-  // pre-fade baseline.
-  const prevColorsRef = useRef<Float32Array | null>(null);
-  const animStartRef = useRef<number | null>(null);
-
+  // Write per-instance colors once per tile. The previous crossfade rewrote
+  // every instance color on every animation frame; with large panes that can
+  // monopolise the WebView for seconds. A direct update is cheaper and more
+  // stable, especially while the user scrubs Y slices with the slider.
   useEffect(() => {
     const mesh = meshRef.current;
     if (!mesh) return;
-    // Initialise the prev buffer on first tile, or resize on (sx, sz) change.
-    if (!prevColorsRef.current || prevColorsRef.current.length !== count * 3) {
-      prevColorsRef.current = new Float32Array(count * 3);
-      // First render: bake new bytes directly so we don't fade from black.
-      for (let i = 0; i < count; i++) {
-        const off = i * 4;
-        const cOff = i * 3;
-        prevColorsRef.current[cOff] = tile.bytes[off] / 255;
-        prevColorsRef.current[cOff + 1] = tile.bytes[off + 1] / 255;
-        prevColorsRef.current[cOff + 2] = tile.bytes[off + 2] / 255;
-      }
-      // Write to instanceColor so something is visible before useFrame runs.
-      for (let i = 0; i < count; i++) {
-        const cOff = i * 3;
-        tmpColor.setRGB(
-          prevColorsRef.current[cOff],
-          prevColorsRef.current[cOff + 1],
-          prevColorsRef.current[cOff + 2],
-        );
-        mesh.setColorAt(i, tmpColor);
-      }
-      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      animStartRef.current = null;
-      return;
-    }
-    // Subsequent updates: snapshot live colours (possibly mid-fade) as
-    // the new starting point, then start a fresh animation.
-    if (mesh.instanceColor) {
-      prevColorsRef.current.set(mesh.instanceColor.array as Float32Array);
-    }
-    animStartRef.current = performance.now();
-  }, [tile.bytes, count, tmpColor]);
-
-  useFrame(() => {
-    if (animStartRef.current == null) return;
-    const mesh = meshRef.current;
-    if (!mesh) return;
-    const prev = prevColorsRef.current;
-    if (!prev) return;
-    const elapsed = performance.now() - animStartRef.current;
-    const t = Math.min(1, elapsed / FADE_MS);
     for (let i = 0; i < count; i++) {
-      const cOff = i * 3;
       const bOff = i * 4;
-      const newR = tile.bytes[bOff] / 255;
-      const newG = tile.bytes[bOff + 1] / 255;
-      const newB = tile.bytes[bOff + 2] / 255;
       tmpColor.setRGB(
-        prev[cOff] + (newR - prev[cOff]) * t,
-        prev[cOff + 1] + (newG - prev[cOff + 1]) * t,
-        prev[cOff + 2] + (newB - prev[cOff + 2]) * t,
+        tile.bytes[bOff] / 255,
+        tile.bytes[bOff + 1] / 255,
+        tile.bytes[bOff + 2] / 255,
       );
       mesh.setColorAt(i, tmpColor);
     }
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    if (t >= 1) {
-      animStartRef.current = null;
-    }
-  });
+  }, [tile.bytes, count, tmpColor]);
 
   // Throttle hover-state writes: only push to the parent when the hovered
   // cell index changes. Without this we'd fire a setState 60+ times per
@@ -414,15 +456,23 @@ function VoxelColumns({
   };
 
   return (
-    <instancedMesh
-      ref={meshRef}
-      args={[undefined, undefined, count]}
-      onPointerMove={handlePointerMove}
-      onPointerOut={handlePointerOut}
-    >
-      <boxGeometry args={[1, 1, 1]} />
-      <meshBasicMaterial toneMapped={false} />
-    </instancedMesh>
+    <group>
+      <instancedMesh
+        ref={meshRef}
+        args={[undefined, undefined, count]}
+        onPointerMove={handlePointerMove}
+        onPointerOut={handlePointerOut}
+      >
+        <boxGeometry args={[1, 1, 1]} />
+        <meshBasicMaterial
+          toneMapped={false}
+          fog={false}
+          dithering
+          onBeforeCompile={decorateBlockMaterial}
+          customProgramCacheKey={() => "mcsf-block-grid-v1"}
+        />
+      </instancedMesh>
+    </group>
   );
 }
 
@@ -432,14 +482,16 @@ function VoxelColumns({
 function YPlaneIndicator({
   tile,
   yLevel,
+  yMin,
   show,
 }: {
   tile: Map3DProps["tile"];
   yLevel: number;
+  yMin: number;
   show: boolean;
 }) {
   if (!show) return null;
-  const planeY = cellHeight(yLevel, tile.scale);
+  const planeY = columnHeight(yLevel, tile.scale, yMin);
   return (
     <mesh position={[0, planeY, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2}>
       <planeGeometry args={[tile.sx, tile.sz]} />
@@ -613,40 +665,19 @@ function WorldBorderWireframe({ tile, height }: { tile: Map3DProps["tile"]; heig
   );
 }
 
-/** Async-gl factory for the R3F `<Canvas>`. Tries WebGPURenderer when
- *  navigator.gpu is available; falls back to R3F's default WebGLRenderer
- *  by returning `null`-equivalent (a plain WebGLRenderer params object).
- *  On Linux WebKitGTK navigator.gpu is undefined → the WebGL2 path is
- *  taken unchanged. */
-async function makeRenderer(props: {
-  canvas: HTMLCanvasElement;
-}): Promise<THREE.WebGLRenderer> {
-  if (hasWebGPU()) {
-    try {
-      // Dynamic import so WebGL-only platforms never load three/webgpu.
-      // Three.js 0.171+: WebGPURenderer is the default export of three/webgpu.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod: any = await import("three/webgpu");
-      const WebGPURenderer = mod.WebGPURenderer ?? mod.default;
-      if (WebGPURenderer) {
-        const r = new WebGPURenderer({ canvas: props.canvas, antialias: false });
-        await r.init();
-        // R3F's gl callback contract wants a WebGLRenderer-compatible
-        // shape; WebGPURenderer implements the same surface (render,
-        // setSize, setPixelRatio, dispose, etc.) but TS doesn't know.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return r as any;
-      }
-    } catch (e) {
-      console.warn("[Map3D] WebGPU init failed, falling back to WebGL2:", e);
-    }
-  }
-  const fallback = new THREE.WebGLRenderer({
-    canvas: props.canvas,
-    antialias: false,
+/** Stable renderer factory for the R3F `<Canvas>`. Keep the interactive map on
+ * WebGL2 for now. The earlier optimistic WebGPURenderer path required async
+ * init through R3F's `gl` callback and could leave the pane blank or tear down
+ * the WebView on some desktop WebViews after Run-triggered re-renders. */
+function makeRenderer(props: { canvas: unknown }): THREE.WebGLRenderer {
+  const renderer = new THREE.WebGLRenderer({
+    canvas: props.canvas as HTMLCanvasElement,
+    antialias: true,
     alpha: false,
+    powerPreference: "high-performance",
   });
-  return fallback;
+  renderer.setClearColor(SCENE_CLEAR, 1);
+  return renderer;
 }
 
 export function Map3D(props: Map3DProps) {
@@ -658,7 +689,8 @@ export function Map3D(props: Map3DProps) {
     yLevel,
     yMin,
     yMax,
-    onYDelta,
+    onZoomFactor,
+    onPanByBlocks,
     onYSet,
     onHover,
     slimeChunks,
@@ -668,35 +700,51 @@ export function Map3D(props: Map3DProps) {
     showSpawnChunks,
   } = props;
 
-  // Wheel handler — bypasses MapControls (which has wheel-zoom off). Step
-  // size = 4 blocks (one scale-Y unit at cubScale=4) so every notch crosses
-  // a cubiomes scale-Y boundary; Shift = ×4 (one chunk-section).
+  // Wheel handler — zooms the rendered 3D view. Depth/Y is adjusted only
+  // through the side slider so scrolling matches normal 3D viewport behavior.
   const onWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const sign = e.deltaY > 0 ? -1 : 1;
-    const mag = e.shiftKey ? 16 : 4;
-    onYDelta(sign * mag);
+    onZoomFactor(Math.exp(-e.deltaY / 500));
   };
 
   // Isometric-ish camera position: above and to the front-right, looking at
   // the origin. Orthographic ignores distance for size; `zoom` does scale.
   const camPos: [number, number, number] = [tile.sx * 0.7, tile.sx * 0.9, tile.sz * 0.7];
   const span = Math.max(tile.sx, tile.sz);
+  const controlsRef = useRef<ComponentRef<typeof OrbitControls>>(null);
+
+  const commitPan = () => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    const dxBlocks = Math.round(controls.target.x * tile.scale);
+    const dzBlocks = Math.round(controls.target.z * tile.scale);
+    if (Math.abs(dxBlocks) < tile.scale && Math.abs(dzBlocks) < tile.scale) {
+      return;
+    }
+    // OrbitControls pans the camera target inside the currently-loaded tile.
+    // Commit that offset to the parent viewCenter so the normal tile-fetch
+    // effect requests the newly exposed world area, then reset the local pan
+    // so the replacement tile is centred in the 3D viewport.
+    onPanByBlocks(dxBlocks, dzBlocks);
+    controls.object.position.sub(controls.target);
+    controls.target.set(0, 0, 0);
+    controls.update();
+  };
 
   return (
     <div
       className="map3dCanvas"
       onWheel={onWheel}
+      onContextMenu={(e) => e.preventDefault()}
       onPointerLeave={() => onHover(null)}
       style={{ width: "100%", height: "100%" }}
     >
       <Canvas
         orthographic
-        dpr={[1, 2]}
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        gl={makeRenderer as any}
+        dpr={1}
+        gl={makeRenderer}
         flat
-        style={{ background: "#0e1410" }}
+        style={{ background: SCENE_CLEAR }}
       >
         <OrthographicCamera
           makeDefault
@@ -704,21 +752,34 @@ export function Map3D(props: Map3DProps) {
           zoom={cameraZoom}
           near={-span * 4}
           far={span * 4}
-          left={-span * 0.6}
-          right={span * 0.6}
-          top={span * 0.6}
-          bottom={-span * 0.6}
         />
+        <CameraFitSync tile={tile} cameraZoom={cameraZoom} />
         <CameraZoomSync cameraZoom={cameraZoom} />
-        <MapControls
-          enableRotate={false}
+        <OrbitControls
+          ref={controlsRef}
+          makeDefault
+          enableRotate
+          enablePan
           enableZoom={false}
+          enableDamping
+          dampingFactor={0.08}
+          mouseButtons={{
+            LEFT: THREE.MOUSE.PAN,
+            MIDDLE: THREE.MOUSE.DOLLY,
+            RIGHT: THREE.MOUSE.ROTATE,
+          }}
           screenSpacePanning
           target={[0, 0, 0]}
+          onEnd={commitPan}
         />
-        <ambientLight intensity={1.0} />
-        <VoxelColumns tile={tile} heights={heights} yLevel={yLevel} onHover={onHover} />
-        <YPlaneIndicator tile={tile} yLevel={yLevel} show={heights != null} />
+        <VoxelColumns
+          tile={tile}
+          heights={heights}
+          yLevel={yLevel}
+          yMin={yMin}
+          onHover={onHover}
+        />
+        <YPlaneIndicator tile={tile} yLevel={yLevel} yMin={yMin} show={heights != null} />
         {slimeChunks && slimeChunks.length > 0 && (
           <SlimeChunksOverlay tile={tile} chunks={slimeChunks} />
         )}

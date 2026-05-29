@@ -95,14 +95,16 @@ struct AppState {
     /// rapidly panning or clicking between matches. The pool amortises that
     /// cost to one-time-per-(version,dimension).
     biome_pool: Mutex<HashMap<(String, String), Vec<BiomeBackend>>>,
-    /// Per-kind monotonic request counters. Each command claims a sequence
+    /// Per-kind monotonic request counters. Each foreground command claims a sequence
     /// number on entry; if a newer request bumps the counter past that
     /// sequence number before the command finishes its expensive work, it
     /// bails out early. Net effect: rapid pan/click only does the LATEST
-    /// request's work, even though every click already issued an invoke.
-    /// Each kind has its own counter so unrelated commands don't cancel
-    /// each other (a fresh tile fetch shouldn't kill a still-running analyze).
+    /// foreground request's work, even though every click already issued an
+    /// invoke. Counters are intentionally narrow: map tiles, height tiles,
+    /// pins, and analysis must not cancel one another. Background thumbnails
+    /// and opportunistic prefetches skip supersession entirely.
     tile_counter: AtomicU64,
+    height_counter: AtomicU64,
     pins_counter: AtomicU64,
     analyze_counter: AtomicU64,
 }
@@ -387,6 +389,20 @@ fn start_search(
         matched_features,
     };
 
+    // Emit a "started" lifecycle event so the UI can flip into a running
+    // state. Includes the per-search constants the frontend needs to
+    // materialise SeedReports from the slim `search-matches` batches.
+    let _ = app.emit(
+        "search-started",
+        serde_json::json!({
+            "job_id": job_id,
+            "count": spec.count,
+            "version": spec.version,
+            "dimension": spec.dimension,
+            "meta": meta,
+        }),
+    );
+
     let app_clone = app.clone();
     let job_id_clone = job_id.clone();
     let spec_clone = spec.clone();
@@ -401,20 +417,6 @@ fn start_search(
             meta_clone,
         );
     });
-
-    // Emit a "started" lifecycle event so the UI can flip into a running
-    // state. Includes the per-search constants the frontend needs to
-    // materialise SeedReports from the slim `search-matches` batches.
-    let _ = app.emit(
-        "search-started",
-        serde_json::json!({
-            "job_id": job_id,
-            "count": spec.count,
-            "version": spec.version,
-            "dimension": spec.dimension,
-            "meta": meta,
-        }),
-    );
 
     Ok(job_id)
 }
@@ -871,6 +873,11 @@ struct TileRequest {
     /// keep the previous fixed-sea-level behaviour.
     #[serde(default = "default_y")]
     y: i32,
+    /// Request purpose controls supersession. Foreground map requests use the
+    /// `"map"` counter. Thumbnails and speculative prefetches pass `"thumb"`
+    /// or `"prefetch"` so they cannot cancel the visible map tile.
+    #[serde(default = "default_tile_purpose")]
+    purpose: String,
 }
 
 fn default_version() -> String {
@@ -888,6 +895,24 @@ fn default_size() -> u32 {
 fn default_y() -> i32 {
     63
 }
+fn default_tile_purpose() -> String {
+    "map".to_string()
+}
+
+fn claim_tile_sequence(state: &AppState, purpose: &str) -> Option<u64> {
+    if purpose == "map" {
+        Some(state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1)
+    } else {
+        None
+    }
+}
+
+fn tile_superseded(state: &AppState, purpose: &str, seq: Option<u64>) -> bool {
+    match (purpose, seq) {
+        ("map", Some(my_seq)) => superseded(&state.tile_counter, my_seq),
+        _ => false,
+    }
+}
 
 #[tauri::command]
 fn render_tile(
@@ -899,15 +924,15 @@ fn render_tile(
     // counter and bail out. Cancellation is "best effort" — we can't
     // interrupt cubiomes mid-call (it's a single C function), so the check
     // points are: before backend acquire, before the cubiomes fill, and after.
-    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if superseded(&state.tile_counter, my_seq) {
+    let my_seq = claim_tile_sequence(&state, &request.purpose);
+    if tile_superseded(&state, &request.purpose, my_seq) {
         return Err(SUPERSEDED.into());
     }
 
     // Pool-acquired backend — avoids re-running cubiomes' setupGenerator on
     // every tile.
     let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
-    if superseded(&state.tile_counter, my_seq) {
+    if tile_superseded(&state, &request.purpose, my_seq) {
         release_biome_backend(&state, &request.version, &request.dimension, backend);
         return Err(SUPERSEDED.into());
     }
@@ -924,7 +949,7 @@ fn render_tile(
     let dimension = request.dimension.clone();
     release_biome_backend(&state, &version, &dimension, backend);
 
-    if superseded(&state.tile_counter, my_seq) {
+    if tile_superseded(&state, &request.purpose, my_seq) {
         return Err(SUPERSEDED.into());
     }
     png_b64.map(|png| {
@@ -957,12 +982,12 @@ fn render_tile_rgba_cmd(
     request: TileRequest,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if superseded(&state.tile_counter, my_seq) {
+    let my_seq = claim_tile_sequence(&state, &request.purpose);
+    if tile_superseded(&state, &request.purpose, my_seq) {
         return Err(SUPERSEDED.into());
     }
     let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
-    if superseded(&state.tile_counter, my_seq) {
+    if tile_superseded(&state, &request.purpose, my_seq) {
         release_biome_backend(&state, &request.version, &request.dimension, backend);
         return Err(SUPERSEDED.into());
     }
@@ -979,7 +1004,7 @@ fn render_tile_rgba_cmd(
     let dimension = request.dimension.clone();
     release_biome_backend(&state, &version, &dimension, backend);
 
-    if superseded(&state.tile_counter, my_seq) {
+    if tile_superseded(&state, &request.purpose, my_seq) {
         return Err(SUPERSEDED.into());
     }
     result.map(|(bytes, biome_ids)| {
@@ -1035,12 +1060,12 @@ fn render_tile_rgba_binary(
     request: TileRequest,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if superseded(&state.tile_counter, my_seq) {
+    let my_seq = claim_tile_sequence(&state, &request.purpose);
+    if tile_superseded(&state, &request.purpose, my_seq) {
         return Err(SUPERSEDED.into());
     }
     let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
-    if superseded(&state.tile_counter, my_seq) {
+    if tile_superseded(&state, &request.purpose, my_seq) {
         release_biome_backend(&state, &request.version, &request.dimension, backend);
         return Err(SUPERSEDED.into());
     }
@@ -1056,7 +1081,7 @@ fn render_tile_rgba_binary(
     let version = request.version.clone();
     let dimension = request.dimension.clone();
     release_biome_backend(&state, &version, &dimension, backend);
-    if superseded(&state.tile_counter, my_seq) {
+    if tile_superseded(&state, &request.purpose, my_seq) {
         return Err(SUPERSEDED.into());
     }
     let (rgba, biome_ids) = result?;
@@ -1106,15 +1131,12 @@ fn surface_height_tile_cmd(
     request: HeightTileRequest,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // Share the tile_counter with `render_tile_rgba_cmd` — the front-end
-    // fires both for the same pan/Y-scroll, so a newer pan should
-    // supersede both together.
-    let my_seq = state.tile_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if superseded(&state.tile_counter, my_seq) {
+    let my_seq = state.height_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if superseded(&state.height_counter, my_seq) {
         return Err(SUPERSEDED.into());
     }
     let mut backend = acquire_biome_backend(&state, &request.version, &request.dimension)?;
-    if superseded(&state.tile_counter, my_seq) {
+    if superseded(&state.height_counter, my_seq) {
         release_biome_backend(&state, &request.version, &request.dimension, backend);
         return Err(SUPERSEDED.into());
     }
@@ -1130,7 +1152,7 @@ fn surface_height_tile_cmd(
     let dimension = request.dimension.clone();
     release_biome_backend(&state, &version, &dimension, backend);
 
-    if superseded(&state.tile_counter, my_seq) {
+    if superseded(&state.height_counter, my_seq) {
         return Err(SUPERSEDED.into());
     }
     result.map(|(heights, biome_ids)| {

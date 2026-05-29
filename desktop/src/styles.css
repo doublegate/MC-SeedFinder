@@ -642,13 +642,21 @@ textarea {
 }
 
 /* 3D canvas fills the entire mapGrid pane. Pointer events flow to the
- * R3F Canvas inside; the wrapper div only handles the wheel (Y scrub). */
+ * R3F Canvas inside; the wrapper div only handles display-only wheel zoom. */
 .map3dCanvas {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
   /* WebGL canvases have a transparent background by default; keep the
    * pane dark even before the first frame paints. */
   background: #0e1410;
+}
+
+.map3dCanvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 /* Hover readout in 3D mode: floats above the tileLabel showing the biome
