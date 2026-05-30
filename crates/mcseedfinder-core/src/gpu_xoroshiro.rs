@@ -23,6 +23,10 @@ extern "C" {
     /// Fill `out[0..k]` with the first `k` `xNextLong` outputs of a
     /// Xoroshiro128++ seeded from `seed`. Defined in `csrc/shim.c`.
     fn mcsf_xoroshiro_stream(seed: u64, k: std::os::raw::c_int, out: *mut u64);
+    /// Run cubiomes' `xPerlinInit` from a raw Xoroshiro state `(lo, hi)` and
+    /// dump 3 doubles (a, b, c) into `out_abc` and 256 perm bytes into
+    /// `out_perm`. Defined in `csrc/shim.c`.
+    fn mcsf_xperlin_init_dump(lo: u64, hi: u64, out_abc: *mut f64, out_perm: *mut u8);
 }
 
 /// CPU reference: cubiomes' Xoroshiro128++ stream for one seed.
@@ -34,6 +38,27 @@ pub fn cpu_xoroshiro_stream(seed: u64, k: u32) -> Vec<u64> {
     out
 }
 
+/// CPU reference: cubiomes' `xPerlinInit` from a raw Xoroshiro state. Returns
+/// `((a, b, c), perm[256])`.
+pub fn cpu_xperlin_init(lo: u64, hi: u64) -> ((f64, f64, f64), [u8; 256]) {
+    let mut abc = [0.0f64; 3];
+    let mut perm = [0u8; 256];
+    unsafe {
+        mcsf_xperlin_init_dump(lo, hi, abc.as_mut_ptr(), perm.as_mut_ptr());
+    }
+    ((abc[0], abc[1], abc[2]), perm)
+}
+
+/// Result of one GPU `xPerlinInit`: the (f32) a/b/c offsets and the 256-byte
+/// permutation table.
+#[derive(Clone, Debug)]
+pub struct PerlinInit {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub perm: [u8; 256],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
@@ -41,6 +66,16 @@ struct Params {
     k: u32,
     _pad0: u32,
     _pad1: u32,
+}
+
+/// Mirrors `PiParams` in `gpu_xoroshiro.wgsl` (Phase B perlin-init entry).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PiParams {
+    n_states: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// wgpu pipeline that runs the WGSL Xoroshiro128++ port over a batch of seeds,
@@ -51,6 +86,10 @@ pub struct GpuXoroshiro {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    // Phase B: per-octave Perlin init (`cs_perlin_init`). Separate layout — it
+    // has a 4th binding (perm output) and two read_write storage buffers.
+    pi_pipeline: wgpu::ComputePipeline,
+    pi_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl std::fmt::Debug for GpuXoroshiro {
@@ -144,11 +183,73 @@ impl GpuXoroshiro {
             cache: None,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
+
+        // Phase B: cs_perlin_init layout — uniform params, read-only states,
+        // and two read_write storage outputs (abc + perm).
+        let storage_rw = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let storage_ro = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let pi_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mcsf-gpu-perlin-init-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage_ro,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage_rw,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage_rw,
+                    count: None,
+                },
+            ],
+        });
+        let pi_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mcsf-gpu-perlin-init-pl"),
+            bind_group_layouts: &[&pi_bgl],
+            push_constant_ranges: &[],
+        });
+        let pi_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mcsf-gpu-perlin-init-cp"),
+            layout: Some(&pi_pl),
+            module: &shader,
+            entry_point: Some("cs_perlin_init"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
         Ok(Self {
             device,
             queue,
             pipeline,
             bind_group_layout: bgl,
+            pi_pipeline,
+            pi_bind_group_layout: pi_bgl,
         })
     }
 
@@ -266,6 +367,160 @@ impl GpuXoroshiro {
         staging.unmap();
         Ok(results)
     }
+
+    /// Run the WGSL `xPerlinInit` (Phase B) over a batch of raw Xoroshiro
+    /// states `(lo, hi)`, returning one [`PerlinInit`] per state. The perm
+    /// table is bit-exact vs cubiomes; a/b/c are f32 approximations.
+    pub fn perlin_init_batch(
+        &self,
+        states: &[(u64, u64)],
+    ) -> Result<Vec<PerlinInit>, &'static str> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = states.len();
+
+        let params = PiParams {
+            n_states: n as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        // States as [lo_lo, lo_hi, hi_lo, hi_hi] u32 quads (two vec2<u32>).
+        let mut states_packed: Vec<[u32; 2]> = Vec::with_capacity(n * 2);
+        for &(lo, hi) in states {
+            states_packed.push([(lo & 0xFFFF_FFFF) as u32, (lo >> 32) as u32]);
+            states_packed.push([(hi & 0xFFFF_FFFF) as u32, (hi >> 32) as u32]);
+        }
+        let states_bytes: &[u8] = bytemuck::cast_slice(&states_packed);
+        let abc_bytes = (n * 16) as wgpu::BufferAddress; // vec4<f32> per state
+        let perm_bytes = (n * 256) as wgpu::BufferAddress; // 64 u32 per state
+
+        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-pi-params"),
+            size: std::mem::size_of::<PiParams>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
+
+        let states_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-pi-states"),
+            size: states_bytes.len() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&states_buf, 0, states_bytes);
+
+        let abc_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-pi-abc"),
+            size: abc_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let perm_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-pi-perm"),
+            size: perm_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let abc_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-pi-abc-staging"),
+            size: abc_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let perm_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcsf-pi-perm-staging"),
+            size: perm_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mcsf-pi-bg"),
+            layout: &self.pi_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: states_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: abc_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: perm_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mcsf-pi-enc"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mcsf-pi-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pi_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            let groups = (n as u32).div_ceil(64);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&abc_buf, 0, &abc_staging, 0, abc_bytes);
+        encoder.copy_buffer_to_buffer(&perm_buf, 0, &perm_staging, 0, perm_bytes);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map both staging buffers, then poll once.
+        let abc_slice = abc_staging.slice(..);
+        let perm_slice = perm_staging.slice(..);
+        let (atx, arx) = std::sync::mpsc::channel();
+        let (ptx, prx) = std::sync::mpsc::channel();
+        abc_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = atx.send(res);
+        });
+        perm_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = ptx.send(res);
+        });
+        let _ = self.device.poll(wgpu::Maintain::Wait);
+        arx.recv()
+            .map_err(|_| "wgpu map channel closed")?
+            .map_err(|_| "wgpu abc map_async failed")?;
+        prx.recv()
+            .map_err(|_| "wgpu map channel closed")?
+            .map_err(|_| "wgpu perm map_async failed")?;
+
+        let abc_data = abc_slice.get_mapped_range();
+        let perm_data = perm_slice.get_mapped_range();
+        let abc_f: &[f32] = bytemuck::cast_slice(&abc_data);
+        let perm_u: &[u8] = &perm_data;
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut perm = [0u8; 256];
+            perm.copy_from_slice(&perm_u[i * 256..(i + 1) * 256]);
+            out.push(PerlinInit {
+                a: abc_f[i * 4],
+                b: abc_f[i * 4 + 1],
+                c: abc_f[i * 4 + 2],
+                perm,
+            });
+        }
+        drop(abc_data);
+        drop(perm_data);
+        abc_staging.unmap();
+        perm_staging.unmap();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -330,5 +585,68 @@ mod tests {
             let c = cpu_xoroshiro_stream(seed, 1)[0];
             assert_eq!(g, c, "seed {seed:#018x}: gpu={g:#018x} cpu={c:#018x}");
         }
+    }
+
+    /// Phase B cornerstone. cubiomes' `xPerlinInit` builds each octave's
+    /// 256-byte permutation table via a Fisher-Yates shuffle driven by
+    /// `xNextInt` (pure integer) — so the GPU table must be BIT-IDENTICAL to
+    /// cubiomes for every input state. The a/b/c offsets come from
+    /// `xNextDouble` and are only f32-tolerant. A green perm-table assertion
+    /// proves the GPU consumes the RNG stream in lockstep with cubiomes
+    /// (correct draw order and count), which is the load-bearing property for
+    /// per-seed `setBiomeSeed` in later phases.
+    #[test]
+    fn gpu_xperlin_init_perm_table_bit_exact() {
+        let Some(gpu) = GpuXoroshiro::try_new() else {
+            eprintln!("skipping: no GPU adapter on this host");
+            return;
+        };
+
+        // Raw Xoroshiro states (lo, hi). xPerlinInit takes a state directly, so
+        // we exercise assorted bit patterns (incl. all-zero, all-one, and the
+        // post-xSetSeed states of a few real seeds) rather than only seeds.
+        let mut states: Vec<(u64, u64)> = vec![
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (u64::MAX, u64::MAX),
+            (0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
+            (0x9E37_79B9_7F4A_7C15, 0x6A09_E667_F3BC_C909),
+        ];
+        // Also use the seeded states of real world seeds: xSetSeed then read
+        // the first xNextLong pair as a representative downstream state.
+        for seed in [0u64, 1, 42, 12345] {
+            let s = cpu_xoroshiro_stream(seed, 2);
+            states.push((s[0], s[1]));
+        }
+
+        let gpu_inits = gpu.perlin_init_batch(&states).expect("gpu dispatch");
+        assert_eq!(gpu_inits.len(), states.len());
+
+        let mut max_abc_err = 0.0f64;
+        for (i, &(lo, hi)) in states.iter().enumerate() {
+            let ((ca, cb, cc), cperm) = cpu_xperlin_init(lo, hi);
+            let g = &gpu_inits[i];
+
+            // Permutation table: BIT-EXACT, byte for byte.
+            assert_eq!(
+                g.perm, cperm,
+                "perm-table mismatch for state ({lo:#018x},{hi:#018x})"
+            );
+
+            // a/b/c: f32-tolerant. cubiomes values are in [0, 256).
+            for (gv, cv, name) in [(g.a, ca, "a"), (g.b, cb, "b"), (g.c, cc, "c")] {
+                let diff = (cv - gv as f64).abs();
+                if diff > max_abc_err {
+                    max_abc_err = diff;
+                }
+                assert!(
+                    diff < 1e-2,
+                    "{name} offset drift too large for state ({lo:#018x},{hi:#018x}): \
+                     gpu={gv} cpu={cv} diff={diff:.3e}"
+                );
+            }
+        }
+        eprintln!("max abs(gpu-cpu) xPerlinInit a/b/c diff: {max_abc_err:.3e}");
     }
 }

@@ -125,3 +125,89 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         outp[base + j] = x_next_long(&xr);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Phase B: per-octave Perlin init (cubiomes `xPerlinInit`, noise.c:79).
+//
+// Given a raw Xoroshiro state, derive a PerlinNoise's a/b/c offsets and its
+// 256-byte permutation table. Reuses the RNG above (x_next_long / mul_u32_full).
+//
+// Accuracy contract:
+//   * a, b, c = xNextDouble * 256  — f32-TOLERANT (xNextDouble is a double in
+//     cubiomes; here it is approximated in f32). These offsets are added to
+//     coordinates and floored, so f32 round-off is acceptable (same concession
+//     as the existing Phase 6c noise primitives).
+//   * the permutation table is BIT-EXACT. The Fisher-Yates shuffle is driven
+//     only by xNextInt (pure integer), and xNextDouble/xNextInt each advance
+//     the Xoroshiro stream by a fixed number of xNextLong draws regardless of
+//     the f32 imprecision in a/b/c, so stream alignment never drifts.
+// -----------------------------------------------------------------------------
+
+struct PiParams { n_states: u32, _p0: u32, _p1: u32, _p2: u32 };
+
+// Bindings are reused per-entry-point (naga only validates bindings reachable
+// from a given entry point — see gpu_noise.wgsl, which likewise reuses
+// @group(0) @binding(0..3) for two distinct pipelines).
+@group(0) @binding(0) var<uniform> pi_params: PiParams;
+// Two vec2<u32> per state: [lo_limbs, hi_limbs].
+@group(0) @binding(1) var<storage, read> pi_states: array<vec2<u32>>;
+// One vec4<f32> per state: (a, b, c, _unused).
+@group(0) @binding(2) var<storage, read_write> pi_abc: array<vec4<f32>>;
+// 64 u32 per state: 256 perm bytes packed little-endian.
+@group(0) @binding(3) var<storage, read_write> pi_perm: array<u32>;
+
+// cubiomes xNextDouble (rng.h:227): (xNextLong >> 11) * 2^-53. Approximated in
+// f32 as hi*2^-32 + lo*2^-64 (only a/b/c depend on the value; f32-tolerant).
+fn x_next_double_f32(xr: ptr<function, Xoro>) -> f32 {
+    let n = x_next_long(xr);
+    return f32(n.y) * 2.3283064365386963e-10 + f32(n.x) * 5.421010862427522e-20;
+}
+
+// cubiomes xNextInt (rng.h:214) with bounded n (here always 1..256). Pure
+// integer; BIT-EXACT, including the rejection loop that preserves stream
+// alignment with the C implementation.
+fn x_next_int(xr: ptr<function, Xoro>, n: u32) -> u32 {
+    let nl = x_next_long(xr);
+    var r = mul_u32_full(nl.x, n); // (low32, high32) of (xNextLong & 0xFFFFFFFF) * n
+    if (r.x < n) {
+        let thresh = (0u - n) % n; // (~n + 1) % n in uint32 wraparound
+        loop {
+            if (r.x >= thresh) { break; }
+            let nl2 = x_next_long(xr);
+            r = mul_u32_full(nl2.x, n);
+        }
+    }
+    return r.y; // r >> 32
+}
+
+@compute @workgroup_size(64)
+fn cs_perlin_init(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let s = gid.x;
+    if (s >= pi_params.n_states) { return; }
+    var xr = Xoro(pi_states[2u * s], pi_states[2u * s + 1u]);
+
+    // a/b/c drawn first, in order (xPerlinInit noise.c:83-85).
+    let a = x_next_double_f32(&xr) * 256.0;
+    let b = x_next_double_f32(&xr) * 256.0;
+    let c = x_next_double_f32(&xr) * 256.0;
+    pi_abc[s] = vec4<f32>(a, b, c, 0.0);
+
+    // Identity table, then Fisher-Yates: j = xNextInt(256 - i) + i; swap(i, j).
+    var idx: array<u32, 256>;
+    for (var i = 0u; i < 256u; i = i + 1u) { idx[i] = i; }
+    for (var i = 0u; i < 256u; i = i + 1u) {
+        let j = x_next_int(&xr, 256u - i) + i;
+        let tmp = idx[i];
+        idx[i] = idx[j];
+        idx[j] = tmp;
+    }
+
+    let base = s * 64u;
+    for (var w = 0u; w < 64u; w = w + 1u) {
+        let b0 = idx[w * 4u + 0u];
+        let b1 = idx[w * 4u + 1u];
+        let b2 = idx[w * 4u + 2u];
+        let b3 = idx[w * 4u + 3u];
+        pi_perm[base + w] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    }
+}

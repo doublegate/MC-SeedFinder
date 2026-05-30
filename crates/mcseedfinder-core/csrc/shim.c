@@ -65,6 +65,26 @@ void mcsf_xoroshiro_stream(uint64_t seed, int k, uint64_t *out) {
     }
 }
 
+/* Phase B oracle: run cubiomes' xPerlinInit from a raw Xoroshiro state
+ * (lo, hi) and dump the resulting a/b/c offsets and 256-byte permutation
+ * table. Reference for the WGSL `cs_perlin_init` entry point. `out_abc` gets 3
+ * doubles; `out_perm` gets 256 bytes (the 257th duplicate entry is omitted —
+ * the GPU emulates it by masking indices). */
+void mcsf_xperlin_init_dump(
+    uint64_t lo, uint64_t hi, double *out_abc, uint8_t *out_perm
+) {
+    Xoroshiro xr;
+    xr.lo = lo;
+    xr.hi = hi;
+    PerlinNoise pn;
+    memset(&pn, 0, sizeof(pn));
+    xPerlinInit(&pn, &xr);
+    out_abc[0] = pn.a;
+    out_abc[1] = pn.b;
+    out_abc[2] = pn.c;
+    memcpy(out_perm, pn.d, 256);
+}
+
 /* Reference oracle for the Rust-side buried_treasure per-chunk roll
  * (structures.rs::roll_buried_treasure_chunk). Returns 1 iff cubiomes'
  * own getStructurePos(Treasure, ...) succeeds at (chunkX, chunkZ),
