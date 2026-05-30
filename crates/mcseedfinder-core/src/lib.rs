@@ -17,6 +17,8 @@ pub mod gpu_btree;
 #[cfg(all(feature = "gpu", feature = "biomes"))]
 pub mod gpu_climate;
 #[cfg(all(feature = "gpu", feature = "biomes"))]
+pub mod gpu_depth;
+#[cfg(all(feature = "gpu", feature = "biomes"))]
 pub mod gpu_double_perlin;
 #[cfg(all(feature = "gpu", feature = "biomes"))]
 pub mod gpu_noise;

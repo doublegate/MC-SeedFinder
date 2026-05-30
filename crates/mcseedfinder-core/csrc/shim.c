@@ -404,6 +404,75 @@ double mcsf_compute_depth(int mc, double c, double e, double w, int y) {
     return 1.0 - (y * 4) / 128.0 - 83.0 / 160.0 + off;
 }
 
+/* --- Phase D1: depth-spline flattening for GPU per-seed search --------- */
+/* For per-seed GPU search the depth value (np[NP_DEPTH]) must be computed on
+ * the GPU, so the seed-independent spline tree is flattened here and uploaded
+ * once. Post-order DFS with pointer dedup guarantees every child has a LOWER
+ * flat index than its parent, so the WGSL walker evaluates nodes forward
+ * (0..count) with no recursion/stack and the root is the last node.
+ *
+ * Capacity: SplineStack holds stack[42] + fstack[151] = 193 nodes max; callers
+ * pass 256-slot buffers. A leaf (FixSpline, len==1) emits typ=-1 + out_fix;
+ * an internal node emits typ + len + loc/der/child triples (<=12). Returns the
+ * node count (root index = count-1), or -1 on overflow. */
+#define MCSF_SPLINE_CAP 256
+
+static int mcsf_spline_flatten_rec(
+    const Spline *sp, const void **seen, int *count,
+    int *o_typ, int *o_len, float *o_fix, float *o_loc, float *o_der, int *o_child
+) {
+    for (int k = 0; k < *count; k++)
+        if (seen[k] == (const void *)sp)
+            return k;
+
+    int len = sp->len;
+    int child_idx[12];
+    if (len != 1) {
+        for (int i = 0; i < len; i++) {
+            child_idx[i] = mcsf_spline_flatten_rec(
+                sp->val[i], seen, count, o_typ, o_len, o_fix, o_loc, o_der, o_child);
+            if (child_idx[i] < 0)
+                return -1;
+        }
+    }
+
+    if (*count >= MCSF_SPLINE_CAP)
+        return -1;
+    int my = (*count)++;
+    seen[my] = (const void *)sp;
+    if (len == 1) {
+        o_typ[my] = -1;
+        o_len[my] = 1;
+        o_fix[my] = ((const FixSpline *)sp)->val;
+    } else {
+        o_typ[my] = sp->typ;
+        o_len[my] = len;
+        for (int i = 0; i < len; i++) {
+            o_loc[my * 12 + i] = sp->loc[i];
+            o_der[my * 12 + i] = sp->der[i];
+            o_child[my * 12 + i] = child_idx[i];
+        }
+    }
+    return my;
+}
+
+int mcsf_depth_spline_flatten(
+    int mc, int *out_typ, int *out_len, float *out_fix,
+    float *out_loc, float *out_der, int *out_child
+) {
+    BiomeNoise bn;
+    memset(&bn, 0, sizeof(bn));
+    initBiomeNoise(&bn, mc);
+    const void *seen[MCSF_SPLINE_CAP];
+    int count = 0;
+    int root = mcsf_spline_flatten_rec(
+        bn.sp, seen, &count, out_typ, out_len, out_fix, out_loc, out_der, out_child);
+    if (root < 0)
+        return -1;
+    /* Post-order guarantees the root is the final node. */
+    return count;
+}
+
 /* --- Approximate surface heightmap (cubiomes mapApproxHeight) ---------- */
 /* Important: NOT bit-exact Java terrain. cubiomes itself names this
  * `mapApproxHeight` because it's derived from the depth-spline output
