@@ -211,3 +211,142 @@ fn cs_perlin_init(@builtin(global_invocation_id) gid: vec3<u32>) {
         pi_perm[base + w] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Phase C: per-seed setBiomeSeed climate-field init (cubiomes
+// `setBiomeSeed` + `init_climate_seed` + `xDoublePerlinInit` + `xOctaveInit`).
+//
+// One thread per world seed; one climate field per dispatch (the field's
+// seed-independent constants — md5 salt, amplitude array, omin/len, and the
+// derived persist/lacuna starts — are passed in the uniform). Per thread it
+// reproduces, entirely on-GPU:
+//   xSetSeed(seed) -> xlo,xhi  (shared across fields in cubiomes; recomputed
+//                               here per dispatch, which is identical)
+//   field pxr = (xlo ^ md5_lo, xhi ^ md5_hi)
+//   octA = xOctaveInit(pxr): draw (a_xlo,a_xhi); per non-zero-amp octave i,
+//          sub-state (a_xlo ^ md5_octave[12+omin+i], a_xhi ^ ...) -> xPerlinInit
+//   octB = xOctaveInit(pxr): same, continuing the field stream
+//
+// This is the per-seed work that makes biome conditions evaluable in the GPU
+// search kernel (Phase D+). Output is the octave state, verified against
+// cubiomes' `mcsf_climate_init_field`: perm tables BIT-EXACT, a/b/c/amplitude/
+// lacunarity f32-tolerant (downstream of `xNextDouble`).
+//
+// Octave output layout (max 18 octaves/field = 9 per half): global octave
+// index = seed*18 + half_base + n, where half_base = 0 for octA, 9 for octB.
+// -----------------------------------------------------------------------------
+
+const MAX_OCT_PER_HALF: u32 = 9u;
+const MAX_OCT_PER_FIELD: u32 = 18u;
+
+struct FieldParams {
+    n_seeds: u32,
+    len: u32,
+    omin: i32,
+    _pad0: u32,
+    md5_lo: vec2<u32>,
+    md5_hi: vec2<u32>,
+    persist_start: f32,
+    lacuna_start: f32,
+    _pad1: f32,
+    _pad2: f32,
+    // Up to 12 amplitudes (fields use <= 9), padded to 3 vec4s.
+    amp: array<vec4<f32>, 3>,
+};
+
+@group(0) @binding(0) var<uniform> fp: FieldParams;
+@group(0) @binding(1) var<storage, read> sbs_seeds: array<vec2<u32>>;
+// md5 "octave_-12".."octave_0": 13 octaves, (lo, hi) per octave = 26 entries.
+@group(0) @binding(2) var<storage, read> md5_oct: array<vec2<u32>>;
+// 8 f32 per octave: (a, b, c, amplitude, lacunarity, _, _, _).
+@group(0) @binding(3) var<storage, read_write> sbs_scalars: array<f32>;
+// 64 u32 per octave: 256 perm bytes packed little-endian.
+@group(0) @binding(4) var<storage, read_write> sbs_perm: array<u32>;
+// 2 u32 per seed: (octA count, octB count).
+@group(0) @binding(5) var<storage, read_write> sbs_counts: array<u32>;
+
+fn get_amp(i: u32) -> f32 {
+    let v = fp.amp[i >> 2u];
+    switch (i & 3u) {
+        case 0u: { return v.x; }
+        case 1u: { return v.y; }
+        case 2u: { return v.z; }
+        default: { return v.w; }
+    }
+}
+
+// cubiomes xPerlinInit (Phase B logic) writing one octave to the output
+// buffers at global octave index `gidx`, with the given amplitude/lacunarity.
+fn write_octave(xr: ptr<function, Xoro>, gidx: u32, amplitude: f32, lacunarity: f32) {
+    let a = x_next_double_f32(xr) * 256.0;
+    let b = x_next_double_f32(xr) * 256.0;
+    let c = x_next_double_f32(xr) * 256.0;
+
+    var idx: array<u32, 256>;
+    for (var i = 0u; i < 256u; i = i + 1u) { idx[i] = i; }
+    for (var i = 0u; i < 256u; i = i + 1u) {
+        let j = x_next_int(xr, 256u - i) + i;
+        let tmp = idx[i];
+        idx[i] = idx[j];
+        idx[j] = tmp;
+    }
+
+    let sbase = gidx * 8u;
+    sbs_scalars[sbase + 0u] = a;
+    sbs_scalars[sbase + 1u] = b;
+    sbs_scalars[sbase + 2u] = c;
+    sbs_scalars[sbase + 3u] = amplitude;
+    sbs_scalars[sbase + 4u] = lacunarity;
+
+    let pbase = gidx * 64u;
+    for (var w = 0u; w < 64u; w = w + 1u) {
+        let b0 = idx[w * 4u + 0u];
+        let b1 = idx[w * 4u + 1u];
+        let b2 = idx[w * 4u + 2u];
+        let b3 = idx[w * 4u + 3u];
+        sbs_perm[pbase + w] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    }
+}
+
+// cubiomes xOctaveInit for one half (octA or octB). Draws the half's
+// (xlo, xhi) from the field stream `fxr`, then builds one octave per non-zero
+// amplitude. Returns the octave count for this half.
+fn init_half(fxr: ptr<function, Xoro>, seed_idx: u32, half_base: u32) -> u32 {
+    let hlo = x_next_long(fxr);
+    let hhi = x_next_long(fxr);
+    var lac = fp.lacuna_start;
+    var per = fp.persist_start;
+    var n = 0u;
+    for (var i = 0u; i < fp.len; i = i + 1u) {
+        if (get_amp(i) != 0.0) {
+            // md5_octave index = 12 + omin + i (always within 0..12).
+            let oi = u32(12 + fp.omin + i32(i));
+            var opx = Xoro(hlo ^ md5_oct[2u * oi], hhi ^ md5_oct[2u * oi + 1u]);
+            let gidx = seed_idx * MAX_OCT_PER_FIELD + half_base + n;
+            write_octave(&opx, gidx, get_amp(i) * per, lac);
+            n = n + 1u;
+        }
+        // lacuna/persist advance every iteration, including skipped octaves.
+        lac = lac * 2.0;
+        per = per * 0.5;
+    }
+    return n;
+}
+
+@compute @workgroup_size(64)
+fn cs_set_biome_field(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let s = gid.x;
+    if (s >= fp.n_seeds) { return; }
+
+    // setBiomeSeed top: xSetSeed(seed) then two xNextLong (shared xlo/xhi).
+    var xr = x_set_seed(sbs_seeds[s]);
+    let xlo = x_next_long(&xr);
+    let xhi = x_next_long(&xr);
+
+    // init_climate_seed: field sub-stream from the field's md5 salt.
+    var fxr = Xoro(xlo ^ fp.md5_lo, xhi ^ fp.md5_hi);
+    let na = init_half(&fxr, s, 0u);
+    let nb = init_half(&fxr, s, MAX_OCT_PER_HALF);
+    sbs_counts[2u * s] = na;
+    sbs_counts[2u * s + 1u] = nb;
+}
