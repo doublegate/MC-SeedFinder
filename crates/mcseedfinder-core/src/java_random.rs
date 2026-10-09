@@ -32,7 +32,7 @@ impl JavaRandom {
     pub fn next_int_bound(&mut self, bound: i32) -> i32 {
         assert!(bound > 0, "bound must be positive");
 
-        if (bound & -bound) == bound {
+        if bound.isolate_lowest_one() == bound {
             return (((bound as i64) * (self.next(31) as i64)) >> 31) as i32;
         }
 

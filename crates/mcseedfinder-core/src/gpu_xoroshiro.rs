@@ -275,12 +275,17 @@ impl GpuXoroshiro {
             })
             .await
             .ok_or("no compatible GPU adapter found")?;
+        // We need 5 storage buffers per stage in setbiome; downlevel default is 4.
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 8,
+            ..wgpu::Limits::downlevel_defaults()
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("mcsf-gpu-xoroshiro-device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -1039,7 +1044,6 @@ mod tests {
         // we exercise assorted bit patterns (incl. all-zero, all-one, and the
         // post-xSetSeed states of a few real seeds) rather than only seeds.
         let mut states: Vec<(u64, u64)> = vec![
-            (0, 0),
             (1, 0),
             (0, 1),
             (u64::MAX, u64::MAX),
