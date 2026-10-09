@@ -39,7 +39,7 @@ parallel = ["dep:rayon"]
 # Declaring `pyo3 = ["dep:pyo3"]` here would decouple the two and break the build.
 
 [dependencies]
-pyo3 = { version = "0.21", optional = true, features = ["abi3-py310"] }
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py310"] }
 # Tree-spec wire format between Python's compiled conditions and the native
 # structure-only fast-path. Kept small and used only at PyO3 boundaries.
 serde = { version = "1", features = ["derive"] }

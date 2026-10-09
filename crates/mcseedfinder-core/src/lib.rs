@@ -125,7 +125,7 @@ fn iter_strongholds_py(world_seed: i64, max_rings: usize) -> PyResult<Vec<(Strin
 /// `get_biome(world_seed, x, z) -> int` contract that `BiomeLookup` expects, so
 /// it slots into the criteria layer in place of the approximate Perlin backend.
 #[cfg(all(feature = "pyo3", feature = "biomes"))]
-#[pyclass(name = "CubiomesBiomeBackend")]
+#[pyclass(name = "CubiomesBiomeBackend", unsendable)]
 struct PyCubiomesBiomeBackend {
     inner: biomes::BiomeBackend,
 }
@@ -263,7 +263,7 @@ fn find_tree_matches_range_compiled(
     // progress callbacks, signal handlers) aren't blocked while we churn
     // through 4 k–1 M seeds. The compiled tree is `frozen`, so no GIL is
     // needed to touch its fields.
-    py.allow_threads(|| conditions::find_matches_range(start_seed, count, &compiled.inner))
+    py.detach(|| conditions::find_matches_range(start_seed, count, &compiled.inner))
 }
 
 /// Biome-aware sibling of [`find_tree_matches_range_compiled`]. Accepts a
@@ -321,7 +321,7 @@ fn find_tree_matches_range_compiled_parallel(
     count: u64,
     compiled: &PyCompiledTree,
 ) -> Vec<i64> {
-    py.allow_threads(|| conditions::find_matches_range_parallel(start_seed, count, &compiled.inner))
+    py.detach(|| conditions::find_matches_range_parallel(start_seed, count, &compiled.inner))
 }
 
 /// Convert a Bedrock text seed to its canonical i32 game-seed via Java's

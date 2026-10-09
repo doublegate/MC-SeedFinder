@@ -144,12 +144,17 @@ impl GpuDepth {
             })
             .await
             .ok_or("no compatible GPU adapter found")?;
+        // We need 8 storage buffers per stage in depth spline; downlevel default is 4.
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 8,
+            ..wgpu::Limits::downlevel_defaults()
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("mcsf-gpu-depth-device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
