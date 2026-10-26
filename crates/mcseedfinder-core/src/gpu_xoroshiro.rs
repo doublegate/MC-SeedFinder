@@ -1041,7 +1041,7 @@ mod tests {
         };
 
         // Raw Xoroshiro states (lo, hi). xPerlinInit takes a state directly, so
-        // we exercise assorted bit patterns (incl. all-zero, all-one, and the
+        // we exercise assorted bit patterns (incl. one-sided-zero, all-one, and the
         // post-xSetSeed states of a few real seeds) rather than only seeds.
         let mut states: Vec<(u64, u64)> = vec![
             (1, 0),

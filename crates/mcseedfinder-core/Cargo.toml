@@ -63,5 +63,10 @@ rayon = { version = "1.10", optional = true }
 # Compiles the vendored cubiomes C sources + shim when the `biomes` feature is on.
 cc = "1.0"
 
-[lints]
-workspace = true
+# Duplicated from root Cargo.toml so standalone path consumers (such as
+# `desktop/src-tauri` and Dependabot's isolated updater) can load this manifest
+# without requiring the root workspace manifest to be present.
+[lints.clippy]
+too_many_arguments = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
