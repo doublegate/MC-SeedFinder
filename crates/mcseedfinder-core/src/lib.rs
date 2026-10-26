@@ -125,9 +125,9 @@ fn iter_strongholds_py(world_seed: i64, max_rings: usize) -> PyResult<Vec<(Strin
 /// `get_biome(world_seed, x, z) -> int` contract that `BiomeLookup` expects, so
 /// it slots into the criteria layer in place of the approximate Perlin backend.
 #[cfg(all(feature = "pyo3", feature = "biomes"))]
-#[pyclass(name = "CubiomesBiomeBackend", unsendable)]
+#[pyclass(name = "CubiomesBiomeBackend")]
 struct PyCubiomesBiomeBackend {
-    inner: biomes::BiomeBackend,
+    inner: std::sync::Mutex<biomes::BiomeBackend>,
 }
 
 #[cfg(all(feature = "pyo3", feature = "biomes"))]
@@ -138,12 +138,17 @@ impl PyCubiomesBiomeBackend {
     fn new(version: &str, dimension: &str, y: i32) -> PyResult<Self> {
         let inner = biomes::BiomeBackend::from_strs(version, dimension, y)
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: std::sync::Mutex::new(inner),
+        })
     }
 
     /// Numeric cubiomes biome ID at block coord `(x, z)`; -1 if unresolved.
     fn get_biome(&mut self, world_seed: i64, x: i32, z: i32) -> i32 {
-        self.inner.get_biome(world_seed, x, z)
+        self.inner
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_biome(world_seed, x, z)
     }
 }
 
@@ -299,11 +304,15 @@ fn find_tree_matches_range_compiled_with_biomes(
     // could lift the BiomeBackend out via an Arc<Mutex<_>> for the
     // threaded case.
     let mut backend_ref = backend.borrow_mut();
+    let backend_inner = backend_ref
+        .inner
+        .get_mut()
+        .unwrap_or_else(|e| e.into_inner());
     Ok(conditions::find_matches_range_with_biomes(
         start_seed,
         count,
         &compiled.inner,
-        &mut backend_ref.inner,
+        backend_inner,
     ))
 }
 

@@ -58,10 +58,10 @@ jobs:
           #   artifact-name: wheel-windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build wheel (manylinux for Linux)
@@ -75,7 +75,7 @@ jobs:
       - name: List built wheels
         run: ls -la dist/
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact-name }}
           path: dist/
@@ -94,12 +94,12 @@ jobs:
           #   artifact-name: desktop-windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - name: Install Tauri Linux deps
@@ -134,7 +134,7 @@ jobs:
           done
           ls -la dist-bundle/
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact-name }}
           path: dist-bundle/
@@ -149,8 +149,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Flatten artifact tree
@@ -166,7 +166,7 @@ jobs:
           \) -exec cp -v {} release-files/ \;
           ls -la release-files/
       - name: Create draft GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true

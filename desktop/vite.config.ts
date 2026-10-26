@@ -8,7 +8,7 @@ export default defineConfig({
     // the warning threshold just above that split chunk so future app-code
     // growth still shows up instead of being hidden by a blanket high limit.
     chunkSizeWarningLimit: 750,
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         manualChunks(id) {
           if (!id.includes("node_modules")) return undefined;
